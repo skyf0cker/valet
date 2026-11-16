@@ -1,0 +1,47 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# MyGo & Packaging
+/.mygo/
+/build/
+/dist/
+/resources/darwin-*/
+build/
+dist/
+*.app/
+*.dmg
+*.pkg
+mygo_windows_*.syso
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Go
+/valet
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+go.work
+go.work.sum
+
+# Frontend (Bun / Vite)
+node_modules/
+.vite/
+*.local
+npm-debug.log*
+.env
+.env.*
+!.env.example
+
+# Editors
+.idea/
+*.swp
+*.swo
+*~

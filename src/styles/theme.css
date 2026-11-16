@@ -1,0 +1,404 @@
+@import "tailwindcss";
+
+@theme {
+  --breakpoint-lg: 881px;
+  --font-sans: "Geist Variable", system-ui, -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
+  --font-serif-en: "Instrument Serif", Georgia, serif;
+  --font-serif-zh: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "STSong", serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces */
+  --bg-canvas: #FFFFFF;
+  --bg-sidebar: #F6F6F6;
+  --bg-sub-sidebar: #FFFFFF;
+  --bg-surface: #FFFFFF;
+  --bg-subtle: #F4F4F4;
+  --bg-muted: #F2F2F2;
+  --bg-hover: #EAEAEA;
+  --bg-card-hover: #F7F7F7;
+  --bg-elevated: #FFFFFF;
+  --bg-segment-active: #FFFFFF;
+  --bg-code: #F6F6F6;
+  --bg-track: #EDEDED;
+
+  /* Brand & Plugin Icon Badges */
+  --brand-icon-bg: #0A0A0A;
+  --brand-icon-border: transparent;
+  --brand-icon-fg: #FFFFFF;
+
+  /* Ink */
+  --ink-primary: #0A0A0A;
+  --ink-strong: #000000;
+  --ink-body: #1A1A1A;
+  --ink-secondary: #3A3A3A;
+  --ink-nav: #0E1512;
+  --ink-muted: #6B6B6B;
+  --ink-subtle: #8A8A8A;
+  --ink-faint: #9A9A9A;
+  --ink-on-primary: #FFFFFF;
+  --ink-on-primary-muted: rgba(255, 255, 255, 0.6);
+
+  /* Borders */
+  --border-faint: #F4F4F4;
+  --border-subtle: #F2F2F2;
+  --border-light: #EFEFEF;
+  --border-base: #EAEAEA;
+  --border-card: #EBEBEB;
+  --border-control: #E2E2E2;
+  --border-strong: #D6D6D6;
+  --border-dash: #CFCFCF;
+
+  /* Status accents */
+  --amber-text: #9A5F0A;
+  --amber-icon: #C27B12;
+  --amber-warn: #B7791F;
+  --amber-bg: #FBF7F0;
+  --amber-border: #EFE2C9;
+  --amber-pill: #E6C98F;
+  --amber-divider: #EFE2C9;
+
+  --danger: #B42318;
+  --danger-bg: #FEF2F2;
+  --danger-border: #FECACA;
+
+  /* Switch & bar tokens */
+  --switch-off-bg: #DADADA;
+  --switch-thumb-on: #FFFFFF;
+  --switch-thumb-off: #FFFFFF;
+  --spark-bar-muted: #CFCFCF;
+  --spark-bar-active: #6B6B6B;
+
+  /* Developer Banner (Light = inverted ink, Dark = #161616 card) */
+  --banner-bg: #0A0A0A;
+  --banner-border: transparent;
+  --banner-fg: #FFFFFF;
+  --banner-muted: rgba(255, 255, 255, 0.72);
+  --banner-btn-bg: #FFFFFF;
+  --banner-btn-fg: #0A0A0A;
+
+  /* Motion System v0.1 */
+  --ease-valet: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dur-micro: 120ms;
+  --dur-base: 240ms;
+  --dur-panel: 320ms;
+  --dur-ambient: 1600ms;
+
+  /* Shadows */
+  --shadow-drawer: -32px 0 64px -24px rgba(0, 0, 0, 0.22);
+  --shadow-composer: 0 16px 40px -20px rgba(0, 0, 0, 0.22);
+  --shadow-popover: 0 18px 48px -16px rgba(0, 0, 0, 0.24);
+  --shadow-segment: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Neutral Obsidian / Graphite Surfaces (exact Paper 16-20 Dark tokens) */
+  --bg-canvas: #0E0E0E;
+  --bg-sidebar: #131313;
+  --bg-sub-sidebar: #111111;
+  --bg-surface: #161616;
+  --bg-subtle: #1C1C1C;
+  --bg-muted: #222222;
+  --bg-hover: #262626;
+  --bg-card-hover: #171717;
+  --bg-elevated: #181818;
+  --bg-segment-active: #2E2E2E;
+  --bg-code: #141414;
+  --bg-track: #282828;
+
+  /* Brand & Plugin Icon Badges */
+  --brand-icon-bg: #1E1E1E;
+  --brand-icon-border: #303030;
+  --brand-icon-fg: #F5F5F5;
+
+  /* Ink */
+  --ink-primary: #F2F2F2;
+  --ink-strong: #F5F5F5;
+  --ink-body: #D4D4D4;
+  --ink-secondary: #C8C8C8;
+  --ink-nav: #D4D4D4;
+  --ink-muted: #8A8A8A;
+  --ink-subtle: #6E6E6E;
+  --ink-faint: #555555;
+  --ink-on-primary: #0A0A0A;
+  --ink-on-primary-muted: rgba(10, 10, 10, 0.6);
+
+  /* Borders */
+  --border-faint: #1A1A1A;
+  --border-subtle: #1F1F1F;
+  --border-light: #222222;
+  --border-base: #222222;
+  --border-card: #262626;
+  --border-control: #303030;
+  --border-strong: #3A3A3A;
+  --border-dash: #444444;
+
+  /* Status accents */
+  --amber-text: #F0B44C;
+  --amber-icon: #E59928;
+  --amber-warn: #E59928;
+  --amber-bg: #1F1910;
+  --amber-border: #4A3516;
+  --amber-pill: #5C4119;
+  --amber-divider: #382A14;
+
+  --danger: #E04F44;
+  --danger-bg: #261413;
+  --danger-border: #562421;
+
+  /* Switch & bar tokens */
+  --switch-off-bg: #303030;
+  --switch-thumb-on: #0A0A0A;
+  --switch-thumb-off: #B8B8B8;
+  --spark-bar-muted: #333333;
+  --spark-bar-active: #8A8A8A;
+
+  /* Developer Banner (exact Paper 19 Dark tokens) */
+  --banner-bg: #161616;
+  --banner-border: #2C2C2C;
+  --banner-fg: #F5F5F5;
+  --banner-muted: #9E9E9E;
+  --banner-btn-bg: #F2F2F2;
+  --banner-btn-fg: #0A0A0A;
+
+  --shadow-drawer: -32px 0 64px -24px rgba(0, 0, 0, 0.72);
+  --shadow-composer: 0 16px 40px -20px rgba(0, 0, 0, 0.65);
+  --shadow-popover: 0 18px 48px -16px rgba(0, 0, 0, 0.7);
+  --shadow-segment: 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-canvas);
+  color: var(--ink-strong);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 18px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-synthesis: none;
+}
+
+/* MyGo window drag helpers */
+.app-drag {
+  --app-region: drag;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.app-no-drag {
+  --app-region: no-drag;
+}
+
+/* M1: On-duty ambient pulse */
+@keyframes valet-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.38;
+  }
+  70% {
+    transform: scale(3.2);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(3.2);
+    opacity: 0;
+  }
+}
+
+/* M2: Bowtie nod greeting */
+@keyframes valet-nod {
+  0% {
+    transform: rotate(0deg) scale(1);
+  }
+  30% {
+    transform: rotate(-8deg) scale(1.08);
+  }
+  65% {
+    transform: rotate(4deg) scale(1.04);
+  }
+  100% {
+    transform: rotate(0deg) scale(1);
+  }
+}
+
+/* M3: Timeline row entry */
+@keyframes valet-timeline-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Drawer slide in from right */
+@keyframes valet-drawer-in {
+  from {
+    opacity: 0;
+    transform: translateX(28px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Modal / Popover enter */
+@keyframes valet-modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* M5: Thinking shimmer sweep & chip pop */
+@keyframes valet-shimmer {
+  0% {
+    background-position: 150% 0;
+  }
+  100% {
+    background-position: -150% 0;
+  }
+}
+
+@keyframes valet-chip-pop {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* M6: Voice waveform RMS animation */
+@keyframes valet-wave {
+  0%,
+  100% {
+    transform: scaleY(0.42);
+    opacity: 0.72;
+  }
+  50% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+
+/* M8: New event arrival pill drop */
+@keyframes valet-pill-drop {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -28px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+@keyframes valet-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-valet-pulse {
+  animation: valet-pulse var(--dur-ambient) ease-out infinite;
+}
+
+.animate-valet-nod {
+  animation: valet-nod 520ms var(--ease-spring);
+}
+
+.animate-valet-timeline-in {
+  animation: valet-timeline-in var(--dur-base) var(--ease-valet) both;
+}
+
+.animate-valet-drawer-in {
+  animation: valet-drawer-in var(--dur-panel) var(--ease-valet) both;
+}
+
+.animate-valet-modal-in {
+  animation: valet-modal-in var(--dur-base) var(--ease-valet) both;
+}
+
+.valet-shimmer-text {
+  background-image: linear-gradient(
+    90deg,
+    var(--ink-primary) 0%,
+    var(--ink-primary) 35%,
+    var(--ink-faint) 50%,
+    var(--ink-primary) 65%,
+    var(--ink-primary) 100%
+  );
+  background-size: 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: valet-shimmer 1.35s linear infinite;
+}
+
+.valet-shimmer-bar {
+  background-image: linear-gradient(
+    90deg,
+    var(--bg-muted) 0%,
+    var(--bg-subtle) 50%,
+    var(--bg-muted) 100%
+  );
+  background-size: 250% 100%;
+  animation: valet-shimmer 1.35s linear infinite;
+}
+
+.animate-valet-chip-pop {
+  animation: valet-chip-pop 180ms var(--ease-spring) both;
+}
+
+.animate-valet-wave {
+  transform-origin: center;
+  animation: valet-wave 760ms ease-in-out infinite;
+}
+
+.animate-valet-pill-drop {
+  animation: valet-pill-drop var(--dur-base) var(--ease-valet) both;
+}
+
+.animate-valet-spin {
+  animation: valet-spin 0.9s linear infinite;
+}
+
+/* Subtle custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--ink-subtle) 30%, transparent);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--ink-subtle) 55%, transparent);
+}

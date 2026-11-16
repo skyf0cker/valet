@@ -1,0 +1,124 @@
+package sidecar
+
+import (
+	"encoding/json"
+
+	"valet/internal/types"
+)
+
+// SyncState mirrors the subset of application state required by the durable Pi agent sidecar.
+type SyncState struct {
+	HomeDir     string                      `json:"homeDir"`
+	DataDir     string                      `json:"dataDir"`
+	IsPaused    bool                        `json:"isPaused"`
+	Preferences types.ValetPreferences      `json:"preferences"`
+	Providers   []types.AgentProviderConfig `json:"providers"`
+	Plugins     []types.PluginState         `json:"plugins"`
+	Memories    []types.MemoryEntry         `json:"memories"`
+}
+
+// InitParams initializes the sidecar harness with SQLite path and host state.
+type InitParams struct {
+	DBPath string    `json:"dbPath"`
+	State  SyncState `json:"state"`
+}
+
+// ChatSendRequest dispatches a user message turn through a durable Conversation.
+type ChatSendRequest struct {
+	ChatID          string                 `json:"chatId"`
+	Prompt          string                 `json:"prompt"`
+	Model           string                 `json:"model"`
+	MentionPluginID string                 `json:"mentionPluginId,omitempty"`
+	Attachments     []types.ChatAttachment `json:"attachments,omitempty"`
+	RequestID       string                 `json:"requestId,omitempty"`
+}
+
+// ChatSendResponse captures the committed assistant turn and any triggered Inbox/Timeline IDs.
+type ChatSendResponse struct {
+	ReplyMessage     types.ChatMessage `json:"replyMessage"`
+	QueuedInboxIDs   []string          `json:"queuedInboxIds"`
+	TimelineEventIDs []string          `json:"timelineEventIds"`
+	UsageCostDelta   float64           `json:"usageCostDelta"`
+	ProviderUsed     string            `json:"providerUsed"`
+}
+
+// PluginEventRequest dispatches a real or simulated plugin event into Pi Durable.
+type PluginEventRequest struct {
+	PluginID  string         `json:"pluginId"`
+	EventCode string         `json:"eventCode"`
+	Payload   map[string]any `json:"payload,omitempty"`
+	Simulated bool           `json:"simulated"`
+}
+
+// PluginEventResponse returns routing policy and side-effect IDs for a dispatched event.
+type PluginEventResponse struct {
+	Handled          bool     `json:"handled"`
+	Policy           string   `json:"policy"`
+	ReplyText        string   `json:"replyText"`
+	QueuedInboxIDs   []string `json:"queuedInboxIds"`
+	TimelineEventIDs []string `json:"timelineEventIds"`
+}
+
+// ExecuteApprovedRequest runs a pre-approved Inbox tool invocation inside the sidecar.
+type ExecuteApprovedRequest struct {
+	InboxID      string         `json:"inboxId"`
+	ToolName     string         `json:"toolName"`
+	ToolArgs     map[string]any `json:"toolArgs"`
+	CheckedPaths []string       `json:"checkedPaths,omitempty"`
+}
+
+// ExecuteApprovedResponse summarizes approved tool execution.
+type ExecuteApprovedResponse struct {
+	OK     bool   `json:"ok"`
+	Output string `json:"output"`
+}
+
+// QueueApprovalRequest is sent by Sidecar's beforeTool safety hook to queue an Inbox card.
+type QueueApprovalRequest struct {
+	PluginID      string                     `json:"pluginId"`
+	PluginName    string                     `json:"pluginName"`
+	EventCode     string                     `json:"eventCode"`
+	Category      string                     `json:"category"`
+	IconKind      string                     `json:"iconKind"`
+	Title         string                     `json:"title"`
+	Summary       string                     `json:"summary"`
+	Reasoning     string                     `json:"reasoning"`
+	WarningTag    string                     `json:"warningTag,omitempty"`
+	Reversible7d  bool                       `json:"reversible7d"`
+	ReclaimableGB float64                    `json:"reclaimableGB,omitempty"`
+	ApproveLabel  string                     `json:"approveLabel"`
+	DismissLabel  string                     `json:"dismissLabel"`
+	ToolName      string                     `json:"toolName"`
+	ToolArgs      map[string]any             `json:"toolArgs"`
+	ActionItems   []types.TimelineActionItem `json:"actionItems"`
+}
+
+// RecordTimelineRequest is sent by Sidecar after automatic/logged tool executions.
+type RecordTimelineRequest struct {
+	PluginID    string                     `json:"pluginId"`
+	PluginName  string                     `json:"pluginName"`
+	EventCode   string                     `json:"eventCode"`
+	Title       string                     `json:"title"`
+	Summary     string                     `json:"summary"`
+	Status      string                     `json:"status"`
+	Reasoning   string                     `json:"reasoning"`
+	ReclaimedGB float64                    `json:"reclaimedGB,omitempty"`
+	Intercepted bool                       `json:"intercepted,omitempty"`
+	CanRestore  bool                       `json:"canRestore,omitempty"`
+	Payload     map[string]any             `json:"payload"`
+	ActionItems []types.TimelineActionItem `json:"actionItems,omitempty"`
+}
+
+type rpcEnvelope struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
