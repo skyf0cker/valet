@@ -568,28 +568,19 @@ export const INITIAL_PLUGINS: PluginState[] = [
         count24h: 0,
       },
     ],
-    actions: [
-      { id: "disk.scan", safety: "readonly", safetyLabel: "只读" },
-      { id: "disk.move_to_trash", safety: "reversible", safetyLabel: "可撤销 · 7 天" },
-      { id: "disk.empty_trash", safety: "confirm_always", safetyLabel: "每次确认" },
-      { id: "disk.purge_snapshots", safety: "confirm_always", safetyLabel: "每次确认" },
-    ],
     config: {
       lowSpaceThresholdPct: 15,
       protectedPaths: ["~/Documents", "~/Projects"],
+      values: { lowSpaceThresholdPct: 15 },
     },
     manifestYaml: `id: com.valet.disk-guard
 name: 磁盘守卫
 version: 1.2.0
 permissions: [full_disk]
-events:
+triggers:
   - id: disk.low_space
-  - id: disk.cache_bloat
-  - id: disk.large_file
-  - id: disk.duplicate_found
-actions:
-  - id: disk.scan
-  - id: disk.move_to_trash`,
+    sensor: script_poll
+    script: scripts/poll-disk.mjs`,
   },
   {
     id: "uninstall-scrubber",
@@ -624,11 +615,6 @@ actions:
         policy: "ask",
         count24h: 2,
       },
-    ],
-    actions: [
-      { id: "app.scan_remnants", safety: "readonly", safetyLabel: "只读" },
-      { id: "app.trash_remnants", safety: "reversible", safetyLabel: "可撤销 · 7 天" },
-      { id: "app.unload_agent", safety: "confirm_always", safetyLabel: "每次确认" },
     ],
     config: {
       protectedPaths: ["~/Documents/Exports"],
@@ -677,10 +663,6 @@ events:
         policy: "ask",
         count24h: 0,
       },
-    ],
-    actions: [
-      { id: "process.sample", safety: "readonly", safetyLabel: "只读" },
-      { id: "process.terminate", safety: "confirm_always", safetyLabel: "每次确认" },
     ],
     config: {
       sampleIntervalSec: 5,
@@ -739,9 +721,6 @@ events:
         count24h: 1,
       },
     ],
-    actions: [
-      { id: "log.summarize", safety: "readonly", safetyLabel: "只读" },
-    ],
     config: {},
     manifestYaml: `id: com.valet.log-detective
 name: 日志侦探
@@ -774,11 +753,6 @@ events:
       { id: "github.release", description: "新版本 Tag 发布通知", policy: "record", count24h: 0 },
       { id: "github.mention", description: "Issue 中被 @ 提及", policy: "record", count24h: 2 },
     ],
-    actions: [
-      { id: "github.fetch_logs", safety: "readonly", safetyLabel: "只读" },
-      { id: "github.rerun_job", safety: "confirm_always", safetyLabel: "每次确认" },
-      { id: "github.comment", safety: "confirm_always", safetyLabel: "每次确认" },
-    ],
     config: {},
     manifestYaml: `id: com.community.github
 name: GitHub
@@ -808,10 +782,6 @@ events:
       { id: "calendar.meeting_soon", description: "日程开始前 10 分钟触发", policy: "auto", count24h: 3 },
       { id: "calendar.meeting_end", description: "会议结束恢复工作区窗口", policy: "auto", count24h: 3 },
     ],
-    actions: [
-      { id: "system.set_focus", safety: "reversible", safetyLabel: "自动恢复" },
-      { id: "app.hide_distractions", safety: "reversible", safetyLabel: "仅隐藏窗口" },
-    ],
     config: {},
     manifestYaml: `id: com.community.calendar-focus
 name: 日历
@@ -819,6 +789,88 @@ version: 1.0.0
 events:
   - id: calendar.meeting_soon
   - id: calendar.meeting_end`,
+  },
+  {
+    id: "surge-doctor",
+    slug: "surge-doctor",
+    name: "Surge 诊断",
+    tagline: "通过 script_poll 导入脱敏日志并按 Skill 排查网络故障",
+    description:
+      "内置 scripts/poll-errors.mjs 与 import-logs.mjs（不修改宿主代码），定期采集并脱敏 ~/Library/Logs/Surge 新增报错，借助通用核心工具定位 DNS、TUN、策略组与外部代理故障。",
+    version: "v1.0.0",
+    bundleId: "com.community.surge-doctor",
+    iconKind: "surge",
+    iconLabel: "Sg",
+    source: "community",
+    enabled: true,
+    installed: true,
+    defaultBehaviorHint: "脚本自动脱敏读取，执行 surge-cli 变更或改写配置时需你批准",
+    statusSubtitle: "脚本轮询 ~/Library/Logs/Surge · Skill 已挂载",
+    triggers24h: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    events: [
+      {
+        id: "surge.error_detected",
+        description: "监测 ~/Library/Logs/Surge 新增错误与告警日志并自动导入归因",
+        policy: "auto",
+        sensor: "script_poll",
+        sourceSummary: "script_poll · scripts/poll-errors.mjs",
+        count24h: 0,
+      },
+      {
+        id: "surge.webhook_alert",
+        description: "接收 Surge Event 脚本或外部探针推送的实时网络/脚本异常",
+        policy: "ask",
+        sensor: "webhook",
+        sourceSummary: "webhook · POST /events/surge-doctor/surge.webhook_alert",
+        count24h: 0,
+      },
+    ],
+    configSchema: [
+      {
+        key: "pollIntervalSec",
+        label: "日志轮询间隔（秒）",
+        type: "slider",
+        default: 30,
+        min: 5,
+        max: 300,
+      },
+      {
+        key: "windowMinutes",
+        label: "日志回溯窗口（分钟）",
+        type: "slider",
+        default: 60,
+        min: 10,
+        max: 1440,
+      },
+    ],
+    config: { values: { pollIntervalSec: 30, windowMinutes: 60 } },
+    bundledFiles: [
+      "manifest.yaml",
+      "SKILL.md",
+      "scripts/import-logs.mjs",
+      "scripts/poll-errors.mjs",
+      "scripts/surge-valet-event.js",
+    ],
+    manifestYaml: `id: com.community.surge-doctor
+name: Surge 诊断
+version: 1.0.0
+triggers:
+  - id: surge.error_detected
+    sensor: script_poll
+    script: scripts/poll-errors.mjs
+    interval_config_key: pollIntervalSec
+    interval_sec: 30
+    emit_on: json
+    policy: auto
+  - id: surge.webhook_alert
+    sensor: webhook
+    policy: ask`,
+    skillMarkdown: `### 触发场景
+- 收到 \`surge.error_detected\` / \`surge.webhook_alert\` 或用户发起 Surge 诊断排查。
+
+### 处理流程
+1. 使用 \`bash\` 运行插件自带只读脚本 \`bun "\${VALET_PLUGIN_DIR}/scripts/import-logs.mjs" --minutes 360\` 获取最新脱敏报告。
+2. 需要查看配置文件时用 \`read_file\` 只读核对异常段；如需刷新 DNS 或重载配置，先通过 \`ask_user\` 或直接运行 \`surge-cli\` 触发权限批准。`,
   },
   {
     id: "dmg-sweeper",
@@ -838,16 +890,14 @@ events:
     events: [
       { id: "fs.file_created", description: "~/Downloads/*.dmg 创建且对应 App 已安装", policy: "auto", count24h: 1 },
     ],
-    actions: [
-      { id: "move_to_trash", safety: "reversible", safetyLabel: "可撤销 · 7 天" },
-    ],
     config: {},
     manifestYaml: `id: local.valet.dmg-sweeper
 name: dmg 清扫员
-events:
+triggers:
   - id: fs.file_created
-actions:
-  - id: move_to_trash`,
+    sensor: fs_watch
+    watch_dirs: [~/Downloads]
+    glob: "*.dmg"`,
   },
   // Marketplace discoverable plugins (installed: false initially)
   {
@@ -868,15 +918,13 @@ actions:
       { id: "battery.drain_spike", description: "10 分钟掉电超过 6%", policy: "ask", count24h: 0 },
       { id: "battery.sleep_drain", description: "合盖睡眠掉电超过 5%", policy: "record", count24h: 0 },
     ],
-    actions: [
-      { id: "battery.report", safety: "readonly", safetyLabel: "只读" },
-    ],
     config: {},
     manifestYaml: `id: com.community.battery-guardian
 name: 电池健康
 version: 1.3.1
-events:
-  - id: battery.drain_spike`,
+triggers:
+  - id: battery.drain_spike
+    sensor: command_poll`,
   },
   {
     id: "homekit-bridge",
@@ -895,14 +943,11 @@ events:
     events: [
       { id: "mac.screen_locked", description: "屏幕锁定超过 5 分钟", policy: "auto", count24h: 0 },
     ],
-    actions: [
-      { id: "homekit.trigger_scene", safety: "reversible", safetyLabel: "可恢复" },
-    ],
     config: {},
     manifestYaml: `id: com.community.homekit
 name: HomeKit
 version: 0.8.0
-events:
+triggers:
   - id: mac.screen_locked`,
   },
   {
@@ -922,14 +967,11 @@ events:
     events: [
       { id: "net.ssid_changed", description: "切换到非信任 Wi-Fi 网络", policy: "ask", count24h: 0 },
     ],
-    actions: [
-      { id: "net.flush_dns", safety: "reversible", safetyLabel: "无损" },
-    ],
     config: {},
     manifestYaml: `id: com.community.wifi-sentinel
 name: Wi-Fi
 version: 1.0.6
-events:
+triggers:
   - id: net.ssid_changed`,
   },
 ];
@@ -1345,13 +1387,12 @@ export const INITIAL_CHAT_THREADS: ChatThread[] = [
 name: dmg 清扫员
 version: 0.1.0
 triggers:
-  - event: fs.file_created
-    glob: "~/Downloads/*.dmg"
+  - id: fs.file_created
+    sensor: fs_watch
+    watch_dirs: [~/Downloads]
+    glob: "*.dmg"
 condition:
-  - app_installed_from(dmg)
-actions:
-  - move_to_trash:
-      retention_days: 7`,
+  - app_installed_from(dmg)`,
         },
       },
     ],
@@ -1587,12 +1628,22 @@ export const INITIAL_PREFERENCES: ValetPreferences = {
   appearance: "light",
   language: "简体中文",
   globalHotkey: ["⌥", "Space"],
+  busyMessagePolicy: "queue",
 
   activeProviderId: "anthropic",
   models: {
     primary: "claude-opus-4",
     fast: "claude-haiku-4",
     vision: "同主模型",
+  },
+  autoReview: {
+    engine: "auto",
+    jevEndpoint: "https://api.typesafe.ai/v1/systemone",
+    jevApiKey: "",
+    jevApiKeyMasked: "",
+    jevModel: "jev-latest",
+    fallbackProviderId: "",
+    fallbackModel: "同快速模型",
   },
   dailySpendCurrent: 18.4,
   dailySpendLimit: 30,
@@ -1603,12 +1654,12 @@ export const INITIAL_PREFERENCES: ValetPreferences = {
   customInstructions:
     "- 回复用中文，先给结论再给细节\n- 文件一律存到 ~/Documents/Valet\n- 工作日 9:00 前不要发通知",
 
-  autonomyLevel: "sensitive_only",
+  autonomyLevel: "auto_review",
   confirmChecklist: {
-    deleteOrOverwrite: true,
+    deleteOrOverwrite: false,
     sendMessageOrEmail: true,
     paymentOrSubscription: true,
-    runTerminalCommand: true,
+    runTerminalCommand: false,
     modifySystemSettings: false,
   },
   blockedApps: ["钥匙串访问", "招商银行", "1Password"],
@@ -1617,6 +1668,12 @@ export const INITIAL_PREFERENCES: ValetPreferences = {
   thresholds: DEFAULT_THRESHOLDS,
   cleanupPolicy: DEFAULT_CLEANUP_POLICY,
   pluginRuntime: DEFAULT_PLUGIN_RUNTIME,
+  heartbeat: {
+    enabled: true,
+    initialized: true,
+    intervalMin: 30,
+    prompt: "巡检当前待处理的系统与应用事件、收件箱待确认事项及后台服务状态；若发现需要关注的异常则按自治策略响应或汇总至收件箱，若一切平稳则静默记录心跳。",
+  },
 
   memoryEnabled: true,
   autoLearnMemory: true,
@@ -1713,6 +1770,7 @@ export function createInitialSnapshot(): ValetSnapshot {
     automations: INITIAL_AUTOMATIONS,
     mcpServers: INITIAL_MCP_SERVERS,
     memories: INITIAL_MEMORIES,
+    heartbeatLogs: [],
     preferences: INITIAL_PREFERENCES,
     systemMetrics: INITIAL_SYSTEM_METRICS,
     scan: INITIAL_SCAN_STATE,

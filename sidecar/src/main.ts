@@ -5,7 +5,9 @@ import type {
   ExecuteApprovedToolRequest,
   HostBridge,
   ProbeMcpRequest,
+  ResolvePermissionRequest,
   SendChatRequest,
+  TestAutoReviewRequest,
   TestProviderRequest,
   ValetSyncState,
 } from "./protocol.ts";
@@ -136,6 +138,10 @@ class StdioJsonRpcServer implements HostBridge {
         return this.runtime.sendChat(params as unknown as SendChatRequest);
       case "chat.abort":
         return this.runtime.abortChat(String(params.chatId ?? ""));
+      case "chat.resolvePermission":
+        return this.runtime.resolvePermission(
+          params as unknown as ResolvePermissionRequest,
+        );
       case "plugin.event":
         return this.runtime.dispatchPluginEvent(
           params as unknown as DispatchPluginEventRequest,
@@ -149,6 +155,10 @@ class StdioJsonRpcServer implements HostBridge {
       case "agent.testProvider":
         return this.runtime.testProvider(
           params as unknown as TestProviderRequest,
+        );
+      case "agent.testAutoReview":
+        return this.runtime.testAutoReview(
+          params as unknown as TestAutoReviewRequest,
         );
       case "mcp.probe":
         return this.runtime.probeMcpServer(params as unknown as ProbeMcpRequest);

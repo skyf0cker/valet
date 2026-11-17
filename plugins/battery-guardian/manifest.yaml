@@ -1,0 +1,18 @@
+id: battery-guardian
+bundle_id: com.community.battery-guardian
+name: 电池健康
+tagline: 监听电量与电源适配器变化，协助排查异常高耗电
+description: 通过 pmset -g batt 探针感知供电切换与异常掉电，由 Agent 结合 SKILL.md 定位高耗电进程或后台任务。
+version: 1.3.1
+source: community
+icon: battery
+icon_label: "⚡"
+default_installed: false
+triggers:
+  - id: system.battery_low
+    description: 电池电量与充放电状态变化触发检查
+    sensor: command_poll
+    command: "pmset -g batt"
+    interval_sec: 120
+    emit_on: change
+    policy: ask

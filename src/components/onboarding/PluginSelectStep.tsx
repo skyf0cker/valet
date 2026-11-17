@@ -3,7 +3,7 @@ import { useValet } from "../../store/ValetContext";
 import { PluginBadgeIcon } from "../ui/Icons";
 import { Switch } from "../ui/Switch";
 
-const FUTURE_MARKET_CHIPS = ["GitHub", "日历", "电池健康", "HomeKit", "Wi-Fi"];
+const FUTURE_MARKET_CHIPS = ["Surge", "GitHub", "日历", "电池健康", "HomeKit", "Wi-Fi"];
 
 export const PluginSelectStep: React.FC = () => {
   const { state, togglePluginEnabled, setOnboardingStep } = useValet();

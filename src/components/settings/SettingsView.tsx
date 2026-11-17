@@ -1,8 +1,9 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import { valetService } from "../../services/valetService";
 import { useValet } from "../../store/ValetContext";
 import type {
   AppearanceMode,
+  AutoReviewConfig,
   AutonomyLevel,
   SettingsSectionId,
   ToneStyle,
@@ -11,6 +12,7 @@ import { SidebarToggleButton } from "../Sidebar";
 import { Kbd } from "../ui/Badge";
 import { Checkbox } from "../ui/Checkbox";
 import { BowtieSvg, SearchIcon } from "../ui/Icons";
+import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { Modal } from "../ui/Modal";
 import { SegmentedControl } from "../ui/SegmentedControl";
 import { SelectMenu } from "../ui/SelectMenu";
@@ -26,7 +28,7 @@ import {
 interface SectionMeta {
   id: SettingsSectionId;
   title: string;
-  group: "Agent" | "Care" | "System";
+  group: "Agent" | "Steward" | "System";
   subtitle: string;
   keywords: string;
 }
@@ -36,15 +38,15 @@ const SECTIONS: SectionMeta[] = [
     id: "general",
     title: "通用",
     group: "Agent",
-    subtitle: "启动、深浅主题外观与全局唤起方式",
-    keywords: "通用 启动 外观 深色 浅色 自动 语言 快捷键 全局唤起",
+    subtitle: "启动、菜单栏驻留、外观与运行中消息发送策略",
+    keywords: "通用 启动 外观 深色 浅色 自动 语言 消息 引导 排队",
   },
   {
     id: "models",
     title: "模型与服务商",
     group: "Agent",
-    subtitle: "密钥安全存于 macOS 钥匙串，控制模型路由与每日预算上限",
-    keywords: "模型 服务商 anthropic openai ollama gemini api key 花费 预算",
+    subtitle: "密钥安全存于 macOS 钥匙串，控制主/快/视觉模型、Auto Review 审查模型与每日预算",
+    keywords: "模型 服务商 anthropic openai ollama gemini api key 花费 预算 jev system one auto review 审查 小模型",
   },
   {
     id: "persona",
@@ -54,32 +56,32 @@ const SECTIONS: SectionMeta[] = [
     keywords: "人格 称呼 语气 指令 custom instructions",
   },
   {
+    id: "heartbeat",
+    title: "心跳与自动化",
+    group: "Agent",
+    subtitle: "周期性主动值守心跳与定时事件编排，让 Valet 持续感知并响应本机事件",
+    keywords: "心跳 巡检 自动化 定时 cron heartbeat 值守 事件",
+  },
+  {
     id: "safety",
     title: "自主与安全",
     group: "Agent",
-    subtitle: "决定 Valet 什么时候必须停下来征求你的批准",
-    keywords: "自主 安全 确认 敏感操作 禁止 应用 紧急停止",
+    subtitle: "决定 Valet 权限策略（每个都询问 / Auto Review / Full Access）、动作确认与受保护路径",
+    keywords: "自主 安全 确认 敏感操作 受保护目录 废纸篓 撤销 禁止 应用 紧急停止 每个都询问 auto review full access 审查",
   },
   {
     id: "thresholds",
-    title: "监控阈值",
-    group: "Care",
-    subtitle: "决定插件什么时候把事件交给 Valet。越敏感，事件越多。",
-    keywords: "监控 阈值 磁盘 可用空间 缓存 大文件 cpu 内存 压力 忽略 进程 日志 灵敏度 节流",
-  },
-  {
-    id: "cleanup",
-    title: "清理策略",
-    group: "Care",
-    subtitle: "Valet 动手清理文件时遵守的还原机制与受保护目录，以及自动化规则。",
-    keywords: "清理 策略 废纸篓 撤销 保留期 受保护目录 卸载 残留 自动化 定时",
+    title: "事件感知阈值",
+    group: "Steward",
+    subtitle: "决定传感器何时将系统与应用状态变化作为事件呈报给 Valet",
+    keywords: "监控 事件 阈值 磁盘 cpu 内存 压力 忽略 进程 日志 灵敏度 节流",
   },
   {
     id: "runtime",
-    title: "插件运行时",
-    group: "Care",
-    subtitle: "插件的沙箱隔离、本地开发热重载与事件限流（含 MCP 服务）。",
-    keywords: "插件 运行时 沙箱 未签名 本地 热重载 事件 上限 安静时段 mcp",
+    title: "插件与事件总线",
+    group: "Steward",
+    subtitle: "插件沙箱隔离、本地开发热重载、Webhook 事件网关与限流策略（含 MCP 服务）",
+    keywords: "插件 运行时 沙箱 未签名 本地 热重载 事件 webhook 上限 安静时段 mcp",
   },
   {
     id: "permissions",
@@ -134,9 +136,9 @@ const SECTIONS: SectionMeta[] = [
 
 const COMPACT_PILLS: SettingsSectionId[] = [
   "general",
+  "heartbeat",
   "safety",
   "thresholds",
-  "cleanup",
   "permissions",
 ];
 
@@ -159,7 +161,10 @@ export const SettingsView: React.FC = () => {
     addMcpServer,
     deleteMcpServer,
     deleteMemory,
+    addMemoryEntry,
     clearMemories,
+    triggerHeartbeatNow,
+    clearHeartbeatLogs,
     setPermissionGranted,
     refreshPermissions,
     resetOnboarding,
@@ -177,6 +182,8 @@ export const SettingsView: React.FC = () => {
   const [ruleModalOpen, setRuleModalOpen] = useState(false);
   const [memoryModalOpen, setMemoryModalOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
+  const [heartbeatLogModalOpen, setHeartbeatLogModalOpen] = useState(false);
+  const memoryCompEndRef = useRef(0);
 
   // Rule creation fields
   const [ruleWhen, setRuleWhen] = useState("每天 09:30");
@@ -191,16 +198,23 @@ export const SettingsView: React.FC = () => {
   const [mcpArgsText, setMcpArgsText] = useState("-y @modelcontextprotocol/server-filesystem ~/Downloads");
   const [mcpUrl, setMcpUrl] = useState("http://localhost:3100/mcp");
 
-  // Inline provider credential state
+  // Inline provider credential & Auto Review state
   const [showProviderKey, setShowProviderKey] = useState(false);
   const [verifyingProvider, setVerifyingProvider] = useState(false);
   const [testingProviderMsg, setTestingProviderMsg] = useState(false);
   const [providerTestReply, setProviderTestReply] = useState<string | null>(null);
+  const [showJevKey, setShowJevKey] = useState(false);
+  const [testingAutoReview, setTestingAutoReview] = useState(false);
+  const [autoReviewTestReply, setAutoReviewTestReply] = useState<string | null>(null);
+  const [newMemoryText, setNewMemoryText] = useState("");
 
   const { preferences } = state;
-  const activeSectionId = state.activeSettingsSection;
+  const activeSectionId: SettingsSectionId =
+    (state.activeSettingsSection as string) === "cleanup"
+      ? "heartbeat"
+      : state.activeSettingsSection;
   const activeSectionMeta =
-    SECTIONS.find((s) => s.id === activeSectionId) ?? SECTIONS[4]!;
+    SECTIONS.find((s) => s.id === activeSectionId) ?? SECTIONS[5]!;
 
   const grantedPermCount = state.permissions.filter((p) => p.granted).length;
   const totalPermCount = state.permissions.length;
@@ -223,6 +237,62 @@ export const SettingsView: React.FC = () => {
   const modelOptions = (
     activeProvider?.models ?? ["claude-opus-4", "claude-haiku-4"]
   ).map((m) => ({ value: m, label: m }));
+
+  const autoReview: AutoReviewConfig = {
+    engine: preferences.autoReview?.engine ?? "auto",
+    jevEndpoint:
+      preferences.autoReview?.jevEndpoint || "https://api.typesafe.ai/v1/systemone",
+    jevApiKey: preferences.autoReview?.jevApiKey ?? "",
+    jevApiKeyMasked: preferences.autoReview?.jevApiKeyMasked ?? "",
+    jevModel: preferences.autoReview?.jevModel || "jev-latest",
+    jevVerified: preferences.autoReview?.jevVerified ?? false,
+    jevLatencyMs: preferences.autoReview?.jevLatencyMs,
+    fallbackProviderId: preferences.autoReview?.fallbackProviderId ?? "",
+    fallbackModel: preferences.autoReview?.fallbackModel || "同快速模型",
+  };
+  const updateAutoReview = (patch: Partial<AutoReviewConfig>) => {
+    setAutoReviewTestReply(null);
+    updatePreferences({
+      autoReview: {
+        ...autoReview,
+        ...patch,
+      },
+    });
+  };
+  const fallbackProvider =
+    (autoReview.fallbackProviderId
+      ? state.providers.find((p) => p.id === autoReview.fallbackProviderId)
+      : undefined) ?? activeProvider;
+  const fallbackModelPool = Array.from(
+    new Set([
+      ...(fallbackProvider?.models ?? []),
+      ...(activeProvider?.models ?? []),
+      ...(autoReview.fallbackModel && autoReview.fallbackModel !== "同快速模型"
+        ? [autoReview.fallbackModel]
+        : []),
+    ])
+  ).filter(Boolean);
+  const fallbackModelOptions = [
+    { value: "同快速模型", label: `同快速模型（${preferences.models.fast}）` },
+    ...fallbackModelPool.map((m) => ({ value: m, label: m })),
+  ];
+  const openRouterProv = state.providers.find((p) => p.id === "openrouter");
+  const hasJevKeyConfigured =
+    Boolean(autoReview.jevApiKey.trim()) ||
+    (autoReview.jevEndpoint.toLowerCase().includes("openrouter.ai") &&
+      Boolean(openRouterProv?.apiKey?.trim()));
+  const activeReviewEngineSummary =
+    autoReview.engine === "jev"
+      ? hasJevKeyConfigured
+        ? `Jev System One · ${autoReview.jevModel}`
+        : "仅 Jev System One（尚未填写 Key，暂转人工确认）"
+      : autoReview.engine === "auto" && hasJevKeyConfigured
+        ? `Jev System One · ${autoReview.jevModel}`
+        : `审查小模型 · ${
+            autoReview.fallbackModel === "同快速模型"
+              ? preferences.models.fast
+              : autoReview.fallbackModel
+          }（${fallbackProvider?.name ?? preferences.activeProviderId}）`;
 
   const spendPct = Math.min(
     100,
@@ -459,93 +529,155 @@ export const SettingsView: React.FC = () => {
           </div>
         );
 
-      case "cleanup":
+      case "heartbeat":
         return (
           <div className="flex flex-col gap-5">
             <div className="flex flex-col gap-2">
-              <SettingGroupHeader title="删除与还原" source="磁盘守卫 · 卸载清道夫" />
+              <SettingGroupHeader
+                title="主动值守心跳（Heartbeat）"
+                rightAction={
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setHeartbeatLogModalOpen(true)}
+                      className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2.5 text-[11px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                    >
+                      <span>运行记录</span>
+                      {(state.heartbeatLogs ?? []).length > 0 && (
+                        <span className="rounded-full bg-[var(--bg-hover)] px-1.5 font-mono text-[10px]">
+                          {(state.heartbeatLogs ?? []).length}
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void triggerHeartbeatNow()}
+                      className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2.5 text-[11px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                    >
+                      立即巡检
+                    </button>
+                  </div>
+                }
+              />
               <SettingsSectionCard noHeader>
-                <SettingRow first label="删除方式">
-                  <SelectMenu
-                    value={preferences.cleanupPolicy.deleteMethod}
-                    options={[
-                      { value: "移入废纸篓", label: "移入废纸篓" },
-                      { value: "安全移出到隔离区", label: "安全移出到隔离区" },
-                    ]}
-                    onChange={(v) =>
-                      updatePreferences({
-                        cleanupPolicy: {
-                          ...preferences.cleanupPolicy,
-                          deleteMethod: v,
-                        },
-                      })
-                    }
-                  />
-                </SettingRow>
-
-                <SettingRow label="撤销保留期">
-                  <SelectMenu
-                    value={preferences.cleanupPolicy.restoreRetentionDays}
-                    options={[
-                      { value: "3 天", label: "3 天" },
-                      { value: "7 天", label: "7 天" },
-                      { value: "14 天", label: "14 天" },
-                      { value: "30 天", label: "30 天" },
-                    ]}
-                    onChange={(v) =>
-                      updatePreferences({
-                        cleanupPolicy: {
-                          ...preferences.cleanupPolicy,
-                          restoreRetentionDays: v,
-                        },
-                      })
-                    }
-                  />
-                </SettingRow>
-
                 <SettingRow
-                  label="受保护目录"
-                  description="自动扫描与一键清理都会永久跳过以下目录"
-                >
-                  <TagInputList
-                    items={preferences.cleanupPolicy.protectedDirs}
-                    mono
-                    addButtonLabel="+ 添加目录"
-                    placeholder="~/Path"
-                    onChange={(next) =>
-                      updatePreferences({
-                        cleanupPolicy: {
-                          ...preferences.cleanupPolicy,
-                          protectedDirs: next,
-                        },
-                      })
-                    }
-                  />
-                </SettingRow>
-
-                <SettingRow
-                  label="卸载后自动扫描残留"
-                  description="保留含用户文件的目录"
+                  first
+                  label="启用周期值守心跳"
+                  description="默认开启 · 按设定间隔唤醒管家检查待处理事件与系统状态（安静时段自动静默）"
                 >
                   <Switch
-                    checked={preferences.cleanupPolicy.autoScanAfterUninstall}
+                    checked={preferences.heartbeat?.enabled ?? true}
                     onChange={(v) =>
                       updatePreferences({
-                        cleanupPolicy: {
-                          ...preferences.cleanupPolicy,
-                          autoScanAfterUninstall: v,
+                        heartbeat: {
+                          intervalMin: preferences.heartbeat?.intervalMin ?? 30,
+                          prompt:
+                            preferences.heartbeat?.prompt ??
+                            "巡检当前待处理的系统与应用事件、收件箱待确认事项及后台服务状态；若发现需要关注的异常则按自治策略响应或汇总至收件箱，若一切平稳则静默记录心跳。",
+                          lastRunAt: preferences.heartbeat?.lastRunAt,
+                          initialized: true,
+                          enabled: v,
                         },
                       })
                     }
-                    ariaLabel="卸载后自动扫描残留"
+                    ariaLabel="启用周期值守心跳"
                   />
                 </SettingRow>
+
+                <SettingRow label="巡检周期">
+                  <SelectMenu
+                    value={String(preferences.heartbeat?.intervalMin ?? 30)}
+                    options={[
+                      { value: "15", label: "每 15 分钟" },
+                      { value: "30", label: "每 30 分钟" },
+                      { value: "60", label: "每 60 分钟" },
+                      { value: "120", label: "每 120 分钟" },
+                    ]}
+                    onChange={(v) =>
+                      updatePreferences({
+                        heartbeat: {
+                          enabled: preferences.heartbeat?.enabled ?? true,
+                          initialized: true,
+                          intervalMin: Number(v) || 30,
+                          prompt:
+                            preferences.heartbeat?.prompt ??
+                            "巡检当前待处理的系统与应用事件、收件箱待确认事项及后台服务状态；若发现需要关注的异常则按自治策略响应或汇总至收件箱，若一切平稳则静默记录心跳。",
+                          lastRunAt: preferences.heartbeat?.lastRunAt,
+                        },
+                      })
+                    }
+                  />
+                </SettingRow>
+
+                <div className="flex flex-col gap-1.5 border-t border-[var(--border-light)] px-4 py-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[12px] font-medium text-[var(--ink-strong)]">
+                      心跳指令 Prompt
+                    </span>
+                    <span className="font-mono text-[10.5px] text-[var(--ink-subtle)]">
+                      {preferences.heartbeat?.lastRunAt
+                        ? `上次巡检：${preferences.heartbeat.lastRunAt}`
+                        : "已开启周期值守 · 等待首次巡检"}
+                    </span>
+                  </div>
+                  <textarea
+                    rows={2}
+                    value={
+                      preferences.heartbeat?.prompt ??
+                      "巡检当前待处理的系统与应用事件、收件箱待确认事项及后台服务状态；若发现需要关注的异常则按自治策略响应或汇总至收件箱，若一切平稳则静默记录心跳。"
+                    }
+                    onChange={(e) =>
+                      updatePreferences({
+                        heartbeat: {
+                          enabled: preferences.heartbeat?.enabled ?? true,
+                          initialized: true,
+                          intervalMin: preferences.heartbeat?.intervalMin ?? 30,
+                          prompt: e.target.value,
+                          lastRunAt: preferences.heartbeat?.lastRunAt,
+                        },
+                      })
+                    }
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    className="w-full resize-none rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 py-2 text-[12px] leading-[18px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                  />
+                </div>
+
+                <div className="flex items-center gap-3 border-t border-[var(--border-light)] px-4 py-3">
+                  <div className="flex min-w-0 flex-1 items-baseline gap-2">
+                    <span className="font-mono text-[12px] font-semibold text-[var(--ink-strong)]">
+                      {(state.heartbeatLogs ?? []).length} 条心跳运行记录
+                    </span>
+                    <span className="truncate text-[11px] text-[var(--ink-subtle)]">
+                      {preferences.heartbeat?.lastRunAt
+                        ? `最近一次 ${preferences.heartbeat.lastRunAt}`
+                        : "尚未产生记录"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setHeartbeatLogModalOpen(true)}
+                    className="inline-flex h-7 shrink-0 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-2.5 text-[11.5px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                  >
+                    查看运行记录
+                  </button>
+                  {(state.heartbeatLogs ?? []).length > 0 && (
+                    <button
+                      type="button"
+                      onClick={clearHeartbeatLogs}
+                      className="inline-flex h-7 shrink-0 cursor-pointer items-center rounded-[7px] px-2 text-[11.5px] font-medium text-[var(--danger)] hover:bg-[var(--danger-bg)]"
+                    >
+                      清空
+                    </button>
+                  )}
+                </div>
               </SettingsSectionCard>
             </div>
 
             <div className="flex flex-col gap-2">
               <SettingGroupHeader
-                title="定时与事件自动化"
+                title="定时与事件编排"
                 rightAction={
                   <button
                     type="button"
@@ -803,17 +935,25 @@ export const SettingsView: React.FC = () => {
               />
             </SettingRow>
             <SettingRow
-              label="全局唤起"
-              description="在任何应用中弹出迷你输入框"
+              label="运行中发送新消息"
+              description="排队等待：先进入待发送队列依次执行；实时引导：立即注入当前轮次调整方向"
             >
-              <Kbd keys={preferences.globalHotkey} />
+              <SegmentedControl<"queue" | "steer">
+                value={preferences.busyMessagePolicy ?? "queue"}
+                onChange={(v) => updatePreferences({ busyMessagePolicy: v })}
+                options={[
+                  { value: "queue", label: "排队等待" },
+                  { value: "steer", label: "实时引导" },
+                ]}
+              />
             </SettingRow>
           </SettingsSectionCard>
         );
 
       case "models":
         return (
-          <SettingsSectionCard noHeader>
+          <div className="flex flex-col gap-5">
+            <SettingsSectionCard noHeader>
             {state.providers.map((prov, idx) => {
               const active = prov.id === preferences.activeProviderId;
               const configured = Boolean(prov.apiKey?.trim()) || prov.verified;
@@ -912,6 +1052,9 @@ export const SettingsView: React.FC = () => {
                             ? "sk-..."
                             : "输入服务商 API Key"
                       }
+                      autoCorrect="off"
+                      autoCapitalize="off"
+                      spellCheck={false}
                       className="h-[32px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
                     />
                   </label>
@@ -936,6 +1079,9 @@ export const SettingsView: React.FC = () => {
                           ? "http://localhost:11434"
                           : "使用默认官方端点"
                       }
+                      autoCorrect="off"
+                      autoCapitalize="off"
+                      spellCheck={false}
                       className="h-[30px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[11px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
                     />
                   </label>
@@ -949,6 +1095,9 @@ export const SettingsView: React.FC = () => {
                         updateProvider(activeProvider.id, { proxyUrl: e.target.value })
                       }
                       placeholder="http://127.0.0.1:7890"
+                      autoCorrect="off"
+                      autoCapitalize="off"
+                      spellCheck={false}
                       className="h-[30px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[11px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
                     />
                   </label>
@@ -1089,6 +1238,225 @@ export const SettingsView: React.FC = () => {
               />
             </SettingRow>
           </SettingsSectionCard>
+
+          <div className="flex flex-col gap-2">
+            <SettingGroupHeader
+              title="Auto Review 权限审查模型"
+              rightAction={
+                <span className="font-mono text-[10px] text-[var(--ink-subtle)]">
+                  {activeReviewEngineSummary}
+                </span>
+              }
+            />
+            <SettingsSectionCard noHeader>
+              <div className="flex flex-col gap-2 px-4 py-3.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[13px] font-medium text-[var(--ink-strong)]">
+                    审查决策引擎
+                  </span>
+                  <span className="text-[11px] text-[var(--ink-muted)]">
+                    在「Auto Review」模式下决定是否自动放行敏感或非纯只读操作
+                  </span>
+                </div>
+                <SegmentedControl<"auto" | "jev" | "llm">
+                  fullWidth
+                  value={autoReview.engine}
+                  onChange={(engine) => updateAutoReview({ engine })}
+                  options={[
+                    { value: "auto", label: "自动（优先 Jev）" },
+                    { value: "jev", label: "仅 Jev System One" },
+                    { value: "llm", label: "仅审查小模型" },
+                  ]}
+                />
+              </div>
+
+              {autoReview.engine !== "llm" && (
+                <div className="flex flex-col gap-3 border-t border-[var(--border-light)] bg-[var(--bg-subtle)] px-4 py-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[12px] font-semibold text-[var(--ink-strong)]">
+                      Jev System One 决策模型（/v1/systemone）
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          updateAutoReview({
+                            jevEndpoint: "https://api.typesafe.ai/v1/systemone",
+                            jevModel: "jev-latest",
+                          })
+                        }
+                        className="cursor-pointer rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2 py-0.5 text-[10.5px] text-[var(--ink-secondary)] hover:text-[var(--ink-strong)]"
+                      >
+                        TypeSafe 官方
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          updateAutoReview({
+                            jevEndpoint: "https://openrouter.ai/api/v1/systemone",
+                            jevModel: "typesafe/jev-1.14",
+                          })
+                        }
+                        className="cursor-pointer rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2 py-0.5 text-[10.5px] text-[var(--ink-secondary)] hover:text-[var(--ink-strong)]"
+                      >
+                        OpenRouter
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowJevKey((v) => !v)}
+                        className="cursor-pointer text-[11px] text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
+                      >
+                        {showJevKey ? "隐藏 Key" : "显示 Key"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <label className="flex flex-col gap-1">
+                    <span className="text-[11px] text-[var(--ink-muted)]">
+                      Jev API Key（写入 macOS 钥匙串；OpenRouter 端点留空时自动复用上方 OpenRouter Key）
+                    </span>
+                    <input
+                      type={showJevKey ? "text" : "password"}
+                      value={autoReview.jevApiKey}
+                      onChange={(e) =>
+                        updateAutoReview({
+                          jevApiKey: e.target.value,
+                          jevApiKeyMasked: e.target.value
+                            ? `${e.target.value.slice(0, 6)}••••${e.target.value.slice(-4)}`
+                            : "",
+                          jevVerified: false,
+                        })
+                      }
+                      placeholder={
+                        autoReview.jevEndpoint.toLowerCase().includes("openrouter.ai")
+                          ? "sk-or-...（留空将复用 OpenRouter 服务商 Key）"
+                          : "ts-...（留空则自动回退至下方审查小模型）"
+                      }
+                      className="h-[32px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                    />
+                  </label>
+
+                  <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                    <label className="flex flex-col gap-1">
+                      <span className="text-[11px] text-[var(--ink-muted)]">
+                        System One Endpoint
+                      </span>
+                      <input
+                        type="text"
+                        value={autoReview.jevEndpoint}
+                        onChange={(e) =>
+                          updateAutoReview({ jevEndpoint: e.target.value, jevVerified: false })
+                        }
+                        placeholder="https://api.typesafe.ai/v1/systemone"
+                        className="h-[30px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[11px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                      />
+                    </label>
+
+                    <label className="flex flex-col gap-1">
+                      <span className="text-[11px] text-[var(--ink-muted)]">
+                        Jev 模型 ID
+                      </span>
+                      <input
+                        type="text"
+                        value={autoReview.jevModel}
+                        onChange={(e) =>
+                          updateAutoReview({ jevModel: e.target.value, jevVerified: false })
+                        }
+                        placeholder="jev-latest 或 typesafe/jev-1.14"
+                        className="h-[30px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[11px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                      />
+                    </label>
+                  </div>
+                </div>
+              )}
+
+              {autoReview.engine !== "jev" && (
+                <>
+                  <SettingRow
+                    label="审查小模型服务商"
+                    description={
+                      autoReview.engine === "auto"
+                        ? "未配置 Jev 时作为回退审查模型"
+                        : "用于快速评估权限风险"
+                    }
+                    tinted
+                  >
+                    <SelectMenu
+                      value={autoReview.fallbackProviderId || ""}
+                      options={[
+                        {
+                          value: "",
+                          label: `跟随主服务商（${activeProvider?.name ?? preferences.activeProviderId}）`,
+                        },
+                        ...state.providers.map((p) => ({
+                          value: p.id,
+                          label: p.name,
+                        })),
+                      ]}
+                      onChange={(v) => updateAutoReview({ fallbackProviderId: v })}
+                    />
+                  </SettingRow>
+                  <SettingRow
+                    label="审查小模型"
+                    description="建议使用 Haiku / Flash / Mini / 本地轻量模型以降低延迟"
+                    tinted
+                  >
+                    <SelectMenu
+                      value={autoReview.fallbackModel}
+                      options={fallbackModelOptions}
+                      onChange={(v) => updateAutoReview({ fallbackModel: v })}
+                      mono
+                      searchable={fallbackModelOptions.length > 8}
+                    />
+                  </SettingRow>
+                </>
+              )}
+
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--border-light)] px-4 py-3">
+                <button
+                  type="button"
+                  disabled={testingAutoReview}
+                  onClick={async () => {
+                    setTestingAutoReview(true);
+                    setAutoReviewTestReply(null);
+                    try {
+                      const res = await valetService.testAutoReview(autoReview);
+                      setAutoReviewTestReply(res.reply);
+                      if (res.ok && autoReview.engine !== "llm" && hasJevKeyConfigured) {
+                        updatePreferences({
+                          autoReview: {
+                            ...autoReview,
+                            jevVerified: true,
+                            jevLatencyMs: res.latencyMs,
+                          },
+                        });
+                      }
+                      pushToast(res.reply, res.ok ? "success" : "warning");
+                    } catch (err) {
+                      const msg = err instanceof Error ? err.message : String(err);
+                      setAutoReviewTestReply(`测试失败：${msg}`);
+                      pushToast(msg, "danger");
+                    } finally {
+                      setTestingAutoReview(false);
+                    }
+                  }}
+                  className="inline-flex h-7 cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] px-3 text-[11px] font-semibold text-[var(--ink-on-primary)] disabled:opacity-60"
+                >
+                  {testingAutoReview ? "检测中…" : "测试 Auto Review 决策"}
+                </button>
+                <span className="text-[11px] text-[var(--ink-subtle)]">
+                  纯只读命令与受信任插件脚本 0ms 本地直通，不消耗审查额度
+                </span>
+              </div>
+
+              {autoReviewTestReply && (
+                <div className="border-t border-[var(--border-light)] bg-[var(--bg-subtle)] px-4 py-2.5 font-mono text-[11px] text-[var(--ink-secondary)]">
+                  {autoReviewTestReply}
+                </div>
+              )}
+            </SettingsSectionCard>
+          </div>
+          </div>
         );
 
       case "persona":
@@ -1099,6 +1467,9 @@ export const SettingsView: React.FC = () => {
                 type="text"
                 value={preferences.userNickname}
                 onChange={(e) => updatePreferences({ userNickname: e.target.value })}
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
                 className="h-7 w-[140px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
               />
             </SettingRow>
@@ -1129,6 +1500,9 @@ export const SettingsView: React.FC = () => {
                 onChange={(e) =>
                   updatePreferences({ customInstructions: e.target.value })
                 }
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
                 className="min-h-[104px] w-full resize-y rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 py-2.5 font-mono text-[11px] leading-[18px] text-[var(--ink-secondary)] outline-none focus:border-[var(--ink-primary)]"
               />
             </div>
@@ -1137,108 +1511,192 @@ export const SettingsView: React.FC = () => {
 
       case "safety":
         return (
-          <SettingsSectionCard noHeader critical>
-            <div className="flex flex-col gap-2 px-4 py-3.5">
-              <div className="flex items-center justify-between">
-                <span className="text-[13px] font-medium text-[var(--ink-strong)]">
-                  自主程度
-                </span>
-                <span className="rounded-[4px] bg-[var(--ink-primary)] px-1.5 py-[2px] font-mono text-[9px] tracking-[0.12em] text-[var(--ink-on-primary)]">
-                  CRITICAL
-                </span>
+          <div className="flex flex-col gap-5">
+            <SettingsSectionCard noHeader critical>
+              <div className="flex flex-col gap-2 px-4 py-3.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[13px] font-medium text-[var(--ink-strong)]">
+                    自主程度
+                  </span>
+                  <span className="rounded-[4px] bg-[var(--ink-primary)] px-1.5 py-[2px] font-mono text-[9px] tracking-[0.12em] text-[var(--ink-on-primary)]">
+                    CRITICAL
+                  </span>
+                </div>
+                <SegmentedControl<AutonomyLevel>
+                  fullWidth
+                  value={preferences.autonomyLevel}
+                  onChange={setAutonomyLevel}
+                  options={[
+                    { value: "always_ask", label: "每个都询问" },
+                    { value: "auto_review", label: "Auto Review" },
+                    { value: "full_access", label: "Full Access" },
+                  ]}
+                />
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5 text-[11px] text-[var(--ink-muted)]">
+                  <span>
+                    {preferences.autonomyLevel === "always_ask"
+                      ? "除纯只读探测工具外，其余工具与终端命令都会请求确认。"
+                      : preferences.autonomyLevel === "full_access"
+                        ? "仅拦截系统硬红线（sudo / 钥匙串 / 受保护目录）与全局开关；其余全自动放行。"
+                        : `当前由「${activeReviewEngineSummary}」智能判断风险（未配置有效凭据时自动降级人工确认）。`}
+                  </span>
+                  {preferences.autonomyLevel === "auto_review" && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveSettingsSection("models")}
+                      className="shrink-0 cursor-pointer font-medium text-[var(--ink-strong)] hover:underline"
+                    >
+                      配置审查模型 →
+                    </button>
+                  )}
+                </div>
               </div>
-              <SegmentedControl<AutonomyLevel>
-                fullWidth
-                value={preferences.autonomyLevel}
-                onChange={setAutonomyLevel}
-                options={[
-                  { value: "always_ask", label: "每步询问" },
-                  { value: "sensitive_only", label: "敏感操作询问" },
-                  { value: "autonomous", label: "完全自主" },
-                ]}
-              />
-            </div>
 
-            <div className="flex flex-col gap-[9px] border-t border-[var(--border-light)] px-4 py-3.5">
-              <span className="text-[13px] font-medium text-[var(--ink-strong)]">
-                以下操作始终需要确认
-              </span>
-              {(
-                [
-                  { key: "deleteOrOverwrite", label: "删除或覆盖文件" },
-                  { key: "sendMessageOrEmail", label: "发送消息、邮件" },
-                  { key: "paymentOrSubscription", label: "付款、下单、订阅" },
-                  { key: "runTerminalCommand", label: "执行终端命令" },
-                  { key: "modifySystemSettings", label: "修改系统设置" },
-                ] as const
-              ).map((item) => {
-                const checked = preferences.confirmChecklist[item.key];
-                return (
-                  <div
-                    key={item.key}
-                    onClick={() =>
-                      updatePreferences({
-                        confirmChecklist: {
-                          ...preferences.confirmChecklist,
-                          [item.key]: !checked,
-                        },
-                      })
-                    }
-                    className="flex cursor-pointer items-center gap-2.5"
-                  >
-                    <Checkbox
-                      size="md"
-                      checked={checked}
-                      onChange={(val) =>
+              <div className="flex flex-col gap-[9px] border-t border-[var(--border-light)] px-4 py-3.5">
+                <span className="text-[13px] font-medium text-[var(--ink-strong)]">
+                  以下操作始终需要确认
+                </span>
+                {(
+                  [
+                    { key: "deleteOrOverwrite", label: "删除或覆盖文件" },
+                    { key: "sendMessageOrEmail", label: "发送消息、邮件" },
+                    { key: "paymentOrSubscription", label: "付款、下单、订阅" },
+                    { key: "runTerminalCommand", label: "执行终端命令" },
+                    { key: "modifySystemSettings", label: "修改系统设置" },
+                  ] as const
+                ).map((item) => {
+                  const checked = preferences.confirmChecklist[item.key];
+                  return (
+                    <div
+                      key={item.key}
+                      onClick={() =>
                         updatePreferences({
                           confirmChecklist: {
                             ...preferences.confirmChecklist,
-                            [item.key]: val,
+                            [item.key]: !checked,
                           },
                         })
                       }
-                    />
-                    <span
-                      className={`text-[12px] ${
-                        checked
-                          ? "text-[var(--ink-strong)]"
-                          : "text-[var(--ink-muted)]"
-                      }`}
+                      className="flex cursor-pointer items-center gap-2.5"
                     >
-                      {item.label}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="flex flex-col gap-2 border-t border-[var(--border-light)] px-4 py-3.5">
-              <span className="text-[13px] font-medium text-[var(--ink-strong)]">
-                禁止操作的应用
-              </span>
-              <TagInputList
-                items={preferences.blockedApps}
-                onChange={(next) => updatePreferences({ blockedApps: next })}
-                placeholder="输入应用名后回车"
-              />
-            </div>
-
-            <button
-              type="button"
-              onClick={togglePauseValet}
-              className="flex w-full cursor-pointer items-center gap-3 border-t border-[var(--border-light)] bg-[var(--ink-primary)] px-4 py-3 text-left text-[var(--ink-on-primary)] transition-opacity hover:opacity-95"
-            >
-              <div className="flex flex-1 flex-col gap-0.5">
-                <span className="text-[13px] font-semibold">
-                  {state.isPaused ? "恢复 Valet 运行" : "紧急停止"}
-                </span>
-                <span className="text-[11px] opacity-65">
-                  立即中止所有动作并释放鼠标键盘
-                </span>
+                      <Checkbox
+                        size="md"
+                        checked={checked}
+                        onChange={(val) =>
+                          updatePreferences({
+                            confirmChecklist: {
+                              ...preferences.confirmChecklist,
+                              [item.key]: val,
+                            },
+                          })
+                        }
+                      />
+                      <span
+                        className={`text-[12px] ${
+                          checked
+                            ? "text-[var(--ink-strong)]"
+                            : "text-[var(--ink-muted)]"
+                        }`}
+                      >
+                        {item.label}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
-              <Kbd keys={preferences.emergencyStopShortcut} dark />
-            </button>
-          </SettingsSectionCard>
+
+              <div className="flex flex-col gap-2 border-t border-[var(--border-light)] px-4 py-3.5">
+                <span className="text-[13px] font-medium text-[var(--ink-strong)]">
+                  禁止操作的应用
+                </span>
+                <TagInputList
+                  items={preferences.blockedApps}
+                  onChange={(next) => updatePreferences({ blockedApps: next })}
+                  placeholder="输入应用名后回车"
+                />
+              </div>
+
+              <button
+                type="button"
+                onClick={togglePauseValet}
+                className="flex w-full cursor-pointer items-center gap-3 border-t border-[var(--border-light)] bg-[var(--ink-primary)] px-4 py-3 text-left text-[var(--ink-on-primary)] transition-opacity hover:opacity-95"
+              >
+                <div className="flex flex-1 flex-col gap-0.5">
+                  <span className="text-[13px] font-semibold">
+                    {state.isPaused ? "恢复 Valet 运行" : "紧急停止"}
+                  </span>
+                  <span className="text-[11px] opacity-65">
+                    立即中止所有动作并释放鼠标键盘
+                  </span>
+                </div>
+                <Kbd keys={preferences.emergencyStopShortcut} dark />
+              </button>
+            </SettingsSectionCard>
+
+            <div className="flex flex-col gap-2">
+              <SettingGroupHeader title="动作可逆性与受保护路径" />
+              <SettingsSectionCard noHeader>
+                <SettingRow
+                  first
+                  label="受保护路径"
+                  description="任何插件与自动化任务均严禁改动以下目录"
+                >
+                  <TagInputList
+                    items={preferences.cleanupPolicy.protectedDirs}
+                    mono
+                    addButtonLabel="+ 添加目录"
+                    placeholder="~/Path"
+                    onChange={(next) =>
+                      updatePreferences({
+                        cleanupPolicy: {
+                          ...preferences.cleanupPolicy,
+                          protectedDirs: next,
+                        },
+                      })
+                    }
+                  />
+                </SettingRow>
+
+                <SettingRow label="文件变更兜底方式">
+                  <SelectMenu
+                    value={preferences.cleanupPolicy.deleteMethod}
+                    options={[
+                      { value: "移入废纸篓", label: "移入废纸篓" },
+                      { value: "安全移出到隔离区", label: "安全移出到隔离区" },
+                    ]}
+                    onChange={(v) =>
+                      updatePreferences({
+                        cleanupPolicy: {
+                          ...preferences.cleanupPolicy,
+                          deleteMethod: v,
+                        },
+                      })
+                    }
+                  />
+                </SettingRow>
+
+                <SettingRow label="可撤销保留期">
+                  <SelectMenu
+                    value={preferences.cleanupPolicy.restoreRetentionDays}
+                    options={[
+                      { value: "3 天", label: "3 天" },
+                      { value: "7 天", label: "7 天" },
+                      { value: "14 天", label: "14 天" },
+                      { value: "30 天", label: "30 天" },
+                    ]}
+                    onChange={(v) =>
+                      updatePreferences({
+                        cleanupPolicy: {
+                          ...preferences.cleanupPolicy,
+                          restoreRetentionDays: v,
+                        },
+                      })
+                    }
+                  />
+                </SettingRow>
+              </SettingsSectionCard>
+            </div>
+          </div>
         );
 
       case "permissions":
@@ -1604,6 +2062,9 @@ export const SettingsView: React.FC = () => {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="搜索设置"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
               className="min-w-0 flex-1 bg-transparent text-[12px] text-[var(--ink-strong)] outline-none placeholder:text-[var(--ink-subtle)]"
             />
             {query && (
@@ -1618,7 +2079,7 @@ export const SettingsView: React.FC = () => {
           </div>
 
           <div className="mt-1 flex min-h-0 flex-1 flex-col gap-[1px] overflow-y-auto pr-0.5">
-            {(["Agent", "Care", "System"] as const).map((groupName, gIdx) => {
+            {(["Agent", "Steward", "System"] as const).map((groupName, gIdx) => {
               const groupSections = filteredSections.filter(
                 (s) => s.group === groupName
               );
@@ -1689,6 +2150,9 @@ export const SettingsView: React.FC = () => {
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="搜索设置"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                   className="min-w-0 flex-1 bg-transparent text-[11px] text-[var(--ink-strong)] outline-none placeholder:text-[var(--ink-subtle)]"
                 />
               </div>
@@ -1741,17 +2205,52 @@ export const SettingsView: React.FC = () => {
           </div>
         )}
 
-        {/* Desktop subtle draggable top bar with optional SidebarToggle */}
+        {/* Desktop subtle draggable top bar + sticky section header */}
         {!isCompactViewport && (
-          <header className="app-drag flex h-[44px] shrink-0 items-center px-6">
-            {sidebarCollapsed && <SidebarToggleButton title="设置" />}
-          </header>
+          <div className="z-10 flex shrink-0 flex-col bg-[var(--bg-canvas)]">
+            <header
+              className={`app-drag flex h-[44px] shrink-0 items-center px-6 ${
+                query.trim() ? "border-b border-[var(--border-subtle)]" : ""
+              }`}
+            >
+              {sidebarCollapsed && <SidebarToggleButton title="设置" />}
+            </header>
+
+            {!query.trim() && (
+              <div
+                className={`border-b border-[var(--border-light)] pb-4 ${
+                  sidebarCollapsed ? "px-6 pt-2" : "px-6 pt-2 xl:px-10"
+                }`}
+              >
+                <div className="flex max-w-[780px] items-end justify-between gap-4">
+                  <div className="flex flex-col gap-1.5">
+                    <h1 className="font-[family-name:var(--font-serif-zh)] text-[22px] font-medium leading-[28px] text-[var(--ink-strong)] lg:text-[28px] lg:leading-[36px]">
+                      {activeSectionMeta.title}
+                    </h1>
+                    <p className="text-[12px] leading-[16px] text-[var(--ink-muted)] lg:text-[13px]">
+                      {activeSectionMeta.subtitle}
+                    </p>
+                  </div>
+
+                  {activeSectionId === "thresholds" && (
+                    <button
+                      type="button"
+                      onClick={resetThresholdsToDefault}
+                      className="shrink-0 cursor-pointer text-[11px] font-medium text-[var(--ink-muted)] transition-colors hover:text-[var(--ink-strong)] lg:text-[12px]"
+                    >
+                      恢复默认
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
         )}
 
         {/* Scrollable Detail Content */}
         <div
           className={`min-h-0 flex-1 overflow-y-auto pb-8 ${
-            isCompactViewport || sidebarCollapsed ? "px-6 pt-3" : "px-6 pt-3 xl:px-10"
+            isCompactViewport || sidebarCollapsed ? "px-6 pt-4" : "px-6 pt-5 xl:px-10"
           }`}
         >
           {query.trim() ? (
@@ -1792,27 +2291,29 @@ export const SettingsView: React.FC = () => {
             )
           ) : (
             <div className="flex max-w-[780px] flex-col gap-[22px]">
-              {/* Detail Header */}
-              <div className="flex items-end justify-between gap-4">
-                <div className="flex flex-col gap-1.5">
-                  <h1 className="font-[family-name:var(--font-serif-zh)] text-[22px] font-medium leading-[28px] text-[var(--ink-strong)] lg:text-[28px] lg:leading-[36px]">
-                    {activeSectionMeta.title}
-                  </h1>
-                  <p className="text-[12px] leading-[16px] text-[var(--ink-muted)] lg:text-[13px]">
-                    {activeSectionMeta.subtitle}
-                  </p>
-                </div>
+              {/* Compact viewport detail header (desktop uses sticky header above) */}
+              {isCompactViewport && (
+                <div className="flex items-end justify-between gap-4">
+                  <div className="flex flex-col gap-1.5">
+                    <h1 className="font-[family-name:var(--font-serif-zh)] text-[22px] font-medium leading-[28px] text-[var(--ink-strong)] lg:text-[28px] lg:leading-[36px]">
+                      {activeSectionMeta.title}
+                    </h1>
+                    <p className="text-[12px] leading-[16px] text-[var(--ink-muted)] lg:text-[13px]">
+                      {activeSectionMeta.subtitle}
+                    </p>
+                  </div>
 
-                {activeSectionId === "thresholds" && (
-                  <button
-                    type="button"
-                    onClick={resetThresholdsToDefault}
-                    className="shrink-0 cursor-pointer text-[11px] font-medium text-[var(--ink-muted)] transition-colors hover:text-[var(--ink-strong)] lg:text-[12px]"
-                  >
-                    恢复默认
-                  </button>
-                )}
-              </div>
+                  {activeSectionId === "thresholds" && (
+                    <button
+                      type="button"
+                      onClick={resetThresholdsToDefault}
+                      className="shrink-0 cursor-pointer text-[11px] font-medium text-[var(--ink-muted)] transition-colors hover:text-[var(--ink-strong)] lg:text-[12px]"
+                    >
+                      恢复默认
+                    </button>
+                  )}
+                </div>
+              )}
 
               {renderSectionBody(activeSectionId)}
             </div>
@@ -1882,6 +2383,9 @@ export const SettingsView: React.FC = () => {
               type="text"
               value={ruleWhen}
               onChange={(e) => setRuleWhen(e.target.value)}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
               className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 text-[13px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
             />
           </label>
@@ -1894,6 +2398,9 @@ export const SettingsView: React.FC = () => {
               value={ruleCronExpr}
               onChange={(e) => setRuleCronExpr(e.target.value)}
               placeholder="30 9 * * *"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
               className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
             />
           </label>
@@ -1905,6 +2412,9 @@ export const SettingsView: React.FC = () => {
               type="text"
               value={ruleTitle}
               onChange={(e) => setRuleTitle(e.target.value)}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
               className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 text-[13px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
             />
           </label>
@@ -1916,6 +2426,9 @@ export const SettingsView: React.FC = () => {
               value={rulePrompt}
               onChange={(e) => setRulePrompt(e.target.value)}
               rows={3}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
               className="rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] p-2.5 text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
             />
           </label>
@@ -1957,6 +2470,48 @@ export const SettingsView: React.FC = () => {
         title="本地记忆管理"
         subtitle="以下偏好仅存储在你的 Mac 本地"
       >
+        <div className="mb-3 flex items-center gap-2">
+          <input
+            type="text"
+            value={newMemoryText}
+            onChange={(e) => setNewMemoryText(e.target.value)}
+            onCompositionEnd={() => {
+              memoryCompEndRef.current = performance.now();
+            }}
+            onKeyDown={(e) => {
+              if (
+                e.nativeEvent.isComposing ||
+                e.keyCode === 229 ||
+                e.nativeEvent.keyCode === 229 ||
+                performance.now() - memoryCompEndRef.current < 100
+              ) {
+                return;
+              }
+              if (e.key === "Enter" && newMemoryText.trim()) {
+                e.preventDefault();
+                void addMemoryEntry(newMemoryText.trim(), "手动添加");
+                setNewMemoryText("");
+              }
+            }}
+            placeholder="输入要长期记住的习惯或偏好（如：永远不要清理 ~/Work）"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            className="h-[34px] flex-1 rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+          />
+          <button
+            type="button"
+            disabled={!newMemoryText.trim()}
+            onClick={() => {
+              if (!newMemoryText.trim()) return;
+              void addMemoryEntry(newMemoryText.trim(), "手动添加");
+              setNewMemoryText("");
+            }}
+            className="h-[34px] shrink-0 cursor-pointer rounded-[8px] bg-[var(--ink-primary)] px-3 text-[12px] font-semibold text-[var(--ink-on-primary)] disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            + 添加记忆
+          </button>
+        </div>
         <div className="flex max-h-[300px] flex-col gap-2 overflow-y-auto">
           {state.memories.length === 0 ? (
             <div className="py-8 text-center text-[12px] text-[var(--ink-muted)]">
@@ -2004,6 +2559,9 @@ export const SettingsView: React.FC = () => {
               type="text"
               value={mcpName}
               onChange={(e) => setMcpName(e.target.value)}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
               className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 text-[13px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
             />
           </label>
@@ -2031,6 +2589,9 @@ export const SettingsView: React.FC = () => {
                   value={mcpCommand}
                   onChange={(e) => setMcpCommand(e.target.value)}
                   placeholder="npx"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                   className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
                 />
               </label>
@@ -2043,6 +2604,9 @@ export const SettingsView: React.FC = () => {
                   value={mcpArgsText}
                   onChange={(e) => setMcpArgsText(e.target.value)}
                   placeholder="-y @modelcontextprotocol/server-filesystem ~/Downloads"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                   className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
                 />
               </label>
@@ -2057,6 +2621,9 @@ export const SettingsView: React.FC = () => {
                 value={mcpUrl}
                 onChange={(e) => setMcpUrl(e.target.value)}
                 placeholder="http://localhost:3100/mcp"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
                 className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
               />
             </label>
@@ -2097,6 +2664,74 @@ export const SettingsView: React.FC = () => {
           >
             接入并探测工具
           </button>
+        </div>
+      </Modal>
+
+      {/* Heartbeat Run History Modal */}
+      <Modal
+        open={heartbeatLogModalOpen}
+        onClose={() => setHeartbeatLogModalOpen(false)}
+        title="心跳运行记录"
+        subtitle="周期巡检记录独立保存在此处，不会写入事件时间线"
+        widthClass="max-w-[560px]"
+      >
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <button
+            type="button"
+            onClick={() => void triggerHeartbeatNow()}
+            className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2.5 text-[11.5px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+          >
+            立即执行一次巡检
+          </button>
+          {(state.heartbeatLogs ?? []).length > 0 && (
+            <button
+              type="button"
+              onClick={clearHeartbeatLogs}
+              className="inline-flex h-7 cursor-pointer items-center rounded-[7px] px-2.5 text-[11.5px] font-medium text-[var(--danger)] hover:bg-[var(--danger-bg)]"
+            >
+              清空记录
+            </button>
+          )}
+        </div>
+        <div className="flex max-h-[400px] flex-col gap-2.5 overflow-y-auto pr-0.5">
+          {(state.heartbeatLogs ?? []).length === 0 ? (
+            <div className="py-10 text-center text-[12px] text-[var(--ink-muted)]">
+              暂无心跳运行记录，可等待周期触发或点击上方「立即执行一次巡检」
+            </div>
+          ) : (
+            (state.heartbeatLogs ?? []).map((log) => (
+              <div
+                key={log.id}
+                className="rounded-[10px] border border-[var(--border-base)] bg-[var(--bg-canvas)] p-3"
+              >
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`h-2 w-2 shrink-0 rounded-full ${
+                      log.status === "error"
+                        ? "bg-[var(--danger)]"
+                        : "bg-emerald-500"
+                    }`}
+                  />
+                  <span className="font-mono text-[11px] font-semibold text-[var(--ink-strong)]">
+                    {log.createdAt}
+                  </span>
+                  {log.model && (
+                    <span className="rounded-[5px] bg-[var(--bg-subtle)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-muted)]">
+                      {log.model}
+                    </span>
+                  )}
+                  {typeof log.durationMs === "number" && log.durationMs > 0 && (
+                    <span className="font-mono text-[10px] text-[var(--ink-subtle)]">
+                      {(log.durationMs / 1000).toFixed(1)}s
+                    </span>
+                  )}
+                </div>
+                <div className="mt-1.5 text-[12.5px] leading-[19px] text-[var(--ink-body)]">
+                  <MarkdownRenderer text={log.detail || log.summary} />
+                </div>
+              </div>
+            ))
+          )}
         </div>
       </Modal>
     </div>

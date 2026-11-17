@@ -1,6 +1,11 @@
 import React, { useState } from "react";
-import type { ChatMessage, PluginDraftSpec } from "../../types/valet";
+import type {
+  ChatMessage,
+  PendingPermissionRequest,
+  PluginDraftSpec,
+} from "../../types/valet";
 import { CheckIcon } from "../ui/Icons";
+import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { Modal } from "../ui/Modal";
 
 export const ProcessTableCard: React.FC<{
@@ -133,6 +138,11 @@ export const PluginDraftCard: React.FC<{
             <span className="rounded-[4px] bg-[var(--ink-primary)] px-1.5 py-[2px] font-mono text-[9px] tracking-[0.12em] text-[var(--ink-on-primary)]">
               PLUGIN DRAFT
             </span>
+            {draft.sensor && (
+              <span className="rounded-[4px] border border-[var(--border-control)] bg-[var(--bg-subtle)] px-1.5 py-[1px] font-mono text-[9.5px] text-[var(--ink-muted)]">
+                {draft.sensor}
+              </span>
+            )}
             <span className="truncate text-[14px] font-semibold leading-[18px] text-[var(--ink-strong)]">
               {draft.name}
             </span>
@@ -177,12 +187,27 @@ export const PluginDraftCard: React.FC<{
       <Modal
         open={codeOpen}
         onClose={() => setCodeOpen(false)}
-        title={`插件清单 · ${draft.name}`}
-        subtitle="~/.valet/plugins/manifest.yaml"
+        title={`闭环插件定义 · ${draft.name}`}
+        subtitle="triggers + sensor + SKILL.md"
       >
-        <pre className="overflow-x-auto rounded-[10px] bg-[var(--bg-code)] p-3.5 font-mono text-[11px] leading-[18px] text-[var(--ink-secondary)]">
-          {draft.manifestYaml}
-        </pre>
+        <div className="flex max-h-[65vh] flex-col gap-3 overflow-y-auto">
+          {draft.skillMarkdown && (
+            <div className="rounded-[10px] border border-[var(--border-light)] bg-[var(--bg-subtle)] p-3.5 text-[12.5px] leading-[19px] text-[var(--ink-body)]">
+              <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.1em] text-[var(--ink-subtle)]">
+                SKILL.md · 处理逻辑
+              </div>
+              <MarkdownRenderer text={draft.skillMarkdown} />
+            </div>
+          )}
+          <div>
+            <div className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.1em] text-[var(--ink-subtle)]">
+              manifest.yaml · 事件与传感器声明
+            </div>
+            <pre className="overflow-x-auto rounded-[10px] bg-[var(--bg-code)] p-3.5 font-mono text-[11px] leading-[18px] text-[var(--ink-secondary)]">
+              {draft.manifestYaml}
+            </pre>
+          </div>
+        </div>
         <div className="mt-4 flex justify-end gap-2">
           {!draft.installed && (
             <button
@@ -218,143 +243,202 @@ function stripThinkMarkup(raw: string): string {
   return clean.replace(/^\s+/, "");
 }
 
-const InlineFormatted: React.FC<{ text: string }> = ({ text }) => {
-  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+export interface StepRowItem {
+  id: string;
+  name: string;
+  label?: string;
+  status: string;
+  detail?: string;
+}
+
+export const ToolStepsList: React.FC<{ steps: StepRowItem[] }> = ({ steps }) => {
+  if (!steps || steps.length === 0) return null;
   return (
-    <>
-      {parts.map((part, i) => {
-        if (part.startsWith("`") && part.endsWith("`") && part.length >= 2) {
-          return (
-            <code
-              key={i}
-              className="rounded-[4px] bg-[var(--bg-muted)] px-1 py-0.5 font-mono text-[12.5px] font-semibold text-[var(--ink-strong)]"
-            >
-              {part.slice(1, -1)}
-            </code>
-          );
-        }
-        if (part.startsWith("**") && part.endsWith("**") && part.length >= 4) {
-          return (
-            <strong key={i} className="font-semibold text-[var(--ink-strong)]">
-              {part.slice(2, -2)}
-            </strong>
-          );
-        }
-        return <React.Fragment key={i}>{part}</React.Fragment>;
+    <div className="flex flex-col gap-1 rounded-[10px] border border-[var(--border-light)] bg-[var(--bg-subtle)]/60 px-3 py-2">
+      {steps.map((step) => {
+        const isRunning = step.status === "running" || step.status === "pending";
+        const isError = step.status === "error";
+        return (
+          <div
+            key={step.id}
+            className="flex items-center gap-2 text-[12px] leading-[18px]"
+          >
+            <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center font-mono text-[11px]">
+              {isError ? (
+                <span className="text-[var(--danger)]">✕</span>
+              ) : isRunning ? (
+                <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--ink-primary)]" />
+              ) : (
+                <span className="text-[var(--ink-muted)]">✓</span>
+              )}
+            </span>
+            <span className="shrink-0 font-medium text-[var(--ink-strong)]">
+              {step.label || step.name}
+            </span>
+            {(step.detail || isRunning) && (
+              <span className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--ink-muted)]">
+                {step.detail || "执行中…"}
+              </span>
+            )}
+          </div>
+        );
       })}
-    </>
+    </div>
   );
-};
-
-const MarkdownTextBlock: React.FC<{ text: string }> = ({ text }) => {
-  const lines = text.split("\n");
-  const blocks: React.ReactNode[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i] ?? "";
-    const trimmed = line.trim();
-
-    if (!trimmed) {
-      i++;
-      continue;
-    }
-
-    const headingMatch = trimmed.match(/^(#{1,3})\s+(.+)$/);
-    if (headingMatch) {
-      const level = headingMatch[1]!.length;
-      const content = headingMatch[2]!;
-      blocks.push(
-        <div
-          key={`h-${i}`}
-          className={`font-semibold text-[var(--ink-strong)] ${
-            level === 1 ? "mt-2 text-[15px]" : "mt-1.5 text-[13.5px]"
-          }`}
-        >
-          <InlineFormatted text={content} />
-        </div>
-      );
-      i++;
-      continue;
-    }
-
-    if (/^[-*•]\s+/.test(trimmed)) {
-      const items: string[] = [];
-      while (i < lines.length && /^[-*•]\s+/.test((lines[i] ?? "").trim())) {
-        items.push((lines[i] ?? "").trim().replace(/^[-*•]\s+/, ""));
-        i++;
-      }
-      blocks.push(
-        <ul key={`ul-${i}`} className="my-1 flex flex-col gap-1 pl-4 list-disc">
-          {items.map((item, idx) => (
-            <li key={idx}>
-              <InlineFormatted text={item} />
-            </li>
-          ))}
-        </ul>
-      );
-      continue;
-    }
-
-    if (/^\d+\.\s+/.test(trimmed)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\d+\.\s+/.test((lines[i] ?? "").trim())) {
-        items.push((lines[i] ?? "").trim().replace(/^\d+\.\s+/, ""));
-        i++;
-      }
-      blocks.push(
-        <ol key={`ol-${i}`} className="my-1 flex flex-col gap-1 pl-4 list-decimal">
-          {items.map((item, idx) => (
-            <li key={idx}>
-              <InlineFormatted text={item} />
-            </li>
-          ))}
-        </ol>
-      );
-      continue;
-    }
-
-    const paraLines: string[] = [];
-    while (
-      i < lines.length &&
-      (lines[i] ?? "").trim() !== "" &&
-      !/^(#{1,3})\s+/.test((lines[i] ?? "").trim()) &&
-      !/^[-*•]\s+/.test((lines[i] ?? "").trim()) &&
-      !/^\d+\.\s+/.test((lines[i] ?? "").trim())
-    ) {
-      paraLines.push(lines[i]!);
-      i++;
-    }
-    blocks.push(
-      <p key={`p-${i}`} className="whitespace-pre-wrap break-words">
-        <InlineFormatted text={paraLines.join("\n")} />
-      </p>
-    );
-  }
-
-  return <div className="flex flex-col gap-1.5">{blocks}</div>;
 };
 
 export const FormattedText: React.FC<{ text: string }> = ({ text }) => {
   const cleaned = stripThinkMarkup(text);
-  const segments = cleaned.split(/(```[\s\S]*?```)/g);
+  return <MarkdownRenderer text={cleaned} />;
+};
+
+export const PermissionAskCard: React.FC<{
+  request: PendingPermissionRequest;
+  onResolve: (
+    decision: "allow_once" | "allow_session" | "deny",
+    note?: string
+  ) => void;
+}> = ({ request, onResolve }) => {
+  const [note, setNote] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const isQuestion = request.toolName === "ask_user";
+
+  const submit = (decision: "allow_once" | "allow_session" | "deny", customNote?: string) => {
+    if (submitting) return;
+    setSubmitting(true);
+    onResolve(decision, customNote ?? (note.trim() || undefined));
+  };
+
   return (
-    <div className="flex flex-col gap-2">
-      {segments.map((seg, idx) => {
-        if (seg.startsWith("```") && seg.endsWith("```") && seg.length >= 6) {
-          const inner = seg.slice(3, -3).replace(/^[^\n]*\n/, "");
-          return (
-            <pre
-              key={idx}
-              className="overflow-x-auto rounded-[8px] bg-[var(--bg-code)] p-3 font-mono text-[11.5px] leading-[18px] text-[var(--ink-secondary)]"
+    <div className="flex w-full max-w-[540px] flex-col gap-2.5 rounded-[12px] border border-[var(--amber-pill)] bg-[var(--bg-surface)] p-3.5 shadow-sm">
+      <div className="flex items-center gap-2">
+        <span className="rounded-[4px] bg-[var(--amber-bg)] px-1.5 py-[2px] font-mono text-[10px] font-semibold tracking-[0.08em] text-[var(--amber-text)]">
+          {isQuestion ? "ASK USER" : "PERMISSION"}
+        </span>
+        <span className="font-mono text-[11px] text-[var(--ink-muted)]">
+          {request.toolName}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-[var(--ink-strong)]">
+          {request.title}
+        </span>
+      </div>
+
+      {request.summary && (
+        <div className="text-[12.5px] leading-[18px] text-[var(--ink-body)] whitespace-pre-wrap">
+          {request.summary}
+        </div>
+      )}
+
+      {request.command && (
+        <pre className="overflow-x-auto rounded-[8px] bg-[var(--bg-code)] px-3 py-2 font-mono text-[11.5px] leading-[17px] text-[var(--ink-strong)]">
+          {request.command}
+        </pre>
+      )}
+
+      {request.targetPath && (
+        <div className="rounded-[7px] bg-[var(--bg-subtle)] px-2.5 py-1.5 font-mono text-[11px] text-[var(--ink-secondary)]">
+          目标路径：{request.targetPath}
+        </div>
+      )}
+
+      {request.paths && request.paths.length > 0 && (
+        <div className="flex flex-col gap-1 rounded-[8px] bg-[var(--bg-subtle)] px-2.5 py-2">
+          {request.paths.slice(0, 6).map((p) => (
+            <div key={p} className="truncate font-mono text-[11px] text-[var(--ink-secondary)]">
+              • {p}
+            </div>
+          ))}
+          {request.paths.length > 6 && (
+            <div className="font-mono text-[10px] text-[var(--ink-muted)]">
+              …共 {request.paths.length} 项
+            </div>
+          )}
+        </div>
+      )}
+
+      {isQuestion && request.options && request.options.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 pt-0.5">
+          {request.options.map((opt) => (
+            <button
+              key={opt}
+              type="button"
+              disabled={submitting}
+              onClick={() => submit("allow_once", opt)}
+              className="inline-flex h-[28px] cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 text-[12px] font-medium text-[var(--ink-strong)] hover:border-[var(--ink-primary)] hover:bg-[var(--bg-subtle)] disabled:opacity-50"
             >
-              {inner}
-            </pre>
-          );
-        }
-        if (!seg.trim()) return null;
-        return <MarkdownTextBlock key={idx} text={seg} />;
-      })}
+              {opt}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {isQuestion && (
+        <div className="flex items-center gap-2 pt-0.5">
+          <input
+            type="text"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && note.trim()) {
+                e.preventDefault();
+                submit("allow_once", note.trim());
+              }
+            }}
+            placeholder="或输入补充说明 / 自定义指示…"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            className="h-[30px] flex-1 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+          />
+          <button
+            type="button"
+            disabled={submitting || !note.trim()}
+            onClick={() => submit("allow_once", note.trim())}
+            className="inline-flex h-[30px] cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] px-3 text-[12px] font-semibold text-[var(--ink-on-primary)] disabled:cursor-default disabled:opacity-40"
+          >
+            {request.approveLabel || "确认"}
+          </button>
+          <button
+            type="button"
+            disabled={submitting}
+            onClick={() => submit("deny")}
+            className="inline-flex h-[30px] cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-2.5 text-[12px] font-medium text-[var(--ink-muted)] hover:text-[var(--ink-strong)] disabled:opacity-50"
+          >
+            {request.dismissLabel || "跳过"}
+          </button>
+        </div>
+      )}
+
+      {!isQuestion && (
+        <div className="flex flex-wrap items-center gap-2 pt-0.5">
+          <button
+            type="button"
+            disabled={submitting}
+            onClick={() => submit("allow_once")}
+            className="inline-flex h-[29px] cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] px-3 text-[12px] font-semibold text-[var(--ink-on-primary)] hover:opacity-90 disabled:opacity-50"
+          >
+            {request.approveLabel || "允许一次"}
+          </button>
+          {request.allowSessionLabel && (
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => submit("allow_session")}
+              className="inline-flex h-[29px] cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 text-[12px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)] disabled:opacity-50"
+            >
+              {request.allowSessionLabel}
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={submitting}
+            onClick={() => submit("deny")}
+            className="inline-flex h-[29px] cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-3 text-[12px] font-medium text-[var(--ink-muted)] hover:text-[var(--danger)] disabled:opacity-50"
+          >
+            {request.dismissLabel || "拒绝"}
+          </button>
+        </div>
+      )}
     </div>
   );
 };

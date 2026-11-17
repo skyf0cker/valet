@@ -8,20 +8,26 @@ import (
 
 // SyncState mirrors the subset of application state required by the durable Pi agent sidecar.
 type SyncState struct {
-	HomeDir     string                      `json:"homeDir"`
-	DataDir     string                      `json:"dataDir"`
-	IsPaused    bool                        `json:"isPaused"`
-	Preferences types.ValetPreferences      `json:"preferences"`
-	Providers   []types.AgentProviderConfig `json:"providers"`
-	Plugins     []types.PluginState         `json:"plugins"`
-	McpServers  []types.McpServerItem       `json:"mcpServers"`
-	Memories    []types.MemoryEntry         `json:"memories"`
+	HomeDir       string                      `json:"homeDir"`
+	DataDir       string                      `json:"dataDir"`
+	IsPaused      bool                        `json:"isPaused"`
+	Preferences   types.ValetPreferences      `json:"preferences"`
+	Providers     []types.AgentProviderConfig `json:"providers"`
+	Plugins       []types.PluginState         `json:"plugins"`
+	McpServers    []types.McpServerItem       `json:"mcpServers"`
+	Memories      []types.MemoryEntry         `json:"memories"`
+	BuiltinSkills []types.BuiltinSkillMeta    `json:"builtinSkills,omitempty"`
 }
 
 // TestProviderRequest asks the sidecar to run a live single-turn completion check.
 type TestProviderRequest struct {
 	Provider types.AgentProviderConfig `json:"provider"`
 	Model    string                    `json:"model"`
+}
+
+// TestAutoReviewRequest asks the sidecar to verify the Auto Review model configuration.
+type TestAutoReviewRequest struct {
+	AutoReview types.AutoReviewConfig `json:"autoReview"`
 }
 
 // ProbeMcpRequest tests an MCP server handshake and returns discovered tools.
@@ -52,6 +58,8 @@ type ChatSendRequest struct {
 	MentionPluginID string                 `json:"mentionPluginId,omitempty"`
 	Attachments     []types.ChatAttachment `json:"attachments,omitempty"`
 	RequestID       string                 `json:"requestId,omitempty"`
+	WhenBusy        string                 `json:"whenBusy,omitempty"` // "steer" | "followUp"
+	Interactive     bool                   `json:"interactive,omitempty"`
 }
 
 // ChatSendResponse captures the committed assistant turn and any triggered Inbox/Timeline IDs.
@@ -86,6 +94,14 @@ type ExecuteApprovedRequest struct {
 	ToolName     string         `json:"toolName"`
 	ToolArgs     map[string]any `json:"toolArgs"`
 	CheckedPaths []string       `json:"checkedPaths,omitempty"`
+}
+
+// ResolvePermissionRequest delivers the user's inline permission decision to an interactive sidecar turn.
+type ResolvePermissionRequest struct {
+	ChatID    string `json:"chatId"`
+	RequestID string `json:"requestId"`
+	Decision  string `json:"decision"` // "allow_once" | "allow_session" | "deny"
+	Note      string `json:"note,omitempty"`
 }
 
 // ExecuteApprovedResponse summarizes approved tool execution.

@@ -1,0 +1,15 @@
+id: github-watcher
+bundle_id: com.community.github-watcher
+name: GitHub
+tagline: 通过本地 Webhook 接收 CI / PR 构建失败通知并协助定位
+description: 监听 GitHub Actions / CI 推送到本地 Webhook 网关的构建失败事件，拉取失败信息、总结原因并在授权后协助重试或回复。
+version: 2.0.1
+source: community
+icon: gh
+icon_label: "GH"
+default_installed: false
+triggers:
+  - id: github.ci_failed
+    description: 仓库工作流失败告警（Webhook 推送）
+    sensor: webhook
+    policy: ask

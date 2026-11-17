@@ -4,6 +4,14 @@ import { call, event } from "mygo-runtime";
 
 // ---- Types ----
 
+export interface AgentHeartbeatConfig {
+  enabled: boolean;
+  initialized?: boolean;
+  intervalMin: number;
+  prompt: string;
+  lastRunAt?: string;
+}
+
 export interface AgentProviderConfig {
   id: string;
   name: string;
@@ -20,6 +28,18 @@ export interface AgentProviderConfig {
   availableModelCount: number;
   models: string[];
   connected: boolean;
+}
+
+export interface AutoReviewConfig {
+  engine: string;
+  jevEndpoint: string;
+  jevApiKey: string;
+  jevApiKeyMasked?: string;
+  jevModel: string;
+  jevVerified?: boolean;
+  jevLatencyMs?: number;
+  fallbackProviderId?: string;
+  fallbackModel: string;
 }
 
 export interface AutomationRule {
@@ -54,6 +74,7 @@ export interface ChatMessage {
   metaLabel?: string;
   createdAt: string;
   attachments?: ChatAttachment[];
+  steps?: ChatStreamStep[];
   processTable?: ProcessTablePayload;
   pluginDraft?: PluginDraftSpec;
 }
@@ -64,12 +85,14 @@ export interface ChatStreamPayload {
   partialText?: string;
   thinkingText?: string;
   steps?: ChatStreamStep[];
+  pendingPermission?: PendingPermissionRequest;
   error?: string;
 }
 
 export interface ChatStreamStep {
   id: string;
   name: string;
+  label?: string;
   status: string;
   detail?: string;
 }
@@ -81,6 +104,8 @@ export interface ChatThread {
   timelineActionCount: number;
   linkedEventIds: string[];
   updatedAt: string;
+  archived?: boolean;
+  archivedAt?: string;
   messages: ChatMessage[];
 }
 
@@ -89,6 +114,17 @@ export interface CleanupPolicySettings {
   restoreRetentionDays: string;
   protectedDirs: string[];
   autoScanAfterUninstall: boolean;
+}
+
+export interface HeartbeatRunLog {
+  id: string;
+  timestamp: string;
+  createdAt: string;
+  status: string;
+  model?: string;
+  durationMs?: number;
+  summary: string;
+  detail?: string;
 }
 
 export interface InboxApprovalItem {
@@ -128,6 +164,7 @@ export interface InstallCustomPluginParams {
   name: string;
   tagline: string;
   yaml: string;
+  skillMarkdown?: string;
 }
 
 export interface LogLine {
@@ -185,6 +222,21 @@ export interface MonitoringThresholds {
   eventThrottle10m: boolean;
 }
 
+export interface PendingPermissionRequest {
+  requestId: string;
+  chatId: string;
+  toolName: string;
+  title: string;
+  summary: string;
+  command?: string;
+  paths?: string[];
+  targetPath?: string;
+  options?: string[];
+  approveLabel: string;
+  allowSessionLabel?: string;
+  dismissLabel: string;
+}
+
 export interface PermissionGuideStep {
   index: string;
   title: string;
@@ -210,10 +262,21 @@ export interface PluginActionCapability {
 }
 
 export interface PluginConfig {
+  values?: Record<string, unknown>;
   lowSpaceThresholdPct?: number;
   protectedPaths?: string[];
   sampleIntervalSec?: number;
   customNote?: string;
+}
+
+export interface PluginConfigField {
+  key: string;
+  label: string;
+  type: string;
+  min?: number;
+  max?: number;
+  default?: unknown;
+  description?: string;
 }
 
 export interface PluginDraftSpec {
@@ -222,6 +285,8 @@ export interface PluginDraftSpec {
   whenExpression: string;
   actionExpression: string;
   manifestYaml: string;
+  sensor?: string;
+  skillMarkdown?: string;
   installed?: boolean;
 }
 
@@ -229,6 +294,8 @@ export interface PluginEventPolicy {
   id: string;
   description: string;
   policy: string;
+  sensor?: string;
+  sourceSummary?: string;
   count24h: number;
 }
 
@@ -237,6 +304,7 @@ export interface PluginRuntimeSettings {
   allowUnsignedLocal: boolean;
   maxEventsPerHour: string;
   quietHours: string;
+  webhookEndpoint?: string;
 }
 
 export interface PluginState {
@@ -262,9 +330,13 @@ export interface PluginState {
   weeklyImpactLabel?: string;
   triggers24h: number[];
   events: PluginEventPolicy[];
-  actions: PluginActionCapability[];
+  actions?: PluginActionCapability[];
+  configSchema?: PluginConfigField[];
   config: PluginConfig;
   manifestYaml: string;
+  skillMarkdown?: string;
+  localDir?: string;
+  bundledFiles?: string[];
 }
 
 export interface ProcessSampleRow {
@@ -332,6 +404,8 @@ export interface SendChatParams {
   model: string;
   mentionPluginId?: string;
   attachments?: ChatAttachment[];
+  busyMode?: string;
+  interactive?: boolean;
 }
 
 export interface SendChatResult {
@@ -433,14 +507,29 @@ export interface TraceStep {
   status: string;
 }
 
+export interface UpsertLocalPluginParams {
+  id: string;
+  slug?: string;
+  name: string;
+  tagline?: string;
+  description?: string;
+  manifestYaml: string;
+  skillMarkdown?: string;
+  files?: Record<string, string>;
+  localDir?: string;
+  enabled?: boolean;
+}
+
 export interface ValetPreferences {
   launchAtLogin: boolean;
   showMenuBarIcon: boolean;
   appearance: string;
   language: string;
   globalHotkey: string[];
+  busyMessagePolicy?: string;
   activeProviderId: string;
   models: ModelSelection;
+  autoReview: AutoReviewConfig;
   dailySpendCurrent: number;
   dailySpendLimit: number;
   maxStepsPerTask: number;
@@ -454,6 +543,7 @@ export interface ValetPreferences {
   thresholds: MonitoringThresholds;
   cleanupPolicy: CleanupPolicySettings;
   pluginRuntime: PluginRuntimeSettings;
+  heartbeat: AgentHeartbeatConfig;
   memoryEnabled: boolean;
   autoLearnMemory: boolean;
   holdToSpeakKey: string;
@@ -493,6 +583,7 @@ export interface ValetSnapshot {
   automations: AutomationRule[];
   mcpServers: McpServerItem[];
   memories: MemoryEntry[];
+  heartbeatLogs: HeartbeatRunLog[];
   preferences: ValetPreferences;
   systemMetrics: SystemMetrics;
   scan: ScanState;
@@ -518,6 +609,10 @@ export const Valet = {
   addMcpServer(srv: McpServerItem): Promise<ValetSnapshot> {
     return call("Valet.AddMcpServer", srv);
   },
+  /** AddMemory persists a user-authored long-term memory entry and syncs Sidecar. */
+  addMemory(content: string, source: string): Promise<ValetSnapshot> {
+    return call("Valet.AddMemory", content, source);
+  },
   /** ApproveAllReversible approves every pending 7-day reversible Inbox card sequentially. */
   approveAllReversible(): Promise<ValetSnapshot> {
     return call("Valet.ApproveAllReversible");
@@ -529,6 +624,10 @@ export const Valet = {
   approveInboxItem(itemID: string): Promise<ValetSnapshot> {
     return call("Valet.ApproveInboxItem", itemID);
   },
+  /** ArchiveChatThread marks a conversation archived or restores it, ensuring an active non-archived thread remains. */
+  archiveChatThread(chatID: string, archived: boolean): Promise<ValetSnapshot> {
+    return call("Valet.ArchiveChatThread", chatID, archived);
+  },
   /**
    * CaptureCurrentScreen verifies Screen Recording access, captures a bounded screenshot on macOS,
    * and syncs the updated permission state.
@@ -539,6 +638,10 @@ export const Valet = {
   /** CheckPermissions probes real macOS privacy permissions via MyGo / permissionflow. */
   checkPermissions(): Promise<ValetSnapshot> {
     return call("Valet.CheckPermissions");
+  },
+  /** ClearHeartbeatLogs clears stored Agent heartbeat execution history. */
+  clearHeartbeatLogs(): Promise<ValetSnapshot> {
+    return call("Valet.ClearHeartbeatLogs");
   },
   /** ClearMemories empties all memory items and updates Sidecar. */
   clearMemories(): Promise<ValetSnapshot> {
@@ -592,7 +695,10 @@ export const Valet = {
   installCustomPlugin(params: InstallCustomPluginParams): Promise<ValetSnapshot> {
     return call("Valet.InstallCustomPlugin", params);
   },
-  /** InstallMarketplacePlugin marks a discoverable plugin installed & enabled. */
+  /**
+   * InstallMarketplacePlugin marks a discoverable plugin installed & enabled,
+   * materializing its bundle files into `<dataDir>/plugins/<slug>/`.
+   */
   installMarketplacePlugin(pluginID: string): Promise<ValetSnapshot> {
     return call("Valet.InstallMarketplacePlugin", pluginID);
   },
@@ -616,6 +722,21 @@ export const Valet = {
   reconnectMcpServer(id: string): Promise<ValetSnapshot> {
     return call("Valet.ReconnectMcpServer", id);
   },
+  /** ReloadPlugin reloads one local plugin from disk (or all local plugins when pluginID is empty) and hot-reloads the runtime. */
+  reloadPlugin(pluginID: string): Promise<ValetSnapshot> {
+    return call("Valet.ReloadPlugin", pluginID);
+  },
+  /** RemoveLocalPlugin uninstalls a plugin and removes its directory under <dataDir>/plugins. */
+  removeLocalPlugin(pluginID: string): Promise<ValetSnapshot> {
+    return call("Valet.RemoveLocalPlugin", pluginID);
+  },
+  /**
+   * RemoveLocalPluginWithFiles uninstalls a plugin (local plugins are removed from the list;
+   * catalog plugins return to Discover with Installed=false, Enabled=false) and optionally removes its disk files.
+   */
+  removeLocalPluginWithFiles(pluginID: string, deleteFiles: boolean): Promise<ValetSnapshot> {
+    return call("Valet.RemoveLocalPluginWithFiles", pluginID, deleteFiles);
+  },
   /** ResetAllData resets the persistent state back to factory Clean Slate defaults. */
   resetAllData(): Promise<ValetSnapshot> {
     return call("Valet.ResetAllData");
@@ -627,6 +748,10 @@ export const Valet = {
   /** ResetThresholds restores default monitoring thresholds. */
   resetThresholds(): Promise<ValetSnapshot> {
     return call("Valet.ResetThresholds");
+  },
+  /** ResolveChatPermission resolves an interactive foreground permission or ask_user prompt in Chat. */
+  resolveChatPermission(chatID: string, requestID: string, decision: string, note: string): Promise<boolean> {
+    return call("Valet.ResolveChatPermission", chatID, requestID, decision, note);
   },
   /** RestoreApprovedInboxItem restores files from Finder Trash / staging vault back to their original paths. */
   restoreApprovedInboxItem(itemID: string): Promise<ValetSnapshot> {
@@ -668,6 +793,10 @@ export const Valet = {
   simulatePluginEvent(pluginID: string, eventCode: string): Promise<SimulateEventResult> {
     return call("Valet.SimulatePluginEvent", pluginID, eventCode);
   },
+  /** TestAutoReview validates Auto Review decision model connectivity (Jev System One or small model fallback). */
+  testAutoReview(cfg: AutoReviewConfig): Promise<TestMessageResult> {
+    return call("Valet.TestAutoReview", cfg);
+  },
   /** ToggleAutomation enables/disables an automation rule and reloads the Engine scheduler. */
   toggleAutomation(id: string): Promise<ValetSnapshot> {
     return call("Valet.ToggleAutomation", id);
@@ -692,6 +821,21 @@ export const Valet = {
   toggleTimelineActionItem(eventID: string, actionID: string): Promise<ValetSnapshot> {
     return call("Valet.ToggleTimelineActionItem", eventID, actionID);
   },
+  /** TriggerHeartbeatNow runs one proactive Agent heartbeat inspection turn and records it in HeartbeatLogs (never on Timeline). */
+  triggerHeartbeatNow(): Promise<ValetSnapshot> {
+    return call("Valet.TriggerHeartbeatNow");
+  },
+  /** TriggerPluginEvent injects a simulated event with an optional JSON payload string into Pi Durable. */
+  triggerPluginEvent(pluginID: string, eventCode: string, payloadJSON: string): Promise<SimulateEventResult> {
+    return call("Valet.TriggerPluginEvent", pluginID, eventCode, payloadJSON);
+  },
+  /**
+   * UninstallPlugin uninstalls any installed plugin (removing local plugins completely, or
+   * resetting catalog plugins back to Installed=false) and deletes its materialized disk bundle.
+   */
+  uninstallPlugin(pluginID: string): Promise<ValetSnapshot> {
+    return call("Valet.UninstallPlugin", pluginID);
+  },
   /** UpdateChatModel updates the selected model for a conversation thread. */
   updateChatModel(chatID: string, model: string): Promise<ValetSnapshot> {
     return call("Valet.UpdateChatModel", chatID, model);
@@ -712,6 +856,10 @@ export const Valet = {
   updatePluginManifest(pluginID: string, manifestYAML: string): Promise<ValetSnapshot> {
     return call("Valet.UpdatePluginManifest", pluginID, manifestYAML);
   },
+  /** UpdatePluginSkill updates a plugin's SKILL.md instruction body and hot-reloads Pi Durable. */
+  updatePluginSkill(pluginID: string, skillMarkdown: string): Promise<ValetSnapshot> {
+    return call("Valet.UpdatePluginSkill", pluginID, skillMarkdown);
+  },
   /** UpdatePreferences applies a full preferences update, syncs native Tray/Login hooks, and reloads Engine & Sidecar. */
   updatePreferences(prefs: ValetPreferences): Promise<ValetSnapshot> {
     return call("Valet.UpdatePreferences", prefs);
@@ -719,6 +867,10 @@ export const Valet = {
   /** UpdateProvider updates API keys (stored in OS Keychain when available), base URLs, and connection status for a provider. */
   updateProvider(providerID: string, patch: AgentProviderConfig): Promise<ValetSnapshot> {
     return call("Valet.UpdateProvider", providerID, patch);
+  },
+  /** UpsertLocalPlugin writes a local plugin bundle to disk, registers/updates it in Store, and hot-reloads Engine & Sidecar. */
+  upsertLocalPlugin(params: UpsertLocalPluginParams): Promise<ValetSnapshot> {
+    return call("Valet.UpsertLocalPlugin", params);
   },
   /** VerifyProvider performs real HTTP endpoint discovery and credential validation against the configured provider. */
   verifyProvider(provider: AgentProviderConfig): Promise<ProviderVerifyResult> {

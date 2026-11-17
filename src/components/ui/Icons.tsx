@@ -433,6 +433,23 @@ export const PluginBadgeIcon: React.FC<{
   }
 
   if (plugin.source === "community") {
+    if (plugin.iconKind === "surge") {
+      return (
+        <div
+          className={`${dim} flex shrink-0 items-center justify-center border border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-strong)]`}
+        >
+          <svg width={iconSz} height={iconSz} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path
+              d="M13 2L4.5 13.5H11.5L10.5 22L19.5 10.5H12.5L13 2Z"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </div>
+      );
+    }
     return (
       <div
         className={`${dim} flex shrink-0 items-center justify-center border border-[var(--border-control)] bg-[var(--bg-surface)] font-mono text-[11px] font-semibold text-[var(--ink-strong)]`}
@@ -501,3 +518,104 @@ export const PluginBadgeIcon: React.FC<{
     </div>
   );
 };
+
+export const StopIcon: React.FC<{ size?: number; className?: string }> = ({
+  size = 13,
+  className = "",
+}) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" className={className}>
+    <rect x="3.5" y="3.5" width="9" height="9" rx="2" fill="currentColor" />
+  </svg>
+);
+
+export const ArchiveIcon: React.FC<{ size?: number; className?: string }> = ({
+  size = 14,
+  className = "",
+}) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" className={className}>
+    <rect x="2" y="2.5" width="12" height="3" rx="1" stroke="currentColor" strokeWidth="1.35" />
+    <path
+      d="M3 5.5v7a1.5 1.5 0 0 0 1.5 1.5h7A1.5 1.5 0 0 0 13 12.5v-7M6.5 8.5h3"
+      stroke="currentColor"
+      strokeWidth="1.35"
+      strokeLinecap="round"
+    />
+  </svg>
+);
+
+export const PencilIcon: React.FC<{ size?: number; className?: string }> = ({
+  size = 14,
+  className = "",
+}) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" className={className}>
+    <path
+      d="M11.3 2.3a1.4 1.4 0 0 1 2 2L5.5 12.1l-2.8.7.7-2.8 7.9-7.7z"
+      stroke="currentColor"
+      strokeWidth="1.4"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
+export const ChevronDownIcon: React.FC<{ size?: number; className?: string }> = ({
+  size = 14,
+  className = "",
+}) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" className={className}>
+    <path
+      d="M4 6l4 4 4-4"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
+export const PauseIcon: React.FC<IconProps> = ({ size = 12, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" className={className} aria-hidden="true">
+    <rect x="3.8" y="3" width="2.8" height="10" rx="1" fill="currentColor" />
+    <rect x="9.4" y="3" width="2.8" height="10" rx="1" fill="currentColor" />
+  </svg>
+);
+
+export const PlayIcon: React.FC<IconProps> = ({ size = 12, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="none" className={className} aria-hidden="true">
+    <path
+      d="M4.5 3.2c0-.6.65-.95 1.15-.62l7.2 4.8c.46.3.46.94 0 1.24l-7.2 4.8c-.5.33-1.15-.02-1.15-.62V3.2z"
+      fill="currentColor"
+    />
+  </svg>
+);
+
+export const SettingsIcon: React.FC<IconProps> = ({ size = 14, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
+    <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.8" />
+    <path
+      d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1.08-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09a1.65 1.65 0 001.51-1.08 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9c.26.6.79 1 1.44 1.08H21a2 2 0 110 4h-.09c-.65.08-1.18.48-1.51 1.08z"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
+export const ShieldIcon: React.FC<IconProps> = ({ size = 14, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
+    <path
+      d="M12 3l7 3v5c0 5-3.2 8.8-7 10-3.8-1.2-7-5-7-10V6l7-3z"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
+export const TerminalSlashIcon: React.FC<IconProps> = ({ size = 14, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
+    <rect x="3" y="3" width="18" height="18" rx="4" stroke="currentColor" strokeWidth="1.8" />
+    <path d="M10 16l4-8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+  </svg>
+);

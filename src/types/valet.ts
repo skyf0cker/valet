@@ -1,12 +1,14 @@
 export type AppView = "inbox" | "timeline" | "chat" | "plugins" | "settings";
 
+export type BusyMessagePolicy = "queue" | "steer";
+
 export type SettingsSectionId =
   | "general"
   | "models"
   | "persona"
+  | "heartbeat"
   | "safety"
   | "thresholds"
-  | "cleanup"
   | "runtime"
   | "permissions"
   | "voice"
@@ -73,6 +75,7 @@ export interface PluginRuntimeSettings {
   allowUnsignedLocal: boolean;
   maxEventsPerHour: string;
   quietHours: string;
+  webhookEndpoint?: string;
 }
 
 export type OnboardingStepId = 1 | 2 | 3 | 4 | 5;
@@ -122,6 +125,8 @@ export interface PluginEventPolicy {
   id: string;
   description: string;
   policy: EventPolicyMode;
+  sensor?: string;
+  sourceSummary?: string;
   count24h: number;
 }
 
@@ -131,7 +136,18 @@ export interface PluginActionCapability {
   safetyLabel: string;
 }
 
+export interface PluginConfigField {
+  key: string;
+  label: string;
+  type: "slider" | "number" | "text" | "boolean";
+  min?: number;
+  max?: number;
+  default?: unknown;
+  description?: string;
+}
+
 export interface PluginConfig {
+  values?: Record<string, unknown>;
   lowSpaceThresholdPct?: number;
   protectedPaths?: string[];
   sampleIntervalSec?: number;
@@ -148,7 +164,8 @@ export type PluginIconKind =
   | "code"
   | "battery"
   | "wifi"
-  | "homekit";
+  | "homekit"
+  | "surge";
 
 export interface PluginState {
   id: string;
@@ -173,9 +190,13 @@ export interface PluginState {
   weeklyImpactLabel?: string;
   triggers24h: number[];
   events: PluginEventPolicy[];
-  actions: PluginActionCapability[];
+  actions?: PluginActionCapability[];
+  configSchema?: PluginConfigField[];
   config: PluginConfig;
   manifestYaml: string;
+  skillMarkdown?: string;
+  localDir?: string;
+  bundledFiles?: string[];
 }
 
 export type TimelineStatus = "running" | "pending_confirm" | "completed" | "failed";
@@ -258,6 +279,8 @@ export interface PluginDraftSpec {
   whenExpression: string;
   actionExpression: string;
   manifestYaml: string;
+  sensor?: string;
+  skillMarkdown?: string;
   installed?: boolean;
 }
 
@@ -273,6 +296,29 @@ export interface ChatAttachment {
   textExcerpt?: string;
 }
 
+export interface PendingPermissionRequest {
+  requestId: string;
+  chatId: string;
+  toolName: string;
+  title: string;
+  summary: string;
+  command?: string;
+  paths?: string[];
+  targetPath?: string;
+  options?: string[];
+  approveLabel: string;
+  allowSessionLabel?: string;
+  dismissLabel: string;
+}
+
+export interface ChatStreamStep {
+  id: string;
+  name: string;
+  label?: string;
+  status: "pending" | "running" | "done" | "error";
+  detail?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -280,6 +326,7 @@ export interface ChatMessage {
   metaLabel?: string;
   createdAt: string;
   attachments?: ChatAttachment[];
+  steps?: ChatStreamStep[];
   processTable?: {
     rows: ProcessSampleRow[];
     primaryActionDone?: boolean;
@@ -296,6 +343,8 @@ export interface ChatThread {
   timelineActionCount: number;
   linkedEventIds: string[];
   updatedAt: string;
+  archived?: boolean;
+  archivedAt?: string;
   messages: ChatMessage[];
 }
 
@@ -307,7 +356,19 @@ export type ProviderId =
   | "ollama"
   | "custom";
 
-export type AutonomyLevel = "always_ask" | "sensitive_only" | "autonomous";
+export type AutonomyLevel = "always_ask" | "auto_review" | "full_access";
+
+export interface AutoReviewConfig {
+  engine: "auto" | "jev" | "llm";
+  jevEndpoint: string;
+  jevApiKey: string;
+  jevApiKeyMasked?: string;
+  jevModel: string;
+  jevVerified?: boolean;
+  jevLatencyMs?: number;
+  fallbackProviderId?: string;
+  fallbackModel: string;
+}
 
 export interface AgentProviderConfig {
   id: ProviderId;
@@ -377,6 +438,17 @@ export interface MemoryEntry {
   createdAt: string;
 }
 
+export interface HeartbeatRunLog {
+  id: string;
+  timestamp: string;
+  createdAt: string;
+  status: "ok" | "error" | string;
+  model?: string;
+  durationMs?: number;
+  summary: string;
+  detail?: string;
+}
+
 export type AppearanceMode = "light" | "dark" | "auto";
 export type ToneStyle = "formal" | "concise" | "friendly";
 
@@ -395,10 +467,12 @@ export interface ValetPreferences {
   appearance: AppearanceMode;
   language: string;
   globalHotkey: string[];
+  busyMessagePolicy?: BusyMessagePolicy;
 
   // 02 模型与预算
   activeProviderId: ProviderId;
   models: ModelSelection;
+  autoReview: AutoReviewConfig;
   dailySpendCurrent: number;
   dailySpendLimit: number;
   maxStepsPerTask: number;
@@ -414,10 +488,17 @@ export interface ValetPreferences {
   blockedApps: string[];
   emergencyStopShortcut: string[];
 
-  // Care：监控阈值 / 清理策略 / 插件运行时
+  // Steward：事件感知阈值 / 受保护路径策略 / 插件运行时
   thresholds: MonitoringThresholds;
   cleanupPolicy: CleanupPolicySettings;
   pluginRuntime: PluginRuntimeSettings;
+  heartbeat?: {
+    enabled: boolean;
+    initialized?: boolean;
+    intervalMin: number;
+    prompt: string;
+    lastRunAt?: string;
+  };
 
   // 06 记忆
   memoryEnabled: boolean;
@@ -494,8 +575,18 @@ export interface ValetSnapshot {
   automations: AutomationRule[];
   mcpServers: McpServerItem[];
   memories: MemoryEntry[];
+  heartbeatLogs?: HeartbeatRunLog[];
   preferences: ValetPreferences;
   systemMetrics: SystemMetrics;
   scan: ScanState;
   storageStats?: StorageStats;
+}
+
+export interface QueuedChatMessage {
+  id: string;
+  chatId: string;
+  prompt: string;
+  mentionPlugin: PluginState | null;
+  attachments: ChatAttachment[];
+  createdAt: string;
 }

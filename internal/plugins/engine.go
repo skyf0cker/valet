@@ -2,9 +2,13 @@ package plugins
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -36,32 +40,33 @@ type TriggerDispatch struct {
 	Payload        map[string]any
 }
 
-// EngineConfig configures Valet's generic declarative plugin engine & sensor runtime.
+// EngineConfig configures Valet's generic declarative plugin sensor runtime.
 type EngineConfig struct {
 	HomeDir    string
 	DataDir    string
+	BunPath    string
 	WatchDir   WatchDirFunc
 	TrashMover sys.TrashMover
 	OnTrigger  func(TriggerDispatch)
 }
 
-// Engine executes declarative plugin capability drivers and manages live per-plugin sensors.
+// Engine manages live per-plugin sensors and cron automations.
 type Engine struct {
 	cfg      EngineConfig
-	drivers  *DriverRegistry
 	throttle *ThrottleTracker
 
-	mu             sync.Mutex
-	closed         bool
-	fsWatches      map[string]*activeSensor
-	metricWorkers  map[string]*activeSensor
-	cronStop       context.CancelFunc
-	lastCronFired  map[string]string
-	lastMetricsSig string
-	lastCronSig    string
-	automations    []types.AutomationRule
-	preferences    types.ValetPreferences
-	isPaused       bool
+	mu              sync.Mutex
+	closed          bool
+	fsWatches       map[string]*activeSensor
+	httpPollWorkers map[string]*activeSensor
+	cmdPollWorkers  map[string]*activeSensor
+	cronTriggers    []pluginCronTrigger
+	cronStop        context.CancelFunc
+	lastCronFired   map[string]string
+	lastCronSig     string
+	automations     []types.AutomationRule
+	preferences     types.ValetPreferences
+	isPaused        bool
 }
 
 type activeSensor struct {
@@ -69,24 +74,24 @@ type activeSensor struct {
 	cancel context.CancelFunc
 }
 
-// NewEngine creates a plugin runtime engine backed by Capability Drivers and Event Throttling.
+type pluginCronTrigger struct {
+	pluginID string
+	trigger  TriggerSpec
+}
+
+// NewEngine creates a generic plugin sensor & cron runtime engine.
 func NewEngine(cfg EngineConfig) *Engine {
 	if cfg.WatchDir == nil {
 		cfg.WatchDir = PollingWatchDir(1200 * time.Millisecond)
 	}
 	return &Engine{
-		cfg:           cfg,
-		drivers:       NewDriverRegistry(),
-		throttle:      NewThrottleTracker(),
-		fsWatches:     make(map[string]*activeSensor),
-		metricWorkers: make(map[string]*activeSensor),
-		lastCronFired: make(map[string]string),
+		cfg:             cfg,
+		throttle:        NewThrottleTracker(),
+		fsWatches:       make(map[string]*activeSensor),
+		httpPollWorkers: make(map[string]*activeSensor),
+		cmdPollWorkers:  make(map[string]*activeSensor),
+		lastCronFired:   make(map[string]string),
 	}
-}
-
-// Drivers returns the underlying capability driver registry for inspection or registration.
-func (e *Engine) Drivers() *DriverRegistry {
-	return e.drivers
 }
 
 // Throttle returns the plugin event rate-limiter/deduplicator.
@@ -159,69 +164,20 @@ func (e *Engine) Close() {
 		w.cancel()
 		delete(e.fsWatches, k)
 	}
-	for k, m := range e.metricWorkers {
-		m.cancel()
-		delete(e.metricWorkers, k)
+	for k, h := range e.httpPollWorkers {
+		h.cancel()
+		delete(e.httpPollWorkers, k)
 	}
+	for k, c := range e.cmdPollWorkers {
+		c.cancel()
+		delete(e.cmdPollWorkers, k)
+	}
+	e.cronTriggers = nil
 	if e.cronStop != nil {
 		e.cronStop()
 		e.cronStop = nil
 	}
 	e.mu.Unlock()
-}
-
-// Invoke enforces plugin enabled status, merges global + plugin-scoped protected paths,
-// resolves the manifest ActionSpec + driver, and executes the capability on the host.
-func (e *Engine) Invoke(
-	ctx context.Context,
-	snap types.ValetSnapshot,
-	pluginID, actionID, driverOverride string,
-	args map[string]any,
-) (InvokeResult, error) {
-	var plugin *types.PluginState
-	for i := range snap.Plugins {
-		if snap.Plugins[i].ID == pluginID {
-			cp := snap.Plugins[i]
-			plugin = &cp
-			break
-		}
-	}
-	if plugin == nil {
-		return InvokeResult{}, fmt.Errorf("未找到插件: %s", pluginID)
-	}
-	if !plugin.Installed || !plugin.Enabled {
-		return InvokeResult{}, fmt.Errorf("插件「%s」当前已停用，已拒绝执行 %s", plugin.Name, actionID)
-	}
-
-	parsed, err := ParseManifestYAML(plugin.ManifestYAML)
-	var spec ActionSpec
-	if err == nil {
-		for _, a := range parsed.ActionSpecs {
-			if a.ID == actionID || a.ToolName == actionID {
-				spec = a
-				break
-			}
-		}
-	}
-	if spec.ID == "" {
-		spec = ActionSpec{ID: actionID, Driver: driverOverride}
-		finalizeActionSpec(&spec, plugin.ID)
-	} else if driverOverride != "" {
-		spec.Driver = driverOverride
-	}
-
-	protected := make([]string, 0, len(snap.Preferences.CleanupPolicy.ProtectedDirs)+len(plugin.Config.ProtectedPaths))
-	protected = append(protected, snap.Preferences.CleanupPolicy.ProtectedDirs...)
-	protected = append(protected, plugin.Config.ProtectedPaths...)
-
-	return e.drivers.Execute(ctx, spec.Driver, InvokeContext{
-		HomeDir:       e.cfg.HomeDir,
-		DataDir:       e.cfg.DataDir,
-		ProtectedDirs: protected,
-		BlockedApps:   snap.Preferences.BlockedApps,
-		TrashMover:    e.cfg.TrashMover,
-		Plugin:        *plugin,
-	}, spec, args)
 }
 
 // Sync reconciles active plugin sensors and cron automations with the latest ValetSnapshot.
@@ -241,10 +197,15 @@ func (e *Engine) Sync(snap types.ValetSnapshot) {
 			w.cancel()
 			delete(e.fsWatches, k)
 		}
-		for k, m := range e.metricWorkers {
-			m.cancel()
-			delete(e.metricWorkers, k)
+		for k, h := range e.httpPollWorkers {
+			h.cancel()
+			delete(e.httpPollWorkers, k)
 		}
+		for k, c := range e.cmdPollWorkers {
+			c.cancel()
+			delete(e.cmdPollWorkers, k)
+		}
+		e.cronTriggers = nil
 		if e.cronStop != nil {
 			e.cronStop()
 			e.cronStop = nil
@@ -258,15 +219,17 @@ func (e *Engine) Sync(snap types.ValetSnapshot) {
 		triggers []TriggerSpec
 		sig      string
 	}{}
-	desiredMetric := map[string]struct {
+	desiredHTTP := map[string]struct {
 		plugin  types.PluginState
 		trigger TriggerSpec
 		sig     string
 	}{}
-	cronPluginTriggers := []struct {
-		pluginID string
-		trigger  TriggerSpec
+	desiredPoll := map[string]struct {
+		plugin  types.PluginState
+		trigger TriggerSpec
+		sig     string
 	}{}
+	var cronPluginTriggers []pluginCronTrigger
 
 	for _, p := range snap.Plugins {
 		if !p.Installed || !p.Enabled {
@@ -276,6 +239,7 @@ func (e *Engine) Sync(snap types.ValetSnapshot) {
 		if err != nil {
 			continue
 		}
+		cfgJSON, _ := json.Marshal(p.Config)
 		for _, trig := range parsed.TriggerSpecs {
 			switch trig.Sensor {
 			case "fs_watch":
@@ -291,22 +255,46 @@ func (e *Engine) Sync(snap types.ValetSnapshot) {
 					cur.sig = p.Version + "|" + p.ManifestYAML
 					desiredFS[key] = cur
 				}
-			case "metric_threshold":
+			case "http_poll":
+				if strings.TrimSpace(trig.URL) == "" {
+					continue
+				}
 				key := p.ID + "::" + trig.ID
-				sig := fmt.Sprintf("%s|%v|%s|%v", p.ManifestYAML, snap.Preferences.Thresholds, snap.Preferences.PluginRuntime.QuietHours, p.Config.LowSpaceThresholdPct)
-				desiredMetric[key] = struct {
+				sig := fmt.Sprintf("%s|%s|%s", p.Version, p.ManifestYAML, snap.Preferences.PluginRuntime.QuietHours)
+				desiredHTTP[key] = struct {
+					plugin  types.PluginState
+					trigger TriggerSpec
+					sig     string
+				}{plugin: p, trigger: trig, sig: sig}
+			case "command_poll":
+				if strings.TrimSpace(trig.Command) == "" {
+					continue
+				}
+				key := p.ID + "::" + trig.ID
+				sig := fmt.Sprintf("%s|%s|%s|%s", p.Version, p.ManifestYAML, snap.Preferences.PluginRuntime.QuietHours, string(cfgJSON))
+				desiredPoll[key] = struct {
+					plugin  types.PluginState
+					trigger TriggerSpec
+					sig     string
+				}{plugin: p, trigger: trig, sig: sig}
+			case "script_poll":
+				if strings.TrimSpace(trig.Script) == "" {
+					continue
+				}
+				key := p.ID + "::" + trig.ID
+				sig := fmt.Sprintf("%s|%s|%s|%s|%s", p.Version, p.LocalDir, p.ManifestYAML, snap.Preferences.PluginRuntime.QuietHours, string(cfgJSON))
+				desiredPoll[key] = struct {
 					plugin  types.PluginState
 					trigger TriggerSpec
 					sig     string
 				}{plugin: p, trigger: trig, sig: sig}
 			case "cron":
-				cronPluginTriggers = append(cronPluginTriggers, struct {
-					pluginID string
-					trigger  TriggerSpec
-				}{pluginID: p.ID, trigger: trig})
+				cronPluginTriggers = append(cronPluginTriggers, pluginCronTrigger{pluginID: p.ID, trigger: trig})
 			}
 		}
 	}
+
+	e.cronTriggers = cronPluginTriggers
 
 	// Reconcile fs_watch sensors
 	for key, running := range e.fsWatches {
@@ -326,21 +314,38 @@ func (e *Engine) Sync(snap types.ValetSnapshot) {
 		go e.runFsSensor(cctx, des.pluginID, dir, des.triggers)
 	}
 
-	// Reconcile metric_threshold sensors
-	for key, running := range e.metricWorkers {
-		des, ok := desiredMetric[key]
+	// Reconcile http_poll sensors
+	for key, running := range e.httpPollWorkers {
+		des, ok := desiredHTTP[key]
 		if !ok || running.sig != des.sig {
 			running.cancel()
-			delete(e.metricWorkers, key)
+			delete(e.httpPollWorkers, key)
 		}
 	}
-	for key, des := range desiredMetric {
-		if _, exists := e.metricWorkers[key]; exists {
+	for key, des := range desiredHTTP {
+		if _, exists := e.httpPollWorkers[key]; exists {
 			continue
 		}
 		cctx, cancel := context.WithCancel(context.Background())
-		e.metricWorkers[key] = &activeSensor{sig: des.sig, cancel: cancel}
-		go e.runMetricSensor(cctx, des.plugin, des.trigger, snap.Preferences)
+		e.httpPollWorkers[key] = &activeSensor{sig: des.sig, cancel: cancel}
+		go e.runHttpPollSensor(cctx, des.plugin, des.trigger, snap.Preferences)
+	}
+
+	// Reconcile command_poll and script_poll sensors
+	for key, running := range e.cmdPollWorkers {
+		des, ok := desiredPoll[key]
+		if !ok || running.sig != des.sig {
+			running.cancel()
+			delete(e.cmdPollWorkers, key)
+		}
+	}
+	for key, des := range desiredPoll {
+		if _, exists := e.cmdPollWorkers[key]; exists {
+			continue
+		}
+		cctx, cancel := context.WithCancel(context.Background())
+		e.cmdPollWorkers[key] = &activeSensor{sig: des.sig, cancel: cancel}
+		go e.runCommandPollSensor(cctx, des.plugin, des.trigger, snap.Preferences)
 	}
 
 	// Reconcile cron scheduler (plugin cron triggers + enabled AutomationRules)
@@ -417,127 +422,6 @@ func matchFsTrigger(ev FsWatchEvent, trig TriggerSpec) bool {
 	return true
 }
 
-func (e *Engine) runMetricSensor(ctx context.Context, plugin types.PluginState, trig TriggerSpec, prefs types.ValetPreferences) {
-	interval := trig.IntervalSec
-	if plugin.Config.SampleIntervalSec != nil && *plugin.Config.SampleIntervalSec > 0 {
-		interval = *plugin.Config.SampleIntervalSec
-	}
-	if interval < 15 {
-		interval = 15
-	}
-	ticker := time.NewTicker(time.Duration(interval) * time.Second)
-	defer ticker.Stop()
-
-	var consecutive int
-	lastDiagMtime := newestCrashMtime(e.cfg.HomeDir)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if inQuietHours(prefs.PluginRuntime.QuietHours, time.Now()) {
-				continue
-			}
-
-			switch trig.Metric {
-			case "disk.used_pct":
-				m := sys.SampleDiskMetrics(e.cfg.HomeDir)
-				freeThreshold := prefs.Thresholds.DiskLowSpacePct
-				if plugin.Config.LowSpaceThresholdPct != nil {
-					freeThreshold = *plugin.Config.LowSpaceThresholdPct
-				}
-				if freeThreshold <= 0 && trig.Threshold > 0 {
-					freeThreshold = int(100 - trig.Threshold)
-				}
-				freePct := 100 - m.DiskPct
-				if freeThreshold > 0 && freePct < freeThreshold {
-					e.dispatch(TriggerDispatch{
-						Kind:      "plugin",
-						PluginID:  plugin.ID,
-						EventCode: trig.ID,
-						Payload: map[string]any{
-							"diskPct":    m.DiskPct,
-							"diskFreeGB": m.DiskFreeGB,
-							"threshold":  freeThreshold,
-							"sensor":     "metric_threshold",
-						},
-					})
-				}
-
-			case "proc.max_cpu":
-				cpuThresh := parsePercent(prefs.Thresholds.CPUSpikePct, 200)
-				if trig.Threshold > 0 {
-					cpuThresh = int(trig.Threshold)
-				}
-				procs := sys.SampleProcesses(ctx, 5)
-				hit := false
-				var offender types.ProcessSampleRow
-				for _, row := range procs.Rows {
-					lower := strings.ToLower(row.Name)
-					if lower == "valet" || lower == "valet-bun" {
-						continue
-					}
-					ignored := false
-					for _, ig := range prefs.Thresholds.IgnoredProcesses {
-						if strings.Contains(lower, strings.ToLower(ig)) {
-							ignored = true
-							break
-						}
-					}
-					if !ignored && row.CPUPct >= cpuThresh {
-						hit = true
-						offender = row
-						break
-					}
-				}
-				if hit {
-					consecutive++
-					needed := 2
-					if trig.SustainedSec > 0 && interval > 0 {
-						needed = maxInt(1, trig.SustainedSec/interval)
-					}
-					if consecutive >= needed {
-						consecutive = 0
-						e.dispatch(TriggerDispatch{
-							Kind:      "plugin",
-							PluginID:  plugin.ID,
-							EventCode: trig.ID,
-							Payload: map[string]any{
-								"pid":    offender.PID,
-								"name":   offender.Name,
-								"cpuPct": offender.CPUPct,
-								"sensor": "metric_threshold",
-							},
-						})
-					}
-				} else {
-					consecutive = 0
-				}
-
-			case "logs.crash_count":
-				newest := newestCrashMtime(e.cfg.HomeDir)
-				if newest.After(lastDiagMtime) {
-					lastDiagMtime = newest
-					summary := sys.SummarizeDiagnosticLogs(e.cfg.HomeDir, 30)
-					if summary.Count > 0 {
-						e.dispatch(TriggerDispatch{
-							Kind:      "plugin",
-							PluginID:  plugin.ID,
-							EventCode: trig.ID,
-							Payload: map[string]any{
-								"count":   summary.Count,
-								"summary": summary.Summary,
-								"sensor":  "metric_threshold",
-							},
-						})
-					}
-				}
-			}
-		}
-	}
-}
-
 func (e *Engine) runCronLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -550,11 +434,40 @@ func (e *Engine) runCronLoop(ctx context.Context) {
 			minuteKey := now.Format("2006-01-02 15:04")
 			e.mu.Lock()
 			rules := append([]types.AutomationRule(nil), e.automations...)
+			cronTrigs := append([]pluginCronTrigger(nil), e.cronTriggers...)
 			quiet := e.preferences.PluginRuntime.QuietHours
 			e.mu.Unlock()
 
-			if inQuietHours(quiet, now) {
+			if InQuietHours(quiet, now) {
 				continue
+			}
+
+			for _, ct := range cronTrigs {
+				if strings.TrimSpace(ct.trigger.Schedule) == "" {
+					continue
+				}
+				if !matchCronExpr(ct.trigger.Schedule, now) {
+					continue
+				}
+				firedKey := "plugin:" + ct.pluginID + ":" + ct.trigger.ID
+				e.mu.Lock()
+				already := e.lastCronFired[firedKey] == minuteKey
+				if !already {
+					e.lastCronFired[firedKey] = minuteKey
+				}
+				e.mu.Unlock()
+				if already {
+					continue
+				}
+				e.dispatch(TriggerDispatch{
+					Kind:      "plugin",
+					PluginID:  ct.pluginID,
+					EventCode: ct.trigger.ID,
+					Payload: map[string]any{
+						"sensor":   "cron",
+						"schedule": ct.trigger.Schedule,
+					},
+				})
 			}
 
 			for _, rule := range rules {
@@ -582,6 +495,267 @@ func (e *Engine) runCronLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (e *Engine) runHttpPollSensor(ctx context.Context, plugin types.PluginState, trig TriggerSpec, prefs types.ValetPreferences) {
+	targetURL := strings.TrimSpace(trig.URL)
+	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+		return
+	}
+	interval := trig.IntervalSec
+	if interval <= 0 {
+		interval = 60
+	}
+	emitOn := strings.ToLower(strings.TrimSpace(trig.EmitOn))
+	if emitOn == "" {
+		emitOn = "change"
+	}
+	method := strings.ToUpper(strings.TrimSpace(trig.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+
+	var hasBaseline bool
+	var lastBody string
+
+	poll := func() {
+		if InQuietHours(prefs.PluginRuntime.QuietHours, time.Now()) {
+			return
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(reqCtx, method, targetURL, nil)
+		if err != nil {
+			return
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		resp.Body.Close()
+
+		body := strings.TrimSpace(string(raw))
+		if len(body) > 4096 {
+			body = body[:4096]
+		}
+		if trig.MatchContains != "" && !strings.Contains(body, trig.MatchContains) {
+			return
+		}
+
+		shouldEmit := false
+		switch emitOn {
+		case "always":
+			shouldEmit = resp.StatusCode < 500
+		case "non_empty":
+			shouldEmit = body != "" && body != "{}" && body != "[]"
+		default: // "change"
+			if !hasBaseline {
+				hasBaseline = true
+				lastBody = body
+				return
+			}
+			if body != lastBody {
+				lastBody = body
+				shouldEmit = true
+			}
+		}
+		if !shouldEmit {
+			return
+		}
+		e.dispatch(TriggerDispatch{
+			Kind:      "plugin",
+			PluginID:  plugin.ID,
+			EventCode: trig.ID,
+			Payload: map[string]any{
+				"sensor": "http_poll",
+				"url":    targetURL,
+				"status": resp.StatusCode,
+				"body":   body,
+			},
+		})
+	}
+
+	if emitOn == "change" {
+		poll()
+	}
+
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			poll()
+		}
+	}
+}
+
+func (e *Engine) runCommandPollSensor(ctx context.Context, plugin types.PluginState, trig TriggerSpec, prefs types.ValetPreferences) {
+	isScript := trig.Sensor == "script_poll"
+	rawCmd := strings.TrimSpace(trig.Command)
+	rawScript := strings.TrimSpace(trig.Script)
+	if isScript {
+		if rawScript == "" {
+			return
+		}
+	} else {
+		if rawCmd == "" || isForbiddenPluginShellCommand(rawCmd) {
+			return
+		}
+	}
+
+	interval := resolvePollInterval(plugin, trig, 60)
+	emitOn := strings.ToLower(strings.TrimSpace(trig.EmitOn))
+	if emitOn == "" {
+		if isScript {
+			emitOn = "json"
+		} else {
+			emitOn = "change"
+		}
+	}
+
+	var hasBaseline bool
+	var lastStdout string
+
+	poll := func() {
+		if InQuietHours(prefs.PluginRuntime.QuietHours, time.Now()) {
+			return
+		}
+		cmdCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+
+		var cmd *exec.Cmd
+		if isScript {
+			bin, args, ok := e.resolveScriptCommand(plugin, rawScript)
+			if !ok {
+				return
+			}
+			cmd = exec.CommandContext(cmdCtx, bin, args...)
+			if plugin.LocalDir != "" {
+				cmd.Dir = plugin.LocalDir
+			} else if e.cfg.HomeDir != "" {
+				cmd.Dir = e.cfg.HomeDir
+			}
+		} else {
+			cmd = exec.CommandContext(cmdCtx, "/bin/sh", "-c", rawCmd)
+			if e.cfg.HomeDir != "" {
+				cmd.Dir = e.cfg.HomeDir
+			}
+		}
+
+		cmd.Env = pluginCommandEnv(e.cfg.HomeDir, e.cfg.DataDir, e.resolveBunBinary(), plugin)
+		out, err := cmd.CombinedOutput()
+		exitCode := 0
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				exitCode = exitErr.ExitCode()
+			} else {
+				exitCode = -1
+			}
+		}
+
+		stdout := strings.TrimSpace(string(out))
+		if isScript && emitOn == "json" {
+			if exitCode != 0 || stdout == "" {
+				return
+			}
+			var parsedOut struct {
+				Triggered bool           `json:"triggered"`
+				Payload   map[string]any `json:"payload"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &parsedOut); err != nil || !parsedOut.Triggered {
+				return
+			}
+			payload := make(map[string]any, len(parsedOut.Payload)+1)
+			for k, v := range parsedOut.Payload {
+				payload[k] = v
+			}
+			payload["sensor"] = "script_poll"
+			e.dispatch(TriggerDispatch{
+				Kind:      "plugin",
+				PluginID:  plugin.ID,
+				EventCode: trig.ID,
+				Payload:   payload,
+			})
+			return
+		}
+
+		if len(stdout) > 8192 {
+			stdout = stdout[:8192]
+		}
+		if trig.MatchContains != "" && !strings.Contains(stdout, trig.MatchContains) {
+			return
+		}
+
+		shouldEmit := false
+		switch emitOn {
+		case "always":
+			shouldEmit = true
+		case "exit_zero":
+			shouldEmit = exitCode == 0
+		case "non_empty":
+			shouldEmit = stdout != ""
+		default: // "change"
+			if !hasBaseline {
+				hasBaseline = true
+				lastStdout = stdout
+				return
+			}
+			if stdout != lastStdout {
+				lastStdout = stdout
+				shouldEmit = true
+			}
+		}
+		if !shouldEmit {
+			return
+		}
+		payload := map[string]any{
+			"sensor":   trig.Sensor,
+			"exitCode": exitCode,
+			"stdout":   stdout,
+		}
+		if isScript {
+			payload["script"] = rawScript
+		} else {
+			payload["command"] = rawCmd
+		}
+		e.dispatch(TriggerDispatch{
+			Kind:      "plugin",
+			PluginID:  plugin.ID,
+			EventCode: trig.ID,
+			Payload:   payload,
+		})
+	}
+
+	if emitOn == "change" || emitOn == "json" {
+		poll()
+	}
+
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			poll()
+		}
+	}
+}
+
+func matchCronExpr(expr string, now time.Time) bool {
+	fields := strings.Fields(strings.TrimSpace(expr))
+	if len(fields) != 5 {
+		return false
+	}
+	return matchCronField(fields[0], now.Minute()) &&
+		matchCronField(fields[1], now.Hour()) &&
+		matchCronField(fields[2], now.Day()) &&
+		matchCronField(fields[3], int(now.Month())) &&
+		matchCronField(fields[4], int(now.Weekday()))
 }
 
 func (e *Engine) dispatch(d TriggerDispatch) {
@@ -650,29 +824,8 @@ func matchCronField(field string, val int) bool {
 	return err == nil && n == val
 }
 
-func newestCrashMtime(homeDir string) time.Time {
-	diagDir := filepath.Join(homeDir, "Library", "Logs", "DiagnosticReports")
-	entries, err := os.ReadDir(diagDir)
-	if err != nil {
-		return time.Time{}
-	}
-	var latest time.Time
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".ips") && !strings.HasSuffix(name, ".crash") {
-			continue
-		}
-		if info, err := entry.Info(); err == nil && info.ModTime().After(latest) {
-			latest = info.ModTime()
-		}
-	}
-	return latest
-}
-
-func inQuietHours(spec string, now time.Time) bool {
+// InQuietHours reports whether now falls inside a "HH:MM - HH:MM" quiet hours window.
+func InQuietHours(spec string, now time.Time) bool {
 	spec = strings.TrimSpace(spec)
 	if spec == "" || spec == "关闭" {
 		return false
@@ -709,19 +862,217 @@ func parseHHMM(raw string) (int, int, bool) {
 	return h, m, true
 }
 
-func parsePercent(raw string, fallback int) int {
-	clean := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), "%"))
-	if n, err := strconv.Atoi(clean); err == nil && n > 0 {
-		return n
+func resolvePollInterval(plugin types.PluginState, trig TriggerSpec, fallback int) int {
+	interval := trig.IntervalSec
+	if interval <= 0 {
+		interval = fallback
 	}
-	return fallback
+	if key := strings.TrimSpace(trig.IntervalConfigKey); key != "" {
+		if plugin.Config.Values != nil {
+			if raw, ok := plugin.Config.Values[key]; ok {
+				switch v := raw.(type) {
+				case int:
+					if v > 0 {
+						interval = v
+					}
+				case int64:
+					if v > 0 {
+						interval = int(v)
+					}
+				case float64:
+					if int(v) > 0 {
+						interval = int(v)
+					}
+				case string:
+					if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+						interval = n
+					}
+				}
+			}
+		}
+		if key == "sampleIntervalSec" && plugin.Config.SampleIntervalSec != nil && *plugin.Config.SampleIntervalSec > 0 {
+			interval = *plugin.Config.SampleIntervalSec
+		}
+	} else if plugin.Config.SampleIntervalSec != nil && *plugin.Config.SampleIntervalSec > 0 {
+		interval = *plugin.Config.SampleIntervalSec
+	}
+	if interval < 1 {
+		interval = 1
+	}
+	return interval
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
+func (e *Engine) resolveBunBinary() string {
+	if p := strings.TrimSpace(e.cfg.BunPath); p != "" {
+		return p
 	}
-	return b
+	if e.cfg.DataDir != "" {
+		candidate := filepath.Join(e.cfg.DataDir, "bin", "bun")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	if p, err := exec.LookPath("bun"); err == nil {
+		return p
+	}
+	candidates := []string{}
+	if e.cfg.HomeDir != "" {
+		candidates = append(candidates, filepath.Join(e.cfg.HomeDir, ".bun", "bin", "bun"))
+	}
+	candidates = append(candidates, "/opt/homebrew/bin/bun", "/usr/local/bin/bun")
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	return "bun"
+}
+
+func (e *Engine) resolveScriptCommand(plugin types.PluginState, relScript string) (string, []string, bool) {
+	dir := strings.TrimSpace(plugin.LocalDir)
+	if dir == "" {
+		return "", nil, false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", nil, false
+	}
+	cleaned := filepath.Clean(strings.TrimSpace(relScript))
+	target := cleaned
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(absDir, cleaned)
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return "", nil, false
+	}
+	rel, err := filepath.Rel(absDir, absTarget)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", nil, false
+	}
+	info, err := os.Stat(absTarget)
+	if err != nil || info.IsDir() {
+		return "", nil, false
+	}
+
+	switch strings.ToLower(filepath.Ext(absTarget)) {
+	case ".js", ".mjs", ".ts", ".mts":
+		return e.resolveBunBinary(), []string{absTarget}, true
+	case ".py":
+		return "python3", []string{absTarget}, true
+	default:
+		return "/bin/sh", []string{absTarget}, true
+	}
+}
+
+func pluginCommandEnv(homeDir, dataDir, bunPath string, plugin types.PluginState) []string {
+	home := strings.TrimSpace(homeDir)
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	stateDir := ""
+	if strings.TrimSpace(dataDir) != "" {
+		stateDir = filepath.Join(dataDir, "plugin-state", plugin.ID)
+	} else {
+		stateDir = filepath.Join(os.TempDir(), "valet-plugin-state", plugin.ID)
+	}
+	_ = os.MkdirAll(stateDir, 0o755)
+
+	cfgValues := make(map[string]any, len(plugin.Config.Values)+3)
+	for k, v := range plugin.Config.Values {
+		cfgValues[k] = v
+	}
+	if plugin.Config.LowSpaceThresholdPct != nil {
+		if _, ok := cfgValues["lowSpaceThresholdPct"]; !ok {
+			cfgValues["lowSpaceThresholdPct"] = *plugin.Config.LowSpaceThresholdPct
+		}
+	}
+	if plugin.Config.SampleIntervalSec != nil {
+		if _, ok := cfgValues["sampleIntervalSec"]; !ok {
+			cfgValues["sampleIntervalSec"] = *plugin.Config.SampleIntervalSec
+		}
+	}
+	if len(plugin.Config.ProtectedPaths) > 0 {
+		if _, ok := cfgValues["protectedPaths"]; !ok {
+			cfgValues["protectedPaths"] = plugin.Config.ProtectedPaths
+		}
+	}
+	cfgJSON, err := json.Marshal(cfgValues)
+	if err != nil {
+		cfgJSON = []byte("{}")
+	}
+
+	env := make([]string, 0, len(os.Environ())+8)
+	pathPrepend := make([]string, 0, 4)
+	if strings.TrimSpace(dataDir) != "" {
+		pathPrepend = append(pathPrepend, filepath.Join(dataDir, "bin"))
+	}
+	if strings.TrimSpace(bunPath) != "" && strings.ContainsRune(bunPath, filepath.Separator) {
+		pathPrepend = append(pathPrepend, filepath.Dir(bunPath))
+	}
+	if home != "" {
+		pathPrepend = append(pathPrepend, filepath.Join(home, ".bun", "bin"))
+	}
+	pathPrepend = append(pathPrepend, "/opt/homebrew/bin")
+
+	existingPath := os.Getenv("PATH")
+	newPath := strings.Join(pathPrepend, string(os.PathListSeparator))
+	if existingPath != "" {
+		newPath += string(os.PathListSeparator) + existingPath
+	}
+
+	skipKeys := map[string]bool{
+		"PATH":                     true,
+		"VALET_HOME_DIR":           true,
+		"VALET_DATA_DIR":           true,
+		"VALET_PLUGIN_ID":          true,
+		"VALET_PLUGIN_DIR":         true,
+		"VALET_PLUGIN_STATE_DIR":   true,
+		"VALET_PLUGIN_CONFIG_JSON": true,
+	}
+	for _, entry := range os.Environ() {
+		k, _, ok := strings.Cut(entry, "=")
+		if ok && skipKeys[k] {
+			continue
+		}
+		env = append(env, entry)
+	}
+	env = append(env,
+		"PATH="+newPath,
+		"VALET_HOME_DIR="+home,
+		"VALET_DATA_DIR="+dataDir,
+		"VALET_PLUGIN_ID="+plugin.ID,
+		"VALET_PLUGIN_DIR="+plugin.LocalDir,
+		"VALET_PLUGIN_STATE_DIR="+stateDir,
+		"VALET_PLUGIN_CONFIG_JSON="+string(cfgJSON),
+	)
+	return env
+}
+
+func isForbiddenPluginShellCommand(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	if lower == "" {
+		return true
+	}
+	blocked := []string{
+		"rm -rf /",
+		"rm -rf /*",
+		"rm -rf ~",
+		"rm -fr /",
+		":(){",
+		"mkfs.",
+		"dd if=",
+		"shutdown",
+		"reboot",
+		"halt",
+		"chmod -r 777 /",
+	}
+	for _, pat := range blocked {
+		if strings.Contains(lower, pat) {
+			return true
+		}
+	}
+	return false
 }
 
 var _ = errors.New

@@ -9,7 +9,9 @@
     "dev:web": "vite",
     "build:web": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit && tsc --noEmit -p sidecar/tsconfig.json",
-    "build:sidecar": "bun -e 'import { chmodSync, copyFileSync, mkdirSync, rmSync } from \"node:fs\"; rmSync(\"resources/darwin-arm64/bin\", { recursive: true, force: true }); mkdirSync(\"resources/darwin-arm64/bin\", { recursive: true }); copyFileSync(process.execPath, \"resources/darwin-arm64/bin/valet-bun\"); chmodSync(\"resources/darwin-arm64/bin/valet-bun\", 0o755);' && bun build sidecar/src/main.ts --target=bun --outfile resources/darwin-arm64/bin/valet-agent.js",
+    "build:sidecar": "bun -e 'import { chmodSync, copyFileSync, mkdirSync, rmSync } from \"node:fs\"; mkdirSync(\"resources/darwin-arm64/bin\", { recursive: true }); rmSync(\"resources/darwin-arm64/bin/valet-bun\", { force: true }); rmSync(\"resources/darwin-arm64/bin/valet-agent.js\", { force: true }); copyFileSync(process.execPath, \"resources/darwin-arm64/bin/valet-bun\"); chmodSync(\"resources/darwin-arm64/bin/valet-bun\", 0o755);' && bun build sidecar/src/main.ts --target=bun --outfile resources/darwin-arm64/bin/valet-agent.js",
+    "build:cli": "mkdir -p resources/darwin-arm64/bin && CGO_ENABLED=0 go build -o resources/darwin-arm64/bin/valet ./cmd/valet",
+    "cli": "CGO_ENABLED=0 go run ./cmd/valet",
     "test:sidecar": "bun test sidecar/src/__tests__"
   },
   "dependencies": {

@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +24,8 @@ import (
 	"valet/internal/store"
 	"valet/internal/sys"
 	"valet/internal/types"
+	pluginsbundle "valet/plugins"
+	skillsbundle "valet/skills"
 )
 
 // StartOptions configures backend directories, native callbacks, and runtime flags.
@@ -44,17 +48,22 @@ type StartOptions struct {
 // Service implements the bound `Valet` MyGo service coordinating native macOS capabilities,
 // persistent application state, plugin routing, and the Pi Durable sidecar agent.
 type Service struct {
-	mu           sync.Mutex
-	started      bool
-	closed       bool
-	opts         StartOptions
-	store        *store.Store
-	client       *sidecar.Client
-	engine       *plugins.Engine
-	stopMetrics  chan struct{}
-	trashMover   sys.TrashMover
-	createdInbox map[string]types.InboxApprovalItem
-	createdEvent map[string]types.TimelineEvent
+	mu              sync.Mutex
+	started         bool
+	closed          bool
+	opts            StartOptions
+	store           *store.Store
+	client          *sidecar.Client
+	engine          *plugins.Engine
+	webhookSrv      *http.Server
+	controlToken    string
+	controlFilePath string
+	cliOnce         sync.Once
+	cliBinPath      string
+	stopMetrics     chan struct{}
+	trashMover      sys.TrashMover
+	createdInbox    map[string]types.InboxApprovalItem
+	createdEvent    map[string]types.TimelineEvent
 }
 
 // NewService constructs a zero-I/O Service safe to pass to mygo.Bind before App.Run / MYGO_GENERATE.
@@ -113,9 +122,19 @@ func (s *Service) start(opts StartOptions) error {
 		}
 	}
 
+	bunBin := resolveBunBinaryWithOpts(opts)
+	if opts.DataDir != "" && bunBin != "" && bunBin != "bun" {
+		binDir := filepath.Join(opts.DataDir, "bin")
+		_ = os.MkdirAll(binDir, 0o755)
+		bunLink := filepath.Join(binDir, "bun")
+		_ = os.Remove(bunLink)
+		_ = os.Symlink(bunBin, bunLink)
+	}
+
 	eng := plugins.NewEngine(plugins.EngineConfig{
 		HomeDir:    opts.HomeDir,
 		DataDir:    opts.DataDir,
+		BunPath:    bunBin,
 		WatchDir:   opts.WatchDir,
 		TrashMover: mover,
 		OnTrigger:  s.handlePluginEngineTrigger,
@@ -136,6 +155,75 @@ func (s *Service) start(opts StartOptions) error {
 	s.stopMetrics = make(chan struct{})
 	s.started = true
 	s.mu.Unlock()
+
+	webhookEndpoint, webhookSrv, wErr := s.startWebhookServer(opts.DesktopReady)
+	if wErr != nil {
+		fmt.Fprintf(os.Stderr, "[valet] webhook server start error: %v\n", wErr)
+	} else {
+		s.mu.Lock()
+		s.webhookSrv = webhookSrv
+		s.mu.Unlock()
+	}
+
+	st.Update(func(snapMut *types.ValetSnapshot) {
+		if webhookEndpoint != "" {
+			snapMut.Preferences.PluginRuntime.WebhookEndpoint = webhookEndpoint
+		}
+		pluginsBaseDir := ""
+		if opts.DataDir != "" {
+			pluginsBaseDir = filepath.Join(opts.DataDir, "plugins")
+		}
+		for i := range snapMut.Plugins {
+			snapMut.Plugins[i].Actions = nil
+			if snapMut.Plugins[i].Config.Values == nil {
+				snapMut.Plugins[i].Config.Values = map[string]any{}
+			}
+			if snapMut.Plugins[i].Installed && snapMut.Plugins[i].Source != "local" && pluginsBaseDir != "" {
+				slug := plugins.NormalizeSlug(snapMut.Plugins[i].Slug)
+				if slug == "" || slug == "local-plugin" {
+					slug = plugins.NormalizeSlug(snapMut.Plugins[i].ID)
+				}
+				if matDir, matFiles, mErr := plugins.MaterializeCatalogPlugin(pluginsbundle.CatalogFS, slug, pluginsBaseDir); mErr == nil {
+					snapMut.Plugins[i].LocalDir = matDir
+					if len(matFiles) > 0 {
+						snapMut.Plugins[i].BundledFiles = matFiles
+					}
+					if strings.TrimSpace(snapMut.Plugins[i].SkillMarkdown) == "" {
+						if _, skillMD, _, _, rErr := plugins.ReadPluginBundle(matDir); rErr == nil && strings.TrimSpace(skillMD) != "" {
+							snapMut.Plugins[i].SkillMarkdown = skillMD
+						}
+					}
+				}
+			} else if snapMut.Plugins[i].LocalDir != "" && len(snapMut.Plugins[i].BundledFiles) == 0 {
+				if _, _, _, files, rErr := plugins.ReadPluginBundle(snapMut.Plugins[i].LocalDir); rErr == nil && len(files) > 0 {
+					snapMut.Plugins[i].BundledFiles = files
+				}
+			}
+
+			parsed, pErr := plugins.ParseManifestYAML(snapMut.Plugins[i].ManifestYAML)
+			if strings.TrimSpace(snapMut.Plugins[i].SkillMarkdown) == "" && pErr == nil && strings.TrimSpace(parsed.Skill) != "" {
+				snapMut.Plugins[i].SkillMarkdown = parsed.Skill
+			}
+			if pErr == nil {
+				evs, _ := plugins.ManifestSpecsToPoliciesAndActions(parsed, snapMut.Plugins[i].Events)
+				if len(evs) > 0 {
+					snapMut.Plugins[i].Events = evs
+				}
+				if len(snapMut.Plugins[i].ConfigSchema) == 0 && len(parsed.ConfigSchema) > 0 {
+					snapMut.Plugins[i].ConfigSchema = parsed.ConfigSchema
+				}
+			}
+		}
+
+		// Discover and merge local plugin bundles from <dataDir>/plugins/*/manifest.yaml
+		if pluginsBaseDir != "" {
+			if localBundles, dErr := plugins.DiscoverLocalPlugins(pluginsBaseDir); dErr == nil {
+				for _, bundle := range localBundles {
+					mergeLocalPluginIntoSlice(&snapMut.Plugins, bundle)
+				}
+			}
+		}
+	})
 
 	// Hydrate secrets from OS Keychain and probe live privacy permissions when in desktop app
 	if opts.DesktopReady {
@@ -168,6 +256,7 @@ func (s *Service) start(opts StartOptions) error {
 	if opts.OnMetrics != nil {
 		go s.metricsLoop()
 	}
+	go s.heartbeatLoop()
 	return nil
 }
 
@@ -181,10 +270,23 @@ func (s *Service) close() error {
 	stopCh := s.stopMetrics
 	client := s.client
 	eng := s.engine
+	webhookSrv := s.webhookSrv
+	controlFile := s.controlFilePath
+	s.webhookSrv = nil
+	s.controlFilePath = ""
 	s.mu.Unlock()
+
+	if controlFile != "" {
+		_ = os.Remove(controlFile)
+	}
 
 	if stopCh != nil {
 		close(stopCh)
+	}
+	if webhookSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = webhookSrv.Shutdown(ctx)
+		cancel()
 	}
 	if eng != nil {
 		eng.Close()
@@ -225,6 +327,133 @@ func (s *Service) metricsLoop() {
 	}
 }
 
+func (s *Service) heartbeatLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	lastRun := time.Now()
+	for {
+		select {
+		case <-s.stopMetrics:
+			return
+		case now := <-ticker.C:
+			snap := s.store.Snapshot()
+			if !snap.OnboardingCompleted || snap.IsPaused || !snap.Preferences.Heartbeat.Enabled {
+				continue
+			}
+			if plugins.InQuietHours(snap.Preferences.PluginRuntime.QuietHours, now) {
+				continue
+			}
+			mins := snap.Preferences.Heartbeat.IntervalMin
+			if mins <= 0 {
+				mins = 30
+			}
+			if now.Sub(lastRun) < time.Duration(mins)*time.Minute {
+				continue
+			}
+			lastRun = now
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			_, _ = s.TriggerHeartbeatNow(ctx)
+			cancel()
+		}
+	}
+}
+
+// TriggerHeartbeatNow runs one proactive Agent heartbeat inspection turn and records it in HeartbeatLogs (never on Timeline).
+func (s *Service) TriggerHeartbeatNow(ctx context.Context) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	startedAt := time.Now()
+	snap := s.store.Snapshot()
+	prompt := strings.TrimSpace(snap.Preferences.Heartbeat.Prompt)
+	if prompt == "" {
+		prompt = store.DefaultHeartbeatConfig().Prompt
+	}
+	model := strings.TrimSpace(snap.Preferences.Models.Fast)
+	if model == "" {
+		model = snap.Preferences.Models.Primary
+	}
+	nowHHMM := time.Now().Format("15:04")
+	s.store.Update(func(st *types.ValetSnapshot) {
+		st.Preferences.Heartbeat.LastRunAt = nowHHMM
+	})
+
+	status := "ok"
+	summary := "已完成本轮心跳巡检，系统状态平稳。"
+	detail := summary
+	if s.client != nil {
+		s.syncSidecarBlocking(ctx, s.store.Snapshot())
+		var resp sidecar.ChatSendResponse
+		if err := s.client.Call(ctx, "chat.send", sidecar.ChatSendRequest{
+			ChatID:    "heartbeat:system",
+			Prompt:    "[AGENT_HEARTBEAT] " + prompt,
+			Model:     model,
+			RequestID: fmt.Sprintf("hb-%d", time.Now().UnixNano()),
+		}, &resp); err == nil {
+			txt := strings.TrimSpace(resp.ReplyMessage.Content)
+			if txt != "" {
+				runes := []rune(txt)
+				if len(runes) > 4000 {
+					detail = string(runes[:3999]) + "…"
+				} else {
+					detail = txt
+				}
+				for _, ln := range strings.Split(txt, "\n") {
+					cleaned := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(ln), "#*-• "))
+					if cleaned == "" {
+						continue
+					}
+					cRunes := []rune(cleaned)
+					if len(cRunes) > 120 {
+						summary = string(cRunes[:119]) + "…"
+					} else {
+						summary = cleaned
+					}
+					break
+				}
+			}
+			s.store.Update(func(st *types.ValetSnapshot) {
+				if resp.UsageCostDelta > 0 {
+					st.Preferences.DailySpendCurrent = math.Round((st.Preferences.DailySpendCurrent+resp.UsageCostDelta)*100) / 100
+				}
+			})
+		} else {
+			status = "error"
+			summary = "心跳巡检执行失败"
+			detail = err.Error()
+		}
+	}
+
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		entry := types.HeartbeatRunLog{
+			ID:         fmt.Sprintf("hb-log-%d", time.Now().UnixNano()),
+			Timestamp:  time.Now().Format(time.RFC3339),
+			CreatedAt:  nowHHMM,
+			Status:     status,
+			Model:      model,
+			DurationMs: int(time.Since(startedAt).Milliseconds()),
+			Summary:    summary,
+			Detail:     detail,
+		}
+		st.HeartbeatLogs = append([]types.HeartbeatRunLog{entry}, st.HeartbeatLogs...)
+		if len(st.HeartbeatLogs) > 50 {
+			st.HeartbeatLogs = st.HeartbeatLogs[:50]
+		}
+	})
+	s.emitStateChange("preferences")
+	return next, nil
+}
+
+// ClearHeartbeatLogs clears stored Agent heartbeat execution history.
+func (s *Service) ClearHeartbeatLogs() (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	return s.store.Update(func(st *types.ValetSnapshot) {
+		st.HeartbeatLogs = []types.HeartbeatRunLog{}
+	}), nil
+}
+
 func (s *Service) refreshHostMetrics() types.SystemMetrics {
 	disk := sys.SampleDiskMetrics(s.opts.HomeDir)
 	proc := sys.SampleProcesses(context.Background(), 3)
@@ -240,14 +469,15 @@ func (s *Service) refreshHostMetrics() types.SystemMetrics {
 
 func (s *Service) buildSyncState(snap types.ValetSnapshot) sidecar.SyncState {
 	return sidecar.SyncState{
-		HomeDir:     s.opts.HomeDir,
-		DataDir:     s.opts.DataDir,
-		IsPaused:    snap.IsPaused,
-		Preferences: snap.Preferences,
-		Providers:   snap.Providers,
-		Plugins:     snap.Plugins,
-		McpServers:  snap.McpServers,
-		Memories:    snap.Memories,
+		HomeDir:       s.opts.HomeDir,
+		DataDir:       s.opts.DataDir,
+		IsPaused:      snap.IsPaused,
+		Preferences:   snap.Preferences,
+		Providers:     snap.Providers,
+		Plugins:       snap.Plugins,
+		McpServers:    snap.McpServers,
+		Memories:      snap.Memories,
+		BuiltinSkills: s.listAllSkills(),
 	}
 }
 
@@ -269,6 +499,12 @@ func (s *Service) hydrateSecretsFromKeychain() {
 			}
 		}
 	}
+	if raw, err := mygo.Secrets.Get("autoreview.jev.apikey"); err == nil {
+		val := strings.TrimSpace(string(raw))
+		if val != "" && val != snap.Preferences.AutoReview.JevAPIKey {
+			updated = true
+		}
+	}
 	if !updated {
 		return
 	}
@@ -280,6 +516,13 @@ func (s *Service) hydrateSecretsFromKeychain() {
 					st.Providers[i].APIKey = val
 					st.Providers[i].APIKeyMasked = maskSecretKey(val)
 				}
+			}
+		}
+		if raw, err := mygo.Secrets.Get("autoreview.jev.apikey"); err == nil {
+			val := strings.TrimSpace(string(raw))
+			if val != "" {
+				st.Preferences.AutoReview.JevAPIKey = val
+				st.Preferences.AutoReview.JevAPIKeyMasked = maskSecretKey(val)
 			}
 		}
 	})
@@ -375,29 +618,6 @@ func (s *Service) handleSidecarNotify(method string, params json.RawMessage) {
 func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 	snap := s.store.Snapshot()
 	switch method {
-	case "host.plugin.invoke":
-		var req struct {
-			PluginID  string         `json:"pluginId"`
-			ActionID  string         `json:"actionId"`
-			Driver    string         `json:"driver"`
-			EventCode string         `json:"eventCode"`
-			Args      map[string]any `json:"args"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		res, err := s.engine.Invoke(ctx, snap, req.PluginID, req.ActionID, req.Driver, req.Args)
-		if err != nil {
-			return nil, err
-		}
-		if req.EventCode != "" {
-			s.recordPluginTriggerStat(req.PluginID, req.EventCode, res.Summary)
-		}
-		if res.Driver == "fs.trash" && res.MovedCount > 0 {
-			s.refreshHostMetrics()
-		}
-		return res, nil
-
 	case "host.kernel.overview", "host.systemOverview":
 		proc := sys.SampleProcesses(ctx, 5)
 		enabledCount := 0
@@ -415,6 +635,24 @@ func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, r
 			"enabledPlugins": enabledCount,
 			"topProcesses":   proc.Rows,
 		}, nil
+
+	case "host.kernel.bash":
+		return s.execKernelBash(ctx, snap, raw)
+
+	case "host.kernel.readFile":
+		return s.execKernelReadFile(snap, raw)
+
+	case "host.kernel.listDir":
+		return s.execKernelListDir(snap, raw)
+
+	case "host.kernel.writeFile":
+		return s.execKernelWriteFile(snap, raw)
+
+	case "host.kernel.trashFiles":
+		return s.execKernelTrashFiles(snap, raw)
+
+	case "host.kernel.killProcess":
+		return s.execKernelKillProcess(snap, raw)
 
 	case "host.kernel.saveMemory", "host.saveMemory":
 		var req struct {
@@ -466,9 +704,571 @@ func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, r
 		}
 		return out, nil
 
+	case "host.skills.list":
+		return map[string]any{
+			"skills": s.listAllSkills(),
+		}, nil
+
+	case "host.skills.read":
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		target := strings.TrimSpace(req.Name)
+		for _, sk := range s.listAllSkills() {
+			if strings.EqualFold(sk.Name, target) {
+				return sk, nil
+			}
+		}
+		for _, p := range snap.Plugins {
+			if strings.EqualFold(p.ID, target) || strings.EqualFold(p.Slug, target) || strings.EqualFold(p.Name, target) {
+				return types.BuiltinSkillMeta{
+					Name:        p.ID,
+					Title:       p.Name,
+					Description: p.Tagline,
+					Content:     p.SkillMarkdown,
+					Source:      "plugin",
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("未找到名为 %q 的 Skill", target)
+
+	case "host.plugin.list":
+		return map[string]any{
+			"pluginsDir": filepath.Join(s.opts.DataDir, "plugins"),
+			"plugins":    snap.Plugins,
+		}, nil
+
+	case "host.plugin.inspect":
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		pl, files, err := s.inspectPluginDetail(req.ID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"plugin": pl,
+			"files":  files,
+		}, nil
+
+	case "host.plugin.upsert":
+		var req types.UpsertLocalPluginParams
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		next, pl, err := s.upsertLocalPlugin(req)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"plugin":  pl,
+			"plugins": next.Plugins,
+		}, nil
+
+	case "host.plugin.installDir":
+		var req struct {
+			Dir     string `json:"dir"`
+			Slug    string `json:"slug"`
+			Name    string `json:"name"`
+			Tagline string `json:"tagline"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		next, pl, err := s.installPluginFromDir(req.Dir, req.Slug, req.Name, req.Tagline, "")
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"plugin":  pl,
+			"plugins": next.Plugins,
+		}, nil
+
+	case "host.plugin.reload":
+		var req struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(raw, &req)
+		next, err := s.ReloadPlugin(req.ID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"plugins": next.Plugins,
+		}, nil
+
+	case "host.plugin.configure":
+		var req struct {
+			ID      string `json:"id"`
+			Enabled *bool  `json:"enabled"`
+			EventID string `json:"eventId"`
+			Policy  string `json:"policy"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		pid := strings.TrimSpace(req.ID)
+		var updated types.PluginState
+		found := false
+		next := s.store.Update(func(st *types.ValetSnapshot) {
+			for i := range st.Plugins {
+				if st.Plugins[i].ID == pid || st.Plugins[i].Slug == pid {
+					found = true
+					if req.Enabled != nil {
+						st.Plugins[i].Enabled = *req.Enabled
+						if *req.Enabled {
+							st.Plugins[i].Installed = true
+						}
+					}
+					if req.EventID != "" && req.Policy != "" {
+						for j := range st.Plugins[i].Events {
+							if st.Plugins[i].Events[j].ID == req.EventID {
+								st.Plugins[i].Events[j].Policy = req.Policy
+							}
+						}
+					}
+					updated = st.Plugins[i]
+				}
+			}
+		})
+		if !found {
+			return nil, fmt.Errorf("未找到插件: %q", pid)
+		}
+		s.syncRuntime(next)
+		s.emitStateChange("plugins")
+		return map[string]any{
+			"plugin":  updated,
+			"plugins": next.Plugins,
+		}, nil
+
+	case "host.plugin.remove":
+		var req struct {
+			ID          string `json:"id"`
+			DeleteFiles *bool  `json:"deleteFiles"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		delFiles := true
+		if req.DeleteFiles != nil {
+			delFiles = *req.DeleteFiles
+		}
+		next, err := s.RemoveLocalPluginWithFiles(req.ID, delFiles)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"removed": req.ID,
+			"plugins": next.Plugins,
+		}, nil
+
+	case "host.plugin.trigger":
+		var req struct {
+			ID          string `json:"id"`
+			EventID     string `json:"eventId"`
+			PayloadJSON string `json:"payloadJson"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		return s.TriggerPluginEvent(ctx, strings.TrimSpace(req.ID), strings.TrimSpace(req.EventID), req.PayloadJSON)
+
 	default:
 		return nil, fmt.Errorf("unknown host RPC method: %s", method)
 	}
+}
+
+func (s *Service) execKernelBash(ctx context.Context, _ types.ValetSnapshot, raw json.RawMessage) (any, error) {
+	var req struct {
+		Command    string `json:"command"`
+		Cwd        string `json:"cwd"`
+		TimeoutSec int    `json:"timeoutSec"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	command := strings.TrimSpace(req.Command)
+	if command == "" {
+		return nil, errors.New("bash 缺少 command 参数")
+	}
+
+	low := strings.ToLower(command)
+	if strings.Contains(low, "/.ssh") ||
+		strings.Contains(low, "/.gnupg") ||
+		strings.Contains(low, "/.aws") ||
+		strings.Contains(low, "keychains") ||
+		strings.Contains(low, "rm -rf /") ||
+		strings.Contains(low, "mkfs") ||
+		strings.HasPrefix(low, "sudo ") ||
+		strings.Contains(low, " sudo ") ||
+		strings.Contains(low, ";sudo ") ||
+		strings.Contains(low, "&&sudo ") ||
+		strings.Contains(low, "|sudo ") {
+		return nil, errors.New("安全边界拒绝：禁止通过 bash 工具执行提权或访问密钥目录等高危指令")
+	}
+
+	homeDir := strings.TrimSpace(s.opts.HomeDir)
+	if homeDir == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			homeDir = h
+		}
+	}
+
+	cwd := strings.TrimSpace(req.Cwd)
+	if cwd == "" {
+		cwd = homeDir
+	} else {
+		if cwd == "~" {
+			cwd = homeDir
+		} else if strings.HasPrefix(cwd, "~/") && homeDir != "" {
+			cwd = filepath.Join(homeDir, cwd[2:])
+		}
+		cwd = filepath.Clean(cwd)
+	}
+	if cwd != "" {
+		info, err := os.Stat(cwd)
+		if err != nil {
+			return nil, fmt.Errorf("工作目录不可访问 (%s): %w", cwd, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("工作目录不是有效文件夹: %s", cwd)
+		}
+	}
+
+	timeoutSec := req.TimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = 20
+	} else if timeoutSec > 90 {
+		timeoutSec = 90
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	shellPath := "/bin/sh"
+	shellArgs := []string{"-c", command}
+	if _, err := os.Stat("/bin/zsh"); err == nil {
+		shellPath = "/bin/zsh"
+		shellArgs = []string{"-lc", command}
+	}
+
+	start := time.Now()
+	cmd := exec.CommandContext(reqCtx, shellPath, shellArgs...)
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+	cmd.Env = s.buildKernelBashEnv()
+	out, err := cmd.CombinedOutput()
+	durationMs := time.Since(start).Milliseconds()
+
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	const maxBytes = 24 * 1024
+	text := string(out)
+	if len(text) > maxBytes {
+		text = text[:maxBytes] + "\n…(输出已截断)"
+	}
+	trimmed := strings.TrimSpace(text)
+
+	summary := fmt.Sprintf("执行完成 (exit=%d)", exitCode)
+	if trimmed != "" {
+		firstLine, _, _ := strings.Cut(trimmed, "\n")
+		firstRunes := []rune(strings.TrimSpace(firstLine))
+		if len(firstRunes) > 80 {
+			firstLine = string(firstRunes[:79]) + "…"
+		} else {
+			firstLine = string(firstRunes)
+		}
+		summary = fmt.Sprintf("exit=%d · %s", exitCode, firstLine)
+	}
+
+	return map[string]any{
+		"ok":         err == nil,
+		"command":    command,
+		"cwd":        cwd,
+		"exitCode":   exitCode,
+		"durationMs": durationMs,
+		"output":     trimmed,
+		"summary":    summary,
+	}, nil
+}
+
+func resolveSafeHostPath(rawPath, homeDir string) (string, error) {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return "", errors.New("缺少 path 参数")
+	}
+	if homeDir == "" {
+		homeDir, _ = os.UserHomeDir()
+	}
+	expanded := sys.ExpandHome(trimmed, homeDir)
+	abs, err := filepath.Abs(expanded)
+	if err != nil {
+		return "", err
+	}
+	low := strings.ToLower(filepath.Clean(abs))
+	for _, seg := range []string{"/.ssh", "/.gnupg", "/.aws", "/library/keychains"} {
+		if strings.HasSuffix(low, seg) || strings.Contains(low, seg+"/") {
+			return "", fmt.Errorf("安全边界拒绝：禁止访问敏感凭据路径 %q", rawPath)
+		}
+	}
+	return abs, nil
+}
+
+func (s *Service) execKernelReadFile(_ types.ValetSnapshot, raw json.RawMessage) (any, error) {
+	var req struct {
+		Path       string `json:"path"`
+		OffsetLine int    `json:"offsetLine"`
+		LimitLines int    `json:"limitLines"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	abs, err := resolveSafeHostPath(req.Path, s.opts.HomeDir)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("%q 是目录，请使用 list_dir 读取目录内容", req.Path)
+	}
+	if info.Size() > 4*1024*1024 {
+		return nil, fmt.Errorf("文件过大 (%d bytes)，建议用 bash head/tail 或 offsetLine 分段查看", info.Size())
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	totalLines := len(lines)
+	offset := req.OffsetLine
+	if offset <= 0 {
+		offset = 1
+	}
+	limit := req.LimitLines
+	if limit <= 0 {
+		limit = 200
+	} else if limit > 500 {
+		limit = 500
+	}
+	startIdx := offset - 1
+	if startIdx >= totalLines {
+		return map[string]any{
+			"path":       abs,
+			"totalLines": totalLines,
+			"startLine":  offset,
+			"endLine":    offset - 1,
+			"content":    "",
+		}, nil
+	}
+	endIdx := startIdx + limit
+	if endIdx > totalLines {
+		endIdx = totalLines
+	}
+	content := strings.Join(lines[startIdx:endIdx], "\n")
+	const maxBytes = 64 * 1024
+	if len(content) > maxBytes {
+		content = content[:maxBytes] + "\n…(内容已截断)"
+	}
+	return map[string]any{
+		"path":       abs,
+		"totalLines": totalLines,
+		"startLine":  startIdx + 1,
+		"endLine":    endIdx,
+		"content":    content,
+	}, nil
+}
+
+func (s *Service) execKernelListDir(_ types.ValetSnapshot, raw json.RawMessage) (any, error) {
+	var req struct {
+		Path       string `json:"path"`
+		MaxEntries int    `json:"maxEntries"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	target := strings.TrimSpace(req.Path)
+	if target == "" {
+		target = "~"
+	}
+	abs, err := resolveSafeHostPath(target, s.opts.HomeDir)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		return nil, err
+	}
+	maxEntries := req.MaxEntries
+	if maxEntries <= 0 {
+		maxEntries = 100
+	} else if maxEntries > 500 {
+		maxEntries = 500
+	}
+	out := make([]map[string]any, 0, min(len(entries), maxEntries))
+	for _, entry := range entries {
+		if len(out) >= maxEntries {
+			break
+		}
+		info, iErr := entry.Info()
+		sizeBytes := int64(0)
+		modTime := ""
+		if iErr == nil {
+			sizeBytes = info.Size()
+			modTime = info.ModTime().Format(time.RFC3339)
+		}
+		out = append(out, map[string]any{
+			"name":      entry.Name(),
+			"path":      filepath.Join(abs, entry.Name()),
+			"isDir":     entry.IsDir(),
+			"sizeBytes": sizeBytes,
+			"modTime":   modTime,
+		})
+	}
+	return map[string]any{
+		"path":       abs,
+		"totalCount": len(entries),
+		"entries":    out,
+	}, nil
+}
+
+func (s *Service) execKernelWriteFile(_ types.ValetSnapshot, raw json.RawMessage) (any, error) {
+	var req struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+		Append  bool   `json:"append"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	abs, err := resolveSafeHostPath(req.Path, s.opts.HomeDir)
+	if err != nil {
+		return nil, err
+	}
+	clean := filepath.Clean(abs)
+	homeClean := filepath.Clean(s.opts.HomeDir)
+	if clean == "/" || (homeClean != "" && clean == homeClean) {
+		return nil, fmt.Errorf("安全边界拒绝：禁止写入根目录或用户主目录 %q", req.Path)
+	}
+	for _, sysPrefix := range []string{"/System", "/usr", "/bin", "/sbin", "/Applications"} {
+		if clean == sysPrefix || strings.HasPrefix(clean, sysPrefix+"/") {
+			return nil, fmt.Errorf("安全边界拒绝：禁止写入系统路径 %q", req.Path)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(clean), 0o755); err != nil {
+		return nil, err
+	}
+	data := []byte(req.Content)
+	if req.Append {
+		f, fErr := os.OpenFile(clean, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if fErr != nil {
+			return nil, fErr
+		}
+		n, wErr := f.Write(data)
+		_ = f.Close()
+		if wErr != nil {
+			return nil, wErr
+		}
+		return map[string]any{
+			"ok":           true,
+			"path":         clean,
+			"bytesWritten": n,
+			"append":       true,
+		}, nil
+	}
+	if err := os.WriteFile(clean, data, 0o644); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"ok":           true,
+		"path":         clean,
+		"bytesWritten": len(data),
+		"append":       false,
+	}, nil
+}
+
+func (s *Service) execKernelTrashFiles(snap types.ValetSnapshot, raw json.RawMessage) (any, error) {
+	var req struct {
+		Paths []string `json:"paths"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	var cleanPaths []string
+	for _, p := range req.Paths {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			cleanPaths = append(cleanPaths, trimmed)
+		}
+	}
+	if len(cleanPaths) == 0 {
+		return nil, errors.New("trash_files 需要至少一个目标路径")
+	}
+	activeMover := s.trashMover
+	if snap.Preferences.CleanupPolicy.DeleteMethod == "安全移出到隔离区" {
+		activeMover = nil
+	}
+	batchID, movedCount, reclaimedGB, err := sys.MoveItemsToTrash(
+		s.opts.HomeDir,
+		s.opts.DataDir,
+		snap.Preferences.CleanupPolicy.ProtectedDirs,
+		cleanPaths,
+		0,
+		activeMover,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if movedCount > 0 {
+		s.refreshHostMetrics()
+	}
+	return map[string]any{
+		"ok":          true,
+		"batchId":     batchID,
+		"movedCount":  movedCount,
+		"reclaimedGB": reclaimedGB,
+		"summary":     fmt.Sprintf("已将 %d 项移入废纸篓（释放约 %.2f GB，7 天内可还原）", movedCount, reclaimedGB),
+	}, nil
+}
+
+func (s *Service) execKernelKillProcess(snap types.ValetSnapshot, raw json.RawMessage) (any, error) {
+	var req struct {
+		PID    int    `json:"pid"`
+		Name   string `json:"name"`
+		Signal string `json:"signal"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	sig := strings.ToUpper(strings.TrimSpace(req.Signal))
+	if sig == "" {
+		sig = "SIGTERM"
+	}
+	if err := sys.TerminateProcess(req.PID, req.Name, sig, snap.Preferences.BlockedApps); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"ok":      true,
+		"pid":     req.PID,
+		"name":    req.Name,
+		"signal":  sig,
+		"summary": fmt.Sprintf("已向进程 %s (PID %d) 发送 %s", req.Name, req.PID, sig),
+	}, nil
 }
 
 func (s *Service) queueApprovalFromAgent(req sidecar.QueueApprovalRequest) map[string]string {
@@ -667,6 +1467,7 @@ func (s *Service) ResetAllData() (types.ValetSnapshot, error) {
 		for _, p := range snap.Providers {
 			_ = mygo.Secrets.Delete("provider.apikey." + p.ID)
 		}
+		_ = mygo.Secrets.Delete("autoreview.jev.apikey")
 	}
 	seed := store.NewSeedSnapshot(s.opts.HomeDir)
 	next := s.store.Update(func(st *types.ValetSnapshot) {
@@ -701,12 +1502,19 @@ func (s *Service) RunFirstScan(ctx context.Context) (types.ValetSnapshot, error)
 	snap := s.store.Snapshot()
 	metrics := sys.SampleDiskMetrics(s.opts.HomeDir)
 
+	isPluginActive := func(id string) bool {
+		for _, p := range snap.Plugins {
+			if p.ID == id || p.Slug == id {
+				return p.Installed && p.Enabled
+			}
+		}
+		return false
+	}
+
 	var diskReport sys.DiskScanReport
 	diskTask := types.ScanTaskItem{ID: "disk", Title: "磁盘", Detail: "插件「磁盘守卫」已停用，已跳过", SizeLabel: "—", Status: "skipped"}
-	if diskRes, err := s.engine.Invoke(ctx, snap, "disk-guard", "disk.scan", "fs.scan_cleanable", map[string]any{"minSizeMB": 2048, "idleDays": 90}); err == nil {
-		if rep, ok := diskRes.Data.(sys.DiskScanReport); ok {
-			diskReport = rep
-		}
+	if isPluginActive("disk-guard") {
+		diskReport = sys.ScanDisk(s.opts.HomeDir, snap.Preferences.CleanupPolicy.ProtectedDirs, 2048, 90)
 		diskTask = types.ScanTaskItem{
 			ID:        "disk",
 			Title:     "磁盘",
@@ -718,13 +1526,9 @@ func (s *Service) RunFirstScan(ctx context.Context) (types.ValetSnapshot, error)
 	}
 
 	orphanTask := types.ScanTaskItem{ID: "orphan", Title: "卸载残留", Detail: "插件「卸载清道夫」已停用，已跳过", SizeLabel: "—", Status: "skipped"}
-	if orphRes, err := s.engine.Invoke(ctx, snap, "uninstall-scrubber", "app.scan_remnants", "fs.scan_orphans", map[string]any{}); err == nil {
-		orphanCount := 0
-		if m, ok := orphRes.Data.(map[string]any); ok {
-			if list, ok := m["remnants"].([]sys.OrphanRemnant); ok {
-				orphanCount = len(list)
-			}
-		}
+	if isPluginActive("uninstall-scrubber") {
+		remnants := sys.ScanOrphanRemnants(s.opts.HomeDir, "")
+		orphanCount := len(remnants)
 		orphanTask = types.ScanTaskItem{
 			ID:        "orphan",
 			Title:     "卸载残留",
@@ -737,12 +1541,8 @@ func (s *Service) RunFirstScan(ctx context.Context) (types.ValetSnapshot, error)
 
 	var procs sys.ProcessSampleSummary
 	procTask := types.ScanTaskItem{ID: "process", Title: "进程", Detail: "插件「进程哨兵」已停用，已跳过", SizeLabel: "—", Status: "skipped"}
-	if procRes, err := s.engine.Invoke(ctx, snap, "process-sentinel", "process.sample", "proc.sample", map[string]any{"limit": 3}); err == nil {
-		if ps, ok := procRes.Data.(sys.ProcessSampleSummary); ok {
-			procs = ps
-		} else {
-			procs.Rows = procRes.Rows
-		}
+	if isPluginActive("process-sentinel") {
+		procs = sys.SampleProcesses(ctx, 3)
 		topProcDetail := "系统负载平稳"
 		if len(procs.Rows) > 0 {
 			topProcDetail = fmt.Sprintf("最高占用：%s (CPU %d%% · %s)", procs.Rows[0].Name, procs.Rows[0].CPUPct, procs.Rows[0].MemLabel)
@@ -758,16 +1558,15 @@ func (s *Service) RunFirstScan(ctx context.Context) (types.ValetSnapshot, error)
 	}
 
 	logTask := types.ScanTaskItem{ID: "log", Title: "系统日志", Detail: "插件「日志侦探」未启用，已跳过", SizeLabel: "—", Status: "skipped"}
-	if logRes, err := s.engine.Invoke(ctx, snap, "log-detective", "log.summarize", "log.summarize_crashes", map[string]any{"minutes": 120}); err == nil {
-		if summary, ok := logRes.Data.(sys.CrashSummary); ok {
-			logTask = types.ScanTaskItem{
-				ID:        "log",
-				Title:     "系统日志",
-				Detail:    summary.Summary,
-				SizeLabel: fmt.Sprintf("%d 份", summary.Count),
-				SizeGB:    0,
-				Status:    "done",
-			}
+	if isPluginActive("log-detective") {
+		summary := sys.SummarizeDiagnosticLogs(s.opts.HomeDir, 120)
+		logTask = types.ScanTaskItem{
+			ID:        "log",
+			Title:     "系统日志",
+			Detail:    summary.Summary,
+			SizeLabel: fmt.Sprintf("%d 份", summary.Count),
+			SizeGB:    0,
+			Status:    "done",
 		}
 	}
 
@@ -791,37 +1590,79 @@ func (s *Service) RunFirstScan(ctx context.Context) (types.ValetSnapshot, error)
 	return next, nil
 }
 
+func makeWelcomeChatThread(primaryModel, nick string) types.ChatThread {
+	if strings.TrimSpace(nick) == "" {
+		nick = "你"
+	}
+	nowHHMM := time.Now().Format("15:04")
+	newID := fmt.Sprintf("chat-%d", time.Now().UnixNano())
+	return types.ChatThread{
+		ID:             newID,
+		Title:          "新对话",
+		Model:          primaryModel,
+		UpdatedAt:      "刚刚",
+		LinkedEventIDs: []string{},
+		Messages: []types.ChatMessage{
+			{
+				ID:        "welcome-" + newID,
+				Role:      "assistant",
+				MetaLabel: primaryModel + " · 就绪",
+				CreatedAt: nowHHMM,
+				Content:   fmt.Sprintf("%s好，我是驻留在你 Mac 上的事件管家。我可以监听本机与外部事件、按策略自动响应异常，或用自然语言为你编排专属插件与 Skill。", nick),
+			},
+		},
+	}
+}
+
 // CreateChatThread creates and activates a new conversation thread.
 func (s *Service) CreateChatThread() (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
-	nowHHMM := time.Now().Format("15:04")
-	newID := fmt.Sprintf("chat-%d", time.Now().UnixNano())
 	next := s.store.Update(func(st *types.ValetSnapshot) {
-		nick := st.Preferences.UserNickname
-		if nick == "" {
-			nick = "你"
-		}
-		thread := types.ChatThread{
-			ID:        newID,
-			Title:     "新对话",
-			Model:     st.Preferences.Models.Primary,
-			UpdatedAt: "刚刚",
-			LinkedEventIDs: []string{},
-			Messages: []types.ChatMessage{
-				{
-					ID:        "welcome-" + newID,
-					Role:      "assistant",
-					MetaLabel: st.Preferences.Models.Primary + " · 就绪",
-					CreatedAt: nowHHMM,
-					Content:   fmt.Sprintf("%s好，我可以帮你排查 Mac 卡顿、清理磁盘缓存、查看崩溃日志，或者直接用自然语言帮你写一个本地插件。", nick),
-				},
-			},
-		}
+		thread := makeWelcomeChatThread(st.Preferences.Models.Primary, st.Preferences.UserNickname)
 		st.ActiveView = string(types.ViewChat)
-		st.ActiveChatID = newID
+		st.ActiveChatID = thread.ID
 		st.ChatThreads = append([]types.ChatThread{thread}, st.ChatThreads...)
+	})
+	return next, nil
+}
+
+// ArchiveChatThread marks a conversation archived or restores it, ensuring an active non-archived thread remains.
+func (s *Service) ArchiveChatThread(chatID string, archived bool) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	nowHHMM := time.Now().Format("15:04")
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.ChatThreads {
+			if st.ChatThreads[i].ID == chatID {
+				st.ChatThreads[i].Archived = archived
+				if archived {
+					st.ChatThreads[i].ArchivedAt = nowHHMM
+				} else {
+					st.ChatThreads[i].ArchivedAt = ""
+				}
+				break
+			}
+		}
+		if archived && st.ActiveChatID == chatID {
+			fallbackID := ""
+			for _, t := range st.ChatThreads {
+				if !t.Archived {
+					fallbackID = t.ID
+					break
+				}
+			}
+			if fallbackID == "" {
+				thread := makeWelcomeChatThread(st.Preferences.Models.Primary, st.Preferences.UserNickname)
+				st.ChatThreads = append([]types.ChatThread{thread}, st.ChatThreads...)
+				fallbackID = thread.ID
+			}
+			st.ActiveChatID = fallbackID
+		} else if !archived {
+			st.ActiveChatID = chatID
+		}
 	})
 	return next, nil
 }
@@ -893,6 +1734,8 @@ func (s *Service) SendChatMessage(ctx context.Context, params types.SendChatPara
 		MentionPluginID: params.MentionPluginID,
 		Attachments:     params.Attachments,
 		RequestID:       fmt.Sprintf("chat-%s-%d", params.ChatID, time.Now().UnixNano()),
+		WhenBusy:        params.BusyMode,
+		Interactive:     params.Interactive,
 	}
 
 	var resp sidecar.ChatSendResponse
@@ -924,7 +1767,19 @@ func (s *Service) SendChatMessage(ctx context.Context, params types.SendChatPara
 		}
 		for i := range st.ChatThreads {
 			if st.ChatThreads[i].ID == params.ChatID {
-				st.ChatThreads[i].Messages = append(st.ChatThreads[i].Messages, resp.ReplyMessage)
+				replaced := false
+				if resp.ReplyMessage.ID != "" {
+					for mIdx := range st.ChatThreads[i].Messages {
+						if st.ChatThreads[i].Messages[mIdx].ID == resp.ReplyMessage.ID {
+							st.ChatThreads[i].Messages[mIdx] = resp.ReplyMessage
+							replaced = true
+							break
+						}
+					}
+				}
+				if !replaced {
+					st.ChatThreads[i].Messages = append(st.ChatThreads[i].Messages, resp.ReplyMessage)
+				}
 				st.ChatThreads[i].TimelineActionCount += len(resp.TimelineEventIDs)
 				for _, eid := range resp.TimelineEventIDs {
 					st.ChatThreads[i].LinkedEventIDs = append([]string{eid}, st.ChatThreads[i].LinkedEventIDs...)
@@ -954,6 +1809,25 @@ func (s *Service) AbortChat(ctx context.Context, chatID string) (bool, error) {
 		return false, err
 	}
 	return out.Aborted, nil
+}
+
+// ResolveChatPermission resolves an interactive foreground permission or ask_user prompt in Chat.
+func (s *Service) ResolveChatPermission(ctx context.Context, chatID, requestID, decision, note string) (bool, error) {
+	if err := s.ensureStarted(); err != nil {
+		return false, err
+	}
+	var out struct {
+		Resolved bool `json:"resolved"`
+	}
+	if err := s.client.Call(ctx, "chat.resolvePermission", sidecar.ResolvePermissionRequest{
+		ChatID:    chatID,
+		RequestID: requestID,
+		Decision:  decision,
+		Note:      note,
+	}, &out); err != nil {
+		return false, err
+	}
+	return out.Resolved, nil
 }
 
 // PerformProcessAction executes a process table quick action cleanly via Go host capabilities.
@@ -1026,6 +1900,19 @@ func (s *Service) InstallPluginDraft(chatID, messageID string, draft types.Plugi
 		return s.store.Snapshot(), err
 	}
 
+	pluginDir := ""
+	if s.opts.DataDir != "" {
+		if dir, _, wErr := plugins.WritePluginBundle(filepath.Join(s.opts.DataDir, "plugins"), types.UpsertLocalPluginParams{
+			ID:            draft.ID,
+			Slug:          draft.ID,
+			Name:          draft.Name,
+			ManifestYAML:  draft.ManifestYAML,
+			SkillMarkdown: draft.SkillMarkdown,
+		}); wErr == nil {
+			pluginDir = dir
+		}
+	}
+
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		for ti := range st.ChatThreads {
 			if st.ChatThreads[ti].ID == chatID {
@@ -1041,48 +1928,43 @@ func (s *Service) InstallPluginDraft(chatID, messageID string, draft types.Plugi
 				st.Plugins[i].Installed = true
 				st.Plugins[i].Enabled = true
 				st.Plugins[i].ManifestYAML = draft.ManifestYAML
+				if pluginDir != "" {
+					st.Plugins[i].LocalDir = pluginDir
+				}
 				return
 			}
 		}
 
-		events := make([]types.PluginEventPolicy, 0, len(parsed.TriggerSpecs))
-		for _, tr := range parsed.TriggerSpecs {
-			pol := tr.Policy
-			if pol == "" {
-				pol = "auto"
+		evList, _ := plugins.ManifestSpecsToPoliciesAndActions(parsed, nil)
+		for idx := range evList {
+			if evList[idx].Description == "Manifest 声明触发规则" && draft.WhenExpression != "" {
+				evList[idx].Description = draft.WhenExpression
 			}
-			desc := tr.Description
-			if desc == "" {
-				desc = draft.WhenExpression
-			}
-			events = append(events, types.PluginEventPolicy{
-				ID: tr.ID, Description: desc, Policy: pol, Count24h: 0,
-			})
 		}
-		actions := make([]types.PluginActionCapability, 0, len(parsed.ActionSpecs))
-		for _, act := range parsed.ActionSpecs {
-			label := "可撤销 · 7 天"
-			if act.Safety == "readonly" {
-				label = "只读"
-			} else if act.Safety == "confirm_always" {
-				label = "每次确认"
-			}
-			actions = append(actions, types.PluginActionCapability{
-				ID: act.ID, Safety: act.Safety, SafetyLabel: label,
-			})
+		skill := strings.TrimSpace(draft.SkillMarkdown)
+		if skill == "" {
+			skill = strings.TrimSpace(parsed.Skill)
 		}
 		st.Plugins = append(st.Plugins, types.PluginState{
 			ID: draft.ID, Slug: draft.ID, Name: draft.Name,
-			Tagline: fmt.Sprintf("%s · %s", draft.WhenExpression, draft.ActionExpression),
-			Description: "通过对话工作台自然语言生成并启用的本地自动化插件。",
-			Version: parsed.Version, BundleID: "local.valet." + draft.ID,
-			IconKind: "code", IconLabel: "{ }", Source: "local",
-			Enabled: true, Installed: true,
-			StatusSubtitle: "本地生成插件 · 传感器与工具热重载生效中",
+			Tagline:        fmt.Sprintf("%s · %s", draft.WhenExpression, draft.ActionExpression),
+			Description:    "通过对话工作台自然语言生成并启用的本地自动化插件。",
+			Version:        parsed.Version,
+			BundleID:       "local.valet." + draft.ID,
+			IconKind:       "code",
+			IconLabel:      "{ }",
+			Source:         "local",
+			Enabled:        true,
+			Installed:      true,
+			StatusSubtitle: "本地生成插件 · 传感器与 Skill 热重载生效中",
 			Triggers24h:    []int{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-			Events:         events,
-			Actions:        actions,
+			Events:         evList,
+			ConfigSchema:   parsed.ConfigSchema,
+			Config:         types.PluginConfig{Values: map[string]any{}},
 			ManifestYAML:   draft.ManifestYAML,
+			SkillMarkdown:  skill,
+			LocalDir:       pluginDir,
+			BundledFiles:   []string{"manifest.yaml", "SKILL.md"},
 		})
 	})
 
@@ -1163,18 +2045,29 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 
 	batchID := ""
 	reclaimed := target.ReclaimableGB
+	approvedToolSummary := ""
+	existingTimelineIDs := make(map[string]bool, len(snap.TimelineEvents))
+	for _, ev := range snap.TimelineEvents {
+		existingTimelineIDs[ev.ID] = true
+	}
 
 	switch {
 	case target.ToolName == "disk_empty_trash":
 		if s.client != nil {
-			_ = s.client.Call(ctx, "tool.executeApproved", sidecar.ExecuteApprovedRequest{
+			var execRes struct {
+				OK     bool   `json:"ok"`
+				Output string `json:"output"`
+			}
+			if err := s.client.Call(ctx, "tool.executeApproved", sidecar.ExecuteApprovedRequest{
 				InboxID:      target.ID,
 				ToolName:     target.ToolName,
 				ToolArgs:     target.ToolArgs,
 				CheckedPaths: checkedPaths,
-			}, nil)
+			}, &execRes); err == nil && strings.TrimSpace(execRes.Output) != "" {
+				approvedToolSummary = summarizeMarkdownReply(execRes.Output)
+			}
 		}
-	case target.Category == "files" || strings.Contains(target.ToolName, "trash"):
+	case target.ToolName == "trash_files" || target.Category == "files" || strings.Contains(target.ToolName, "trash"):
 		if len(checkedPaths) == 0 {
 			if s.opts.DesktopReady {
 				if len(target.ActionItems) == 0 {
@@ -1202,23 +2095,47 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 		if realReclaimed > 0 {
 			reclaimed = realReclaimed
 		}
-	case target.ToolName == "process_terminate":
-		if rawPID, ok := target.Payload["pid"]; ok {
-			pid := intFromAny(rawPID)
-			if pid > 1 {
-				_ = sys.TerminateProcess(pid, target.Title, "SIGTERM", snap.Preferences.BlockedApps)
+	case target.ToolName == "kill_process" || target.ToolName == "process_terminate":
+		pid := intFromAny(target.ToolArgs["pid"])
+		if pid <= 1 {
+			pid = intFromAny(target.Payload["pid"])
+		}
+		procName, _ := target.ToolArgs["name"].(string)
+		if strings.TrimSpace(procName) == "" {
+			procName = target.Title
+		}
+		sig, _ := target.ToolArgs["signal"].(string)
+		if strings.TrimSpace(sig) == "" {
+			sig = "SIGTERM"
+		}
+		if pid > 1 {
+			if err := sys.TerminateProcess(pid, procName, sig, snap.Preferences.BlockedApps); err != nil {
+				return snap, err
 			}
+			approvedToolSummary = fmt.Sprintf("已向 %s (PID %d) 发送 %s", procName, pid, sig)
 		}
 	case target.ToolName != "" && s.client != nil:
-		_ = s.client.Call(ctx, "tool.executeApproved", sidecar.ExecuteApprovedRequest{
+		var execRes struct {
+			OK     bool   `json:"ok"`
+			Output string `json:"output"`
+		}
+		if err := s.client.Call(ctx, "tool.executeApproved", sidecar.ExecuteApprovedRequest{
 			InboxID:      target.ID,
 			ToolName:     target.ToolName,
 			ToolArgs:     target.ToolArgs,
 			CheckedPaths: checkedPaths,
-		}, nil)
+		}, &execRes); err == nil && strings.TrimSpace(execRes.Output) != "" {
+			approvedToolSummary = summarizeMarkdownReply(execRes.Output)
+		}
 	}
 
 	nowHHMM := time.Now().Format("15:04")
+	linkedSummary := "已批准执行并同步完成。"
+	newEvtSummary := "已通过收件箱批准并执行。"
+	if approvedToolSummary != "" && batchID == "" {
+		linkedSummary = "已批准执行：" + approvedToolSummary
+		newEvtSummary = "已批准执行：" + approvedToolSummary
+	}
 	nextSnap := s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.InboxItems {
 			if st.InboxItems[i].ID == itemID {
@@ -1233,23 +2150,29 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 		st.SystemMetrics.DiskFreeGB = math.Round((st.SystemMetrics.DiskFreeGB+reclaimed)*10) / 10
 
 		if target.LinkedTimelineEventID != "" {
-			for i := range st.TimelineEvents {
-				if st.TimelineEvents[i].ID == target.LinkedTimelineEventID {
-					st.TimelineEvents[i].Status = "completed"
-					st.TimelineEvents[i].CanRestore = target.Reversible7d
-					st.TimelineEvents[i].TrashBatchID = batchID
-					st.TimelineEvents[i].ReclaimedGB = reclaimed
-					st.TimelineEvents[i].Summary = "已批准执行并同步完成。"
-					for j := range st.TimelineEvents[i].TraceSteps {
-						st.TimelineEvents[i].TraceSteps[j].Status = "done"
+			filtered := make([]types.TimelineEvent, 0, len(st.TimelineEvents))
+			for _, ev := range st.TimelineEvents {
+				if !existingTimelineIDs[ev.ID] && strings.HasPrefix(ev.ID, "evt-rec-") {
+					continue
+				}
+				if ev.ID == target.LinkedTimelineEventID {
+					ev.Status = "completed"
+					ev.CanRestore = target.Reversible7d
+					ev.TrashBatchID = batchID
+					ev.ReclaimedGB = reclaimed
+					ev.Summary = linkedSummary
+					for j := range ev.TraceSteps {
+						ev.TraceSteps[j].Status = "done"
 					}
 				}
+				filtered = append(filtered, ev)
 			}
+			st.TimelineEvents = filtered
 		} else {
 			st.TimelineEvents = append([]types.TimelineEvent{{
 				ID: "evt-from-" + itemID, Timestamp: time.Now().Format(time.RFC3339), TimeLabel: nowHHMM,
 				DayGroup: "today", Title: target.Title,
-				Summary: "已通过收件箱批准并执行。", PluginID: target.PluginID, PluginName: target.PluginName,
+				Summary: newEvtSummary, PluginID: target.PluginID, PluginName: target.PluginName,
 				PluginBadge: target.PluginBadge, EventCode: target.EventCode, Status: "completed",
 				Payload: target.Payload, Reasoning: target.Reasoning, ActionItems: target.ActionItems,
 				TraceSteps: target.TraceSteps, Logs: target.Logs,
@@ -1577,16 +2500,50 @@ func (s *Service) TogglePluginEnabled(pluginID string) (types.ValetSnapshot, err
 	return next, nil
 }
 
-// InstallMarketplacePlugin marks a discoverable plugin installed & enabled.
+// InstallMarketplacePlugin marks a discoverable plugin installed & enabled,
+// materializing its bundle files into `<dataDir>/plugins/<slug>/`.
 func (s *Service) InstallMarketplacePlugin(pluginID string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
+	pid := strings.TrimSpace(pluginID)
+	snap := s.store.Snapshot()
+	var slug string
+	for _, p := range snap.Plugins {
+		if p.ID == pid || p.Slug == pid {
+			slug = p.Slug
+			if slug == "" {
+				slug = p.ID
+			}
+			break
+		}
+	}
+	if slug == "" {
+		slug = plugins.NormalizeSlug(pid)
+	}
+
+	var matDir string
+	var matFiles []string
+	if s.opts.DataDir != "" && slug != "" {
+		if dir, files, err := plugins.MaterializeCatalogPlugin(pluginsbundle.CatalogFS, slug, filepath.Join(s.opts.DataDir, "plugins")); err == nil {
+			matDir = dir
+			matFiles = files
+		}
+	}
+
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.Plugins {
-			if st.Plugins[i].ID == pluginID {
+			if st.Plugins[i].ID == pid || st.Plugins[i].Slug == pid {
 				st.Plugins[i].Installed = true
 				st.Plugins[i].Enabled = true
+				st.Plugins[i].Actions = nil
+				if matDir != "" {
+					st.Plugins[i].LocalDir = matDir
+				}
+				if len(matFiles) > 0 {
+					st.Plugins[i].BundledFiles = matFiles
+				}
+				st.Plugins[i].StatusSubtitle = "已安装并启用 · 传感器与 Skill 已激活"
 			}
 		}
 	})
@@ -1604,6 +2561,12 @@ func (s *Service) InstallCustomPlugin(params types.InstallCustomPluginParams) (t
 		return s.store.Snapshot(), err
 	}
 	slug := fmt.Sprintf("local-%d", time.Now().Unix()%100000)
+	if parsed.ID != "" {
+		cand := plugins.NormalizeSlug(parsed.ID)
+		if cand != "" && cand != "local-plugin" {
+			slug = cand
+		}
+	}
 	name := strings.TrimSpace(params.Name)
 	if name == "" {
 		name = parsed.Name
@@ -1613,24 +2576,21 @@ func (s *Service) InstallCustomPlugin(params types.InstallCustomPluginParams) (t
 	}
 	tagline := strings.TrimSpace(params.Tagline)
 	if tagline == "" {
-		tagline = "~/Valet/plugins/custom · 本地开发"
+		tagline = "~/Valet/plugins/" + slug + " · 本地开发"
 	}
 
-	evList, actList := manifestSpecsToPoliciesAndActions(parsed, nil)
-
-	next := s.store.Update(func(st *types.ValetSnapshot) {
-		st.Plugins = append(st.Plugins, types.PluginState{
-			ID: slug, Slug: slug, Name: name, Tagline: tagline,
-			Description: "通过本地 Manifest YAML 导入的自定义事件响应插件。",
-			Version: parsed.Version, BundleID: "local.valet." + slug,
-			IconKind: "code", IconLabel: "{ }", Source: "local",
-			Enabled: true, Installed: true,
-			StatusSubtitle: "~/Valet/plugins/custom · 热重载中",
-			Triggers24h:    make([]int, 10),
-			Events:         evList, Actions: actList, ManifestYAML: params.YAML,
-		})
+	next, _, uErr := s.upsertLocalPlugin(types.UpsertLocalPluginParams{
+		ID:            slug,
+		Slug:          slug,
+		Name:          name,
+		Tagline:       tagline,
+		Description:   "通过本地 Manifest 与 Skill 创建的自定义事件处理插件。",
+		ManifestYAML:  params.YAML,
+		SkillMarkdown: params.SkillMarkdown,
 	})
-	s.syncRuntime(next)
+	if uErr != nil {
+		return s.store.Snapshot(), uErr
+	}
 	return next, nil
 }
 
@@ -1648,18 +2608,377 @@ func (s *Service) UpdatePluginManifest(pluginID, manifestYAML string) (types.Val
 			if st.Plugins[i].ID != pluginID {
 				continue
 			}
-			evList, actList := manifestSpecsToPoliciesAndActions(parsed, st.Plugins[i].Events)
+			evList, _ := plugins.ManifestSpecsToPoliciesAndActions(parsed, st.Plugins[i].Events)
 			if strings.TrimSpace(parsed.Version) != "" {
 				st.Plugins[i].Version = parsed.Version
 			}
 			st.Plugins[i].Events = evList
-			st.Plugins[i].Actions = actList
+			st.Plugins[i].Actions = nil
+			st.Plugins[i].ConfigSchema = parsed.ConfigSchema
 			st.Plugins[i].ManifestYAML = manifestYAML
+			if strings.TrimSpace(parsed.Skill) != "" {
+				st.Plugins[i].SkillMarkdown = strings.TrimSpace(parsed.Skill)
+			}
 			st.Plugins[i].StatusSubtitle = "刚刚热重载 · Manifest 已生效"
+			if (st.Plugins[i].Source == "local" || st.Plugins[i].LocalDir != "") && s.opts.DataDir != "" {
+				if dir, _, wErr := plugins.WritePluginBundle(filepath.Join(s.opts.DataDir, "plugins"), types.UpsertLocalPluginParams{
+					ID:            st.Plugins[i].ID,
+					Slug:          st.Plugins[i].Slug,
+					Name:          st.Plugins[i].Name,
+					ManifestYAML:  manifestYAML,
+					SkillMarkdown: st.Plugins[i].SkillMarkdown,
+				}); wErr == nil {
+					st.Plugins[i].LocalDir = dir
+				}
+			}
 		}
 	})
 	s.syncRuntime(next)
 	return next, nil
+}
+
+// UpdatePluginSkill updates a plugin's SKILL.md instruction body and hot-reloads Pi Durable.
+func (s *Service) UpdatePluginSkill(pluginID, skillMarkdown string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	trimmed := strings.TrimSpace(skillMarkdown)
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Plugins {
+			if st.Plugins[i].ID == pluginID {
+				st.Plugins[i].SkillMarkdown = trimmed
+				st.Plugins[i].StatusSubtitle = "刚刚更新 Skill · 处理逻辑已热重载"
+				if (st.Plugins[i].Source == "local" || st.Plugins[i].LocalDir != "") && s.opts.DataDir != "" && st.Plugins[i].ManifestYAML != "" {
+					if dir, _, wErr := plugins.WritePluginBundle(filepath.Join(s.opts.DataDir, "plugins"), types.UpsertLocalPluginParams{
+						ID:            st.Plugins[i].ID,
+						Slug:          st.Plugins[i].Slug,
+						Name:          st.Plugins[i].Name,
+						ManifestYAML:  st.Plugins[i].ManifestYAML,
+						SkillMarkdown: trimmed,
+					}); wErr == nil {
+						st.Plugins[i].LocalDir = dir
+					}
+				}
+			}
+		}
+	})
+	s.syncRuntime(next)
+	return next, nil
+}
+
+// ReloadPlugin reloads one local plugin from disk (or all local plugins when pluginID is empty) and hot-reloads the runtime.
+func (s *Service) ReloadPlugin(pluginID string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	pid := strings.TrimSpace(pluginID)
+	pluginsBase := filepath.Join(s.opts.DataDir, "plugins")
+
+	if pid == "" {
+		discovered, err := plugins.DiscoverLocalPlugins(pluginsBase)
+		if err != nil {
+			return s.store.Snapshot(), err
+		}
+		next := s.store.Update(func(st *types.ValetSnapshot) {
+			for _, bundle := range discovered {
+				mergeLocalPluginIntoSlice(&st.Plugins, bundle)
+			}
+		})
+		s.syncRuntime(next)
+		s.emitStateChange("plugins")
+		return next, nil
+	}
+
+	snap := s.store.Snapshot()
+	var existing *types.PluginState
+	for i := range snap.Plugins {
+		if snap.Plugins[i].ID == pid || snap.Plugins[i].Slug == pid {
+			cp := snap.Plugins[i]
+			existing = &cp
+			break
+		}
+	}
+	dir := ""
+	if existing != nil && existing.LocalDir != "" {
+		dir = existing.LocalDir
+	} else {
+		cand := filepath.Join(pluginsBase, plugins.NormalizeSlug(pid))
+		if _, err := os.Stat(cand); err == nil {
+			dir = cand
+		}
+	}
+
+	if dir != "" {
+		manifestYAML, skillMD, parsed, _, err := plugins.ReadPluginBundle(dir)
+		if err != nil {
+			return snap, err
+		}
+		next := s.store.Update(func(st *types.ValetSnapshot) {
+			var cur *types.PluginState
+			for i := range st.Plugins {
+				if st.Plugins[i].ID == pid || st.Plugins[i].Slug == pid {
+					cur = &st.Plugins[i]
+					break
+				}
+			}
+			slug := plugins.NormalizeSlug(filepath.Base(dir))
+			updated := plugins.BuildPluginStateFromParsed(pid, slug, parsed.Name, "", "", manifestYAML, skillMD, dir, parsed, cur)
+			updated.StatusSubtitle = "刚刚从磁盘热重载 · 已生效"
+			if cur != nil {
+				*cur = updated
+			} else {
+				st.Plugins = append(st.Plugins, updated)
+			}
+		})
+		s.syncRuntime(next)
+		s.emitStateChange("plugins")
+		return next, nil
+	}
+
+	if existing == nil {
+		return snap, fmt.Errorf("未找到插件: %q", pid)
+	}
+	parsed, err := plugins.ParseManifestYAML(existing.ManifestYAML)
+	if err != nil {
+		return snap, err
+	}
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Plugins {
+			if st.Plugins[i].ID == existing.ID {
+				evList, _ := plugins.ManifestSpecsToPoliciesAndActions(parsed, st.Plugins[i].Events)
+				st.Plugins[i].Events = evList
+				st.Plugins[i].Actions = nil
+				st.Plugins[i].ConfigSchema = parsed.ConfigSchema
+				st.Plugins[i].StatusSubtitle = "刚刚热重载 · 已生效"
+			}
+		}
+	})
+	s.syncRuntime(next)
+	s.emitStateChange("plugins")
+	return next, nil
+}
+
+// UninstallPlugin uninstalls any installed plugin (removing local plugins completely, or
+// resetting catalog plugins back to Installed=false) and deletes its materialized disk bundle.
+func (s *Service) UninstallPlugin(pluginID string) (types.ValetSnapshot, error) {
+	return s.RemoveLocalPluginWithFiles(pluginID, true)
+}
+
+// RemoveLocalPlugin uninstalls a plugin and removes its directory under <dataDir>/plugins.
+func (s *Service) RemoveLocalPlugin(pluginID string) (types.ValetSnapshot, error) {
+	return s.RemoveLocalPluginWithFiles(pluginID, true)
+}
+
+// RemoveLocalPluginWithFiles uninstalls a plugin (local plugins are removed from the list;
+// catalog plugins return to Discover with Installed=false, Enabled=false) and optionally removes its disk files.
+func (s *Service) RemoveLocalPluginWithFiles(pluginID string, deleteFiles bool) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	pid := strings.TrimSpace(pluginID)
+	var removedDir string
+	var resolvedID string
+	var resolvedSlug string
+	var found bool
+	var isLocal bool
+
+	snap := s.store.Snapshot()
+	for _, p := range snap.Plugins {
+		if p.ID == pid || p.Slug == pid {
+			found = true
+			isLocal = p.Source == "local"
+			removedDir = p.LocalDir
+			resolvedID = p.ID
+			resolvedSlug = p.Slug
+			if resolvedSlug == "" {
+				resolvedSlug = p.ID
+			}
+			break
+		}
+	}
+	if !found {
+		return snap, fmt.Errorf("未找到插件: %q", pid)
+	}
+
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		if isLocal {
+			filtered := make([]types.PluginState, 0, len(st.Plugins))
+			for _, p := range st.Plugins {
+				if p.ID == pid || p.Slug == pid || p.ID == resolvedID {
+					continue
+				}
+				filtered = append(filtered, p)
+			}
+			st.Plugins = filtered
+		} else {
+			for i := range st.Plugins {
+				if st.Plugins[i].ID == resolvedID {
+					st.Plugins[i].Installed = false
+					st.Plugins[i].Enabled = false
+					st.Plugins[i].LocalDir = ""
+					st.Plugins[i].StatusSubtitle = "可安装 · 扩展目录"
+				}
+			}
+		}
+		if st.ActivePluginDetailID != nil && (*st.ActivePluginDetailID == pid || *st.ActivePluginDetailID == resolvedID) {
+			st.ActivePluginDetailID = nil
+		}
+	})
+
+	if deleteFiles && s.opts.DataDir != "" {
+		basePlugins, _ := filepath.Abs(filepath.Join(s.opts.DataDir, "plugins"))
+		targetDir := removedDir
+		if targetDir == "" {
+			targetDir = filepath.Join(basePlugins, plugins.NormalizeSlug(resolvedSlug))
+		}
+		if absTarget, err := filepath.Abs(targetDir); err == nil {
+			if rel, rErr := filepath.Rel(basePlugins, absTarget); rErr == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+				_ = os.RemoveAll(absTarget)
+			}
+		}
+		baseState, _ := filepath.Abs(filepath.Join(s.opts.DataDir, "plugin-state"))
+		if absState, err := filepath.Abs(filepath.Join(baseState, resolvedID)); err == nil {
+			if rel, rErr := filepath.Rel(baseState, absState); rErr == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+				_ = os.RemoveAll(absState)
+			}
+		}
+	}
+
+	s.syncRuntime(next)
+	s.emitStateChange("plugins")
+	return next, nil
+}
+
+// UpsertLocalPlugin writes a local plugin bundle to disk, registers/updates it in Store, and hot-reloads Engine & Sidecar.
+func (s *Service) UpsertLocalPlugin(params types.UpsertLocalPluginParams) (types.ValetSnapshot, error) {
+	next, _, err := s.upsertLocalPlugin(params)
+	return next, err
+}
+
+func (s *Service) upsertLocalPlugin(params types.UpsertLocalPluginParams) (types.ValetSnapshot, types.PluginState, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, types.PluginState{}, err
+	}
+	pluginsBase := filepath.Join(s.opts.DataDir, "plugins")
+	pluginDir, parsed, err := plugins.WritePluginBundle(pluginsBase, params)
+	if err != nil {
+		return s.store.Snapshot(), types.PluginState{}, err
+	}
+	slug := plugins.NormalizeSlug(filepath.Base(pluginDir))
+	id := strings.TrimSpace(params.ID)
+	if id == "" {
+		id = slug
+	}
+
+	var result types.PluginState
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		var existing *types.PluginState
+		for i := range st.Plugins {
+			if st.Plugins[i].ID == id || st.Plugins[i].Slug == slug {
+				existing = &st.Plugins[i]
+				break
+			}
+		}
+		if existing != nil && existing.Source != "local" {
+			// Avoid overwriting core plugins by ID collision
+			id = "local-" + slug
+			existing = nil
+		}
+		built := plugins.BuildPluginStateFromParsed(
+			id,
+			slug,
+			params.Name,
+			params.Tagline,
+			params.Description,
+			strings.TrimSpace(params.ManifestYAML),
+			strings.TrimSpace(params.SkillMarkdown),
+			pluginDir,
+			parsed,
+			existing,
+		)
+		built.Installed = true
+		if params.Enabled != nil {
+			built.Enabled = *params.Enabled
+		} else if existing == nil {
+			built.Enabled = true
+		}
+		built.StatusSubtitle = "本地插件 · 传感器与工具热重载生效中"
+
+		if existing != nil {
+			*existing = built
+		} else {
+			st.Plugins = append(st.Plugins, built)
+		}
+		result = built
+	})
+
+	s.syncRuntime(next)
+	s.emitStateChange("plugins")
+	return next, result, nil
+}
+
+func (s *Service) installPluginFromDir(dir, slugOverride, nameOverride, taglineOverride, skillOverride string) (types.ValetSnapshot, types.PluginState, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, types.PluginState{}, err
+	}
+	manifestYAML, skillMD, parsed, files, err := plugins.ReadPluginBundle(dir)
+	if err != nil {
+		return s.store.Snapshot(), types.PluginState{}, err
+	}
+	if strings.TrimSpace(skillOverride) != "" {
+		skillMD = strings.TrimSpace(skillOverride)
+	}
+	resolvedDir := dir
+	if info, statErr := os.Stat(dir); statErr == nil && !info.IsDir() {
+		resolvedDir = filepath.Dir(dir)
+	}
+
+	slug := strings.TrimSpace(slugOverride)
+	if slug == "" {
+		slug = strings.TrimSpace(parsed.ID)
+	}
+	if slug == "" {
+		slug = filepath.Base(resolvedDir)
+	}
+	slug = plugins.NormalizeSlug(slug)
+
+	extraFiles := make(map[string]string)
+	for _, rel := range files {
+		low := strings.ToLower(rel)
+		if low == "manifest.yaml" || low == "manifest.yml" || low == "plugin.yaml" || low == "plugin.yml" || low == "skill.md" {
+			continue
+		}
+		if data, rErr := os.ReadFile(filepath.Join(resolvedDir, filepath.FromSlash(rel))); rErr == nil && len(data) <= 512*1024 {
+			extraFiles[rel] = string(data)
+		}
+	}
+
+	return s.upsertLocalPlugin(types.UpsertLocalPluginParams{
+		ID:            slug,
+		Slug:          slug,
+		Name:          strings.TrimSpace(nameOverride),
+		Tagline:       strings.TrimSpace(taglineOverride),
+		ManifestYAML:  manifestYAML,
+		SkillMarkdown: skillMD,
+		Files:         extraFiles,
+	})
+}
+
+func (s *Service) inspectPluginDetail(idOrSlug string) (types.PluginState, []string, error) {
+	snap := s.store.Snapshot()
+	q := strings.TrimSpace(idOrSlug)
+	for _, p := range snap.Plugins {
+		if p.ID == q || p.Slug == q {
+			var files []string
+			if p.LocalDir != "" {
+				if _, _, _, f, err := plugins.ReadPluginBundle(p.LocalDir); err == nil {
+					files = f
+				}
+			}
+			return p, files, nil
+		}
+	}
+	return types.PluginState{}, nil, fmt.Errorf("未找到插件: %q", q)
 }
 
 // FixPluginAuth clears authError on a plugin and updates failed Timeline events.
@@ -1710,6 +3029,27 @@ func (s *Service) UpdatePluginConfig(pluginID string, cfg types.PluginConfig) (t
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
+	if cfg.Values == nil {
+		cfg.Values = map[string]any{}
+	}
+	if cfg.LowSpaceThresholdPct != nil {
+		if _, ok := cfg.Values["lowSpaceThresholdPct"]; !ok {
+			cfg.Values["lowSpaceThresholdPct"] = *cfg.LowSpaceThresholdPct
+		}
+	} else if raw, ok := cfg.Values["lowSpaceThresholdPct"]; ok {
+		if n := intFromAny(raw); n > 0 {
+			cfg.LowSpaceThresholdPct = &n
+		}
+	}
+	if cfg.SampleIntervalSec != nil {
+		if _, ok := cfg.Values["sampleIntervalSec"]; !ok {
+			cfg.Values["sampleIntervalSec"] = *cfg.SampleIntervalSec
+		}
+	} else if raw, ok := cfg.Values["sampleIntervalSec"]; ok {
+		if n := intFromAny(raw); n > 0 {
+			cfg.SampleIntervalSec = &n
+		}
+	}
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.Plugins {
 			if st.Plugins[i].ID == pluginID {
@@ -1724,6 +3064,23 @@ func (s *Service) UpdatePluginConfig(pluginID string, cfg types.PluginConfig) (t
 // SimulatePluginEvent injects an event through Valet's event throttle + Pi Durable agent pipeline.
 func (s *Service) SimulatePluginEvent(ctx context.Context, pluginID, eventCode string) (types.SimulateEventResult, error) {
 	return s.dispatchPluginEventInternal(ctx, pluginID, eventCode, map[string]any{"simulated": true}, true)
+}
+
+// TriggerPluginEvent injects a simulated event with an optional JSON payload string into Pi Durable.
+func (s *Service) TriggerPluginEvent(ctx context.Context, pluginID, eventCode, payloadJSON string) (types.SimulateEventResult, error) {
+	payload := map[string]any{"simulated": true}
+	trimmed := strings.TrimSpace(payloadJSON)
+	if trimmed != "" {
+		var custom map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &custom); err != nil {
+			return types.SimulateEventResult{}, fmt.Errorf("事件 Payload JSON 格式无效：%w", err)
+		}
+		for k, v := range custom {
+			payload[k] = v
+		}
+		payload["simulated"] = true
+	}
+	return s.dispatchPluginEventInternal(ctx, pluginID, eventCode, payload, true)
 }
 
 func (s *Service) dispatchPluginEventInternal(
@@ -1778,6 +3135,8 @@ func (s *Service) dispatchPluginEventInternal(
 		}, &resp)
 	}
 
+	importedLogs := extractImportedLogLines(reqPayload)
+
 	s.mu.Lock()
 	var createdEvt *types.TimelineEvent
 	var createdInbox *types.InboxApprovalItem
@@ -1796,6 +3155,33 @@ func (s *Service) dispatchPluginEventInternal(
 	s.mu.Unlock()
 
 	if createdEvt != nil {
+		if len(importedLogs) > 0 {
+			createdEvt.Logs = append(createdEvt.Logs, importedLogs...)
+			if createdInbox != nil {
+				createdInbox.Logs = append(createdInbox.Logs, importedLogs...)
+			}
+			s.mu.Lock()
+			s.createdEvent[createdEvt.ID] = *createdEvt
+			if createdInbox != nil {
+				s.createdInbox[createdInbox.ID] = *createdInbox
+			}
+			s.mu.Unlock()
+			s.store.Update(func(st *types.ValetSnapshot) {
+				for i := range st.TimelineEvents {
+					if st.TimelineEvents[i].ID == createdEvt.ID {
+						st.TimelineEvents[i].Logs = append(st.TimelineEvents[i].Logs, importedLogs...)
+					}
+				}
+				if createdInbox != nil {
+					for i := range st.InboxItems {
+						if st.InboxItems[i].ID == createdInbox.ID {
+							st.InboxItems[i].Logs = append(st.InboxItems[i].Logs, importedLogs...)
+						}
+					}
+				}
+			})
+			s.emitStateChange("timeline")
+		}
 		return types.SimulateEventResult{Event: *createdEvt, InboxItem: createdInbox}, nil
 	}
 
@@ -1826,27 +3212,63 @@ func (s *Service) dispatchPluginEventInternal(
 		sourceLabel = "来自开发者事件模拟器"
 		titlePrefix = "模拟事件："
 	}
+	if reqPayload["source"] == "manual_import" {
+		sourceLabel = "来自手动日志导入"
+		titlePrefix = ""
+	}
+
+	title := fmt.Sprintf("%s%s 捕获 %s", titlePrefix, plugin.Name, eventCode)
+	if customTitle, ok := reqPayload["title"].(string); ok && strings.TrimSpace(customTitle) != "" {
+		title = strings.TrimSpace(customTitle)
+	}
+	reasoning := fmt.Sprintf("插件「%s」捕获事件 %s，当前按策略「%s」路由记录。", plugin.Name, eventCode, policy)
+	if reply := strings.TrimSpace(resp.ReplyText); reply != "" {
+		reasoning = reply
+		if short := summarizeMarkdownReply(reply); short != "" {
+			summary = short
+		}
+	}
+	traceSteps := []types.TraceStep{
+		{ID: "s1", Time: nowHHMM, Stage: "事件触发", Detail: eventCode + " 已进入事件总线", Status: "done"},
+	}
+	logs := []types.LogLine{{ID: "sl1", TS: now.Format("15:04:05"), Level: "INFO", Message: "Dispatched " + eventCode}}
+	if len(importedLogs) > 0 {
+		logs = importedLogs
+		traceSteps = append(traceSteps, types.TraceStep{
+			ID:     "s2",
+			Time:   nowHHMM,
+			Stage:  "日志采集与归因",
+			Detail: fmt.Sprintf("附带 %d 条结构化日志供 Skill 归因", len(importedLogs)),
+			Status: "done",
+		})
+	}
 
 	evtID := fmt.Sprintf("evt-plug-%d", now.UnixNano())
 	evt := types.TimelineEvent{
 		ID: evtID, Timestamp: now.Format(time.RFC3339), TimeLabel: nowHHMM,
-		DayGroup: "today", Title: fmt.Sprintf("%s%s 捕获 %s", titlePrefix, plugin.Name, eventCode),
+		DayGroup: "today", Title: title,
 		Summary: summary, PluginID: plugin.ID, PluginName: plugin.Name, PluginBadge: badge,
 		EventCode: eventCode, Status: evtStatus, TriggerLatencyLabel: nowHHMM + " · " + sourceLabel,
-		Payload: reqPayload,
-		Reasoning: fmt.Sprintf("插件「%s」捕获事件 %s，当前按策略「%s」路由记录。", plugin.Name, eventCode, policy),
+		Payload:     reqPayload,
+		Reasoning:   reasoning,
 		ActionItems: []types.TimelineActionItem{},
-		TraceSteps: []types.TraceStep{
-			{ID: "s1", Time: nowHHMM, Stage: "事件触发", Detail: eventCode + " 已进入事件总线", Status: "done"},
-		},
-		Logs: []types.LogLine{{ID: "sl1", TS: now.Format("15:04:05"), Level: "INFO", Message: "Dispatched " + eventCode}},
+		TraceSteps:  traceSteps,
+		Logs:        logs,
 	}
 
 	var inb *types.InboxApprovalItem
 	if policy == "ask" {
+		cat := "files"
+		iconKind := plugin.IconKind
+		if iconKind == "" {
+			iconKind = "disk"
+		}
+		if iconKind == "pulse" || iconKind == "log" || iconKind == "battery" || iconKind == "wifi" || iconKind == "surge" {
+			cat = "process"
+		}
 		item := types.InboxApprovalItem{
 			ID: fmt.Sprintf("inbox-plug-%d", now.UnixNano()), Timestamp: evt.Timestamp,
-			TimeLabel: nowHHMM, AgeLabel: "刚刚", Category: "files", IconKind: "disk",
+			TimeLabel: nowHHMM, AgeLabel: "刚刚", Category: cat, IconKind: iconKind,
 			Title: evt.Title, Summary: evt.Summary, PluginID: plugin.ID, PluginName: plugin.Name,
 			PluginBadge: plugin.Name, EventCode: eventCode, Reversible7d: false, ReclaimableGB: 0,
 			ApproveLabel: "批准执行", DismissLabel: "忽略", Status: "pending", LinkedTimelineEventID: evt.ID,
@@ -2035,6 +3457,23 @@ func (s *Service) SendTestAgentMessage(ctx context.Context, provider types.Agent
 	return out, err
 }
 
+// TestAutoReview validates Auto Review decision model connectivity (Jev System One or small model fallback).
+func (s *Service) TestAutoReview(ctx context.Context, cfg types.AutoReviewConfig) (types.TestMessageResult, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.TestMessageResult{}, err
+	}
+	cfg.JevAPIKey = strings.TrimSpace(cfg.JevAPIKey)
+	cfg.JevEndpoint = strings.TrimSpace(cfg.JevEndpoint)
+	cfg.JevModel = strings.TrimSpace(cfg.JevModel)
+	cfg.FallbackProviderID = strings.TrimSpace(cfg.FallbackProviderID)
+	cfg.FallbackModel = strings.TrimSpace(cfg.FallbackModel)
+	var out types.TestMessageResult
+	err := s.client.Call(ctx, "agent.testAutoReview", sidecar.TestAutoReviewRequest{
+		AutoReview: cfg,
+	}, &out)
+	return out, err
+}
+
 // UpdateModels updates primary/fast/vision model selections.
 func (s *Service) UpdateModels(models types.ModelSelection) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
@@ -2058,18 +3497,25 @@ func (s *Service) SetAutonomyLevel(level string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
+	normalized := strings.TrimSpace(level)
+	switch normalized {
+	case "sensitive_only", "":
+		normalized = "auto_review"
+	case "autonomous":
+		normalized = "full_access"
+	}
 	next := s.store.Update(func(st *types.ValetSnapshot) {
-		st.Preferences.AutonomyLevel = level
-		switch level {
+		st.Preferences.AutonomyLevel = normalized
+		switch normalized {
 		case "always_ask":
 			st.Preferences.ConfirmChecklist = types.SafetyConfirmationChecklist{
 				DeleteOrOverwrite: true, SendMessageOrEmail: true, PaymentOrSubscription: true,
 				RunTerminalCommand: true, ModifySystemSettings: true,
 			}
-		case "sensitive_only":
+		case "auto_review":
 			st.Preferences.ConfirmChecklist = types.SafetyConfirmationChecklist{
-				DeleteOrOverwrite: true, SendMessageOrEmail: true, PaymentOrSubscription: true,
-				RunTerminalCommand: true, ModifySystemSettings: false,
+				DeleteOrOverwrite: false, SendMessageOrEmail: true, PaymentOrSubscription: true,
+				RunTerminalCommand: false, ModifySystemSettings: false,
 			}
 		default:
 			st.Preferences.ConfirmChecklist = types.SafetyConfirmationChecklist{
@@ -2087,14 +3533,42 @@ func (s *Service) UpdatePreferences(prefs types.ValetPreferences) (types.ValetSn
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
+	trimmedJevKey := strings.TrimSpace(prefs.AutoReview.JevAPIKey)
+	if s.opts.DesktopReady {
+		if trimmedJevKey != "" {
+			_ = mygo.Secrets.Set("autoreview.jev.apikey", []byte(trimmedJevKey))
+		} else {
+			_ = mygo.Secrets.Delete("autoreview.jev.apikey")
+		}
+	}
+	prefs.AutoReview.JevAPIKey = trimmedJevKey
+	prefs.AutoReview.JevAPIKeyMasked = maskSecretKey(trimmedJevKey)
+	switch strings.TrimSpace(prefs.AutonomyLevel) {
+	case "sensitive_only", "":
+		prefs.AutonomyLevel = "auto_review"
+	case "autonomous":
+		prefs.AutonomyLevel = "full_access"
+	}
+
 	next := s.store.Update(func(st *types.ValetSnapshot) {
+		prevWebhook := st.Preferences.PluginRuntime.WebhookEndpoint
+		prevLastHeartbeat := st.Preferences.Heartbeat.LastRunAt
 		st.Preferences = prefs
-		for i := range st.Plugins {
-			if st.Plugins[i].ID == "disk-guard" {
-				val := prefs.Thresholds.DiskLowSpacePct
-				st.Plugins[i].Config.LowSpaceThresholdPct = &val
-				st.Plugins[i].Config.ProtectedPaths = prefs.CleanupPolicy.ProtectedDirs
-			}
+		if st.Preferences.PluginRuntime.WebhookEndpoint == "" {
+			st.Preferences.PluginRuntime.WebhookEndpoint = prevWebhook
+		}
+		if st.Preferences.Heartbeat.LastRunAt == "" {
+			st.Preferences.Heartbeat.LastRunAt = prevLastHeartbeat
+		}
+		if st.Preferences.Heartbeat.IntervalMin <= 0 {
+			st.Preferences.Heartbeat.IntervalMin = 30
+		}
+		if st.Preferences.Heartbeat.Prompt == "" {
+			st.Preferences.Heartbeat.Prompt = store.DefaultHeartbeatConfig().Prompt
+		}
+		st.Preferences.Heartbeat.Initialized = true
+		if st.Preferences.BusyMessagePolicy != "steer" && st.Preferences.BusyMessagePolicy != "queue" {
+			st.Preferences.BusyMessagePolicy = "queue"
 		}
 	})
 	if s.opts.OnSyncTray != nil {
@@ -2425,6 +3899,32 @@ func (s *Service) probeMcpServer(ctx context.Context, srv types.McpServerItem) t
 	return srv
 }
 
+// AddMemory persists a user-authored long-term memory entry and syncs Sidecar.
+func (s *Service) AddMemory(content, source string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return s.store.Snapshot(), errors.New("记忆内容不能为空")
+	}
+	src := strings.TrimSpace(source)
+	if src == "" {
+		src = "手动添加"
+	}
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		entry := types.MemoryEntry{
+			ID:        fmt.Sprintf("mem-%d", time.Now().UnixNano()),
+			Content:   trimmed,
+			Source:    src,
+			CreatedAt: time.Now().Format("2006-01-02"),
+		}
+		st.Memories = append([]types.MemoryEntry{entry}, st.Memories...)
+	})
+	s.syncRuntime(next)
+	return next, nil
+}
+
 // DeleteMemory deletes a single memory item and updates Sidecar.
 func (s *Service) DeleteMemory(id string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
@@ -2507,53 +4007,246 @@ func formatBytesHuman(b int64) string {
 	}
 }
 
-func manifestSpecsToPoliciesAndActions(
-	parsed plugins.ParsedManifest,
-	existing []types.PluginEventPolicy,
-) ([]types.PluginEventPolicy, []types.PluginActionCapability) {
-	prevMap := make(map[string]types.PluginEventPolicy, len(existing))
-	for _, ev := range existing {
-		prevMap[ev.ID] = ev
-	}
-	evList := make([]types.PluginEventPolicy, 0, len(parsed.TriggerSpecs))
-	for _, ts := range parsed.TriggerSpecs {
-		if prev, ok := prevMap[ts.ID]; ok {
-			if strings.TrimSpace(ts.Description) != "" {
-				prev.Description = ts.Description
+func mergeLocalPluginIntoSlice(list *[]types.PluginState, bundle types.PluginState) {
+	for i := range *list {
+		if (*list)[i].ID == bundle.ID || (*list)[i].Slug == bundle.Slug {
+			if (*list)[i].Source != "local" {
+				return
 			}
-			evList = append(evList, prev)
-			continue
+			parsed, err := plugins.ParseManifestYAML(bundle.ManifestYAML)
+			if err != nil {
+				return
+			}
+			updated := plugins.BuildPluginStateFromParsed(
+				(*list)[i].ID,
+				(*list)[i].Slug,
+				bundle.Name,
+				(*list)[i].Tagline,
+				(*list)[i].Description,
+				bundle.ManifestYAML,
+				bundle.SkillMarkdown,
+				bundle.LocalDir,
+				parsed,
+				&(*list)[i],
+			)
+			(*list)[i] = updated
+			return
 		}
-		desc := strings.TrimSpace(ts.Description)
-		if desc == "" {
-			desc = "Manifest 声明触发规则"
-		}
-		pol := ts.Policy
-		if pol == "" {
-			pol = "ask"
-		}
-		evList = append(evList, types.PluginEventPolicy{
-			ID: ts.ID, Description: desc, Policy: pol,
-		})
 	}
-	actList := make([]types.PluginActionCapability, 0, len(parsed.ActionSpecs))
-	for _, as := range parsed.ActionSpecs {
-		actList = append(actList, types.PluginActionCapability{
-			ID: as.ID, Safety: as.Safety, SafetyLabel: safetyLabelFor(as.Safety),
-		})
-	}
-	return evList, actList
+	*list = append(*list, bundle)
 }
 
-func safetyLabelFor(safety string) string {
-	switch safety {
-	case "readonly":
-		return "只读"
-	case "confirm_always":
-		return "始终确认"
-	default:
-		return "可撤销"
+func (s *Service) listAllSkills() []types.BuiltinSkillMeta {
+	builtin := skillsbundle.All()
+	out := make([]types.BuiltinSkillMeta, 0, len(builtin))
+	seen := make(map[string]bool, len(builtin))
+	for _, sk := range builtin {
+		seen[strings.ToLower(sk.Name)] = true
+		out = append(out, types.BuiltinSkillMeta{
+			Name:        sk.Name,
+			Title:       sk.Title,
+			Description: sk.Description,
+			Content:     sk.Content,
+			Source:      "builtin",
+		})
 	}
+	if s.opts.DataDir != "" {
+		skillsDir := filepath.Join(s.opts.DataDir, "skills")
+		if entries, err := os.ReadDir(skillsDir); err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+					continue
+				}
+				sp := filepath.Join(skillsDir, entry.Name(), "SKILL.md")
+				raw, rErr := os.ReadFile(sp)
+				if rErr != nil {
+					continue
+				}
+				name := entry.Name()
+				if seen[strings.ToLower(name)] {
+					continue
+				}
+				out = append(out, types.BuiltinSkillMeta{
+					Name:        name,
+					Title:       name,
+					Description: "用户自定义本地 Skill",
+					Content:     strings.TrimSpace(string(raw)),
+					Source:      "user",
+				})
+			}
+		}
+	}
+	return out
+}
+
+func (s *Service) buildKernelBashEnv() []string {
+	skipKeys := map[string]bool{
+		"PATH":               true,
+		"VALET_HOME_DIR":     true,
+		"VALET_DATA_DIR":     true,
+		"VALET_CONTROL_FILE": true,
+	}
+	env := make([]string, 0, len(os.Environ())+6)
+	for _, entry := range os.Environ() {
+		k, _, ok := strings.Cut(entry, "=")
+		if ok && skipKeys[k] {
+			continue
+		}
+		env = append(env, entry)
+	}
+	if s.opts.HomeDir != "" {
+		env = append(env, "VALET_HOME_DIR="+s.opts.HomeDir)
+	}
+	if s.opts.DataDir != "" {
+		env = append(env, "VALET_DATA_DIR="+s.opts.DataDir)
+	}
+	s.mu.Lock()
+	ctrlFile := s.controlFilePath
+	s.mu.Unlock()
+	if ctrlFile != "" {
+		env = append(env, "VALET_CONTROL_FILE="+ctrlFile)
+	}
+
+	var extraPath []string
+	if s.opts.DataDir != "" {
+		extraPath = append(extraPath, filepath.Join(s.opts.DataDir, "bin"))
+	}
+	if cliBin := s.resolveCLIBinary(); cliBin != "" {
+		extraPath = append(extraPath, filepath.Dir(cliBin))
+	}
+	if bunBin := resolveBunBinaryWithOpts(s.opts); bunBin != "" && strings.ContainsRune(bunBin, filepath.Separator) {
+		extraPath = append(extraPath, filepath.Dir(bunBin))
+	}
+	if s.opts.HomeDir != "" {
+		extraPath = append(extraPath, filepath.Join(s.opts.HomeDir, ".bun", "bin"))
+	}
+	extraPath = append(extraPath, "/opt/homebrew/bin")
+
+	seen := make(map[string]bool, len(extraPath))
+	deduped := make([]string, 0, len(extraPath))
+	for _, p := range extraPath {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			deduped = append(deduped, p)
+		}
+	}
+	curPath := os.Getenv("PATH")
+	newPath := strings.Join(deduped, string(os.PathListSeparator))
+	if curPath != "" {
+		newPath += string(os.PathListSeparator) + curPath
+	}
+	env = append(env, "PATH="+newPath)
+	return env
+}
+
+func resolveBunBinaryWithOpts(opts StartOptions) string {
+	platDir := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
+	var candidates []string
+	if opts.ResourcesDir != "" {
+		candidates = append(candidates,
+			filepath.Join(opts.ResourcesDir, "bin", "valet-bun"),
+			filepath.Join(opts.ResourcesDir, platDir, "bin", "valet-bun"),
+		)
+	}
+	repoRoot := findBackendRepoRoot(opts.RepoRoot)
+	if repoRoot != "" {
+		candidates = append(candidates,
+			filepath.Join(repoRoot, "resources", platDir, "bin", "valet-bun"),
+			filepath.Join(repoRoot, "resources", "bin", "valet-bun"),
+		)
+	}
+	for _, cand := range candidates {
+		if info, err := os.Stat(cand); err == nil && !info.IsDir() {
+			return cand
+		}
+	}
+	if p, err := exec.LookPath("bun"); err == nil {
+		return p
+	}
+	home := strings.TrimSpace(opts.HomeDir)
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	for _, c := range []string{
+		filepath.Join(home, ".bun", "bin", "bun"),
+		"/opt/homebrew/bin/bun",
+		"/usr/local/bin/bun",
+	} {
+		if info, err := os.Stat(c); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	return "bun"
+}
+
+func (s *Service) resolveCLIBinary() string {
+	s.cliOnce.Do(func() {
+		platDir := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
+		var candidates []string
+		if s.opts.ResourcesDir != "" {
+			candidates = append(candidates,
+				filepath.Join(s.opts.ResourcesDir, "bin", "valet"),
+				filepath.Join(s.opts.ResourcesDir, platDir, "bin", "valet"),
+			)
+		}
+		repoRoot := findBackendRepoRoot(s.opts.RepoRoot)
+		if repoRoot != "" {
+			candidates = append(candidates,
+				filepath.Join(repoRoot, "resources", platDir, "bin", "valet"),
+				filepath.Join(repoRoot, "resources", "bin", "valet"),
+			)
+		}
+		if s.opts.DataDir != "" {
+			candidates = append(candidates, filepath.Join(s.opts.DataDir, "bin", "valet"))
+		}
+		for _, cand := range candidates {
+			if info, err := os.Stat(cand); err == nil && !info.IsDir() {
+				s.cliBinPath = cand
+				return
+			}
+		}
+		// Fallback in dev/test environments: build ./cmd/valet once into <DataDir>/bin/valet.
+		if repoRoot != "" && s.opts.DataDir != "" {
+			if _, err := os.Stat(filepath.Join(repoRoot, "cmd", "valet", "main.go")); err == nil {
+				outBin := filepath.Join(s.opts.DataDir, "bin", "valet")
+				if os.MkdirAll(filepath.Dir(outBin), 0o755) == nil {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					buildCmd := exec.CommandContext(ctx, "go", "build", "-o", outBin, "./cmd/valet")
+					buildCmd.Dir = repoRoot
+					buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+					if buildCmd.Run() == nil {
+						s.cliBinPath = outBin
+					}
+				}
+			}
+		}
+	})
+	return s.cliBinPath
+}
+
+func findBackendRepoRoot(explicit string) string {
+	var cands []string
+	if explicit != "" {
+		cands = append(cands, explicit)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		cur := wd
+		for i := 0; i < 6; i++ {
+			cands = append(cands, cur)
+			parent := filepath.Dir(cur)
+			if parent == cur {
+				break
+			}
+			cur = parent
+		}
+	}
+	for _, dir := range cands {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+	}
+	return explicit
 }
 
 func maskSecretKey(raw string) string {
@@ -3063,4 +4756,76 @@ func intFromAny(v any) int {
 	default:
 		return 0
 	}
+}
+
+func extractImportedLogLines(payload map[string]any) []types.LogLine {
+	if len(payload) == 0 {
+		return nil
+	}
+	raw, ok := payload["recentEntries"]
+	if !ok || raw == nil {
+		return nil
+	}
+	toLogLine := func(idx int, ts, level, component, message string) (types.LogLine, bool) {
+		msg := strings.TrimSpace(message)
+		if msg == "" {
+			return types.LogLine{}, false
+		}
+		if comp := strings.TrimSpace(component); comp != "" {
+			msg = fmt.Sprintf("[%s] %s", comp, msg)
+		}
+		lvl := "WARN"
+		if strings.EqualFold(strings.TrimSpace(level), "ERROR") || strings.EqualFold(strings.TrimSpace(level), "ERR") {
+			lvl = "ERR"
+		}
+		if len(ts) >= 19 {
+			ts = ts[11:19]
+		}
+		return types.LogLine{
+			ID:      fmt.Sprintf("imp-%d", idx+1),
+			TS:      ts,
+			Level:   lvl,
+			Message: msg,
+		}, true
+	}
+
+	if entries, ok := raw.([]any); ok {
+		out := make([]types.LogLine, 0, len(entries))
+		for i, item := range entries {
+			if i >= 30 {
+				break
+			}
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			ts, _ := m["timestamp"].(string)
+			lvl, _ := m["level"].(string)
+			comp, _ := m["component"].(string)
+			msg, _ := m["message"].(string)
+			if line, ok := toLogLine(i, ts, lvl, comp, msg); ok {
+				out = append(out, line)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+func summarizeMarkdownReply(raw string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		trimmed = strings.TrimLeft(trimmed, "#*- ")
+		trimmed = strings.ReplaceAll(trimmed, "**", "")
+		trimmed = strings.TrimSpace(trimmed)
+		if trimmed == "" {
+			continue
+		}
+		runes := []rune(trimmed)
+		if len(runes) > 160 {
+			return string(runes[:159]) + "…"
+		}
+		return string(runes)
+	}
+	return ""
 }

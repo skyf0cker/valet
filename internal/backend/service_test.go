@@ -153,23 +153,22 @@ func TestBackendSidecarEndToEnd(t *testing.T) {
 		t.Fatalf("expected restored file at %s, stat err=%v", samplePath, statErr)
 	}
 
-	// Create a 2 MB dummy cache file in ~/Library/Caches/Homebrew so ScanDisk reports >= 1 MB
-	// and verify the full /clean -> beforeTool Inbox approval -> Trash -> Restore flow.
-	brewCacheDir := filepath.Join(homeDir, "Library", "Caches", "Homebrew")
-	if err := os.MkdirAll(brewCacheDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	brewCacheFile := filepath.Join(brewCacheDir, "pkg.tar.gz")
-	if err := os.WriteFile(brewCacheFile, make([]byte, 2*1024*1024), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	if _, err := svc.SetAutonomyLevel("sensitive_only"); err != nil {
 		t.Fatalf("SetAutonomyLevel failed: %v", err)
 	}
+	snapAfterSet, err := svc.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot after SetAutonomyLevel failed: %v", err)
+	}
+	if snapAfterSet.Preferences.AutonomyLevel != "auto_review" {
+		t.Fatalf("expected legacy sensitive_only normalized to auto_review, got %q", snapAfterSet.Preferences.AutonomyLevel)
+	}
+	if snapAfterSet.Preferences.AutoReview.Engine != "auto" || snapAfterSet.Preferences.AutoReview.JevEndpoint == "" {
+		t.Fatalf("expected default AutoReview config populated, got %+v", snapAfterSet.Preferences.AutoReview)
+	}
 	cleanRes, err := svc.SendChatMessage(ctx, types.SendChatParams{
 		ChatID: "chat-default",
-		Prompt: "/clean 扫描并清理缓存",
+		Prompt: "/clean 扫描并清理下载目录",
 		Model:  "claude-opus-4",
 	})
 	if err != nil {
@@ -181,14 +180,14 @@ func TestBackendSidecarEndToEnd(t *testing.T) {
 	if _, err := svc.ApproveInboxItem(ctx, cleanRes.CreatedInbox.ID); err != nil {
 		t.Fatalf("ApproveInboxItem failed: %v", err)
 	}
-	if _, statErr := os.Stat(brewCacheFile); !os.IsNotExist(statErr) {
-		t.Fatalf("expected %s to be moved to trash vault after approval, stat err=%v", brewCacheFile, statErr)
+	if _, statErr := os.Stat(samplePath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected %s to be moved to trash vault after approval, stat err=%v", samplePath, statErr)
 	}
 	if _, err := svc.RestoreApprovedInboxItem(cleanRes.CreatedInbox.ID); err != nil {
 		t.Fatalf("RestoreApprovedInboxItem failed: %v", err)
 	}
-	if _, statErr := os.Stat(brewCacheFile); statErr != nil {
-		t.Fatalf("expected %s to be restored after undo, stat err=%v", brewCacheFile, statErr)
+	if _, statErr := os.Stat(samplePath); statErr != nil {
+		t.Fatalf("expected %s to be restored after undo, stat err=%v", samplePath, statErr)
 	}
 
 	// 4. Disabling disk-guard makes RunFirstScan mark the disk task as skipped
@@ -590,7 +589,7 @@ func TestTrashApprovalAndModelSync(t *testing.T) {
 				Title:        "空路径旧审批卡",
 				Status:       "pending",
 				Reversible7d: true,
-				ToolName:     "disk_move_to_trash",
+				ToolName:     "trash_files",
 				ActionItems:  nil,
 			},
 			{
@@ -602,7 +601,7 @@ func TestTrashApprovalAndModelSync(t *testing.T) {
 				Status:        "pending",
 				Reversible7d:  true,
 				ReclaimableGB: 0.1,
-				ToolName:      "disk_move_to_trash",
+				ToolName:      "trash_files",
 				ActionItems: []types.TimelineActionItem{
 					{
 						ID:        "a1",
@@ -658,5 +657,420 @@ func TestTrashApprovalAndModelSync(t *testing.T) {
 	if orSnap.Preferences.Models.Primary != "openai/gpt-4.1" || orSnap.ChatThreads[0].Model != "openai/gpt-4.1" {
 		t.Fatalf("expected OpenRouter primary & ChatThread synced to openai/gpt-4.1, got prefs=%+v thread=%q",
 			orSnap.Preferences.Models, orSnap.ChatThreads[0].Model)
+	}
+}
+
+func TestWebhookSkillArchiveMemoryHeartbeat(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	_ = os.MkdirAll(filepath.Join(homeDir, "Downloads"), 0o755)
+
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		HomeDir:      homeDir,
+		DataDir:      dataDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("svc.start failed: %v", err)
+	}
+	defer func() { _ = svc.close() }()
+
+	snap, err := svc.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot failed: %v", err)
+	}
+	if snap.Preferences.PluginRuntime.WebhookEndpoint == "" {
+		t.Fatalf("expected webhook endpoint to be initialized, got empty")
+	}
+	if !snap.Preferences.Heartbeat.Enabled || !snap.Preferences.Heartbeat.Initialized {
+		t.Fatalf("expected agent heartbeat to be enabled & initialized by default, got %+v", snap.Preferences.Heartbeat)
+	}
+	if snap.Preferences.BusyMessagePolicy != "queue" {
+		t.Fatalf("expected default BusyMessagePolicy == \"queue\", got %q", snap.Preferences.BusyMessagePolicy)
+	}
+
+	// 1. Install custom webhook plugin with SKILL.md
+	customYAML := `id: local.valet.deploy-watch
+name: 部署观察员
+version: 0.1.0
+triggers:
+  - id: deploy.failed
+    sensor: webhook
+    policy: auto
+`
+	customSkill := "# Deploy Watch Skill\n\n当收到 `deploy.failed` 时汇总错误摘要。"
+	snap, err = svc.InstallCustomPlugin(types.InstallCustomPluginParams{
+		Name:          "部署观察员",
+		Tagline:       "接收部署失败 Webhook 并执行 Skill",
+		YAML:          customYAML,
+		SkillMarkdown: customSkill,
+	})
+	if err != nil {
+		t.Fatalf("InstallCustomPlugin failed: %v", err)
+	}
+
+	var deployedID string
+	for _, p := range snap.Plugins {
+		if p.Name == "部署观察员" {
+			deployedID = p.ID
+			if !strings.Contains(p.SkillMarkdown, "Deploy Watch Skill") {
+				t.Fatalf("expected SKILL.md persisted on plugin, got %q", p.SkillMarkdown)
+			}
+			break
+		}
+	}
+	if deployedID == "" {
+		t.Fatalf("expected installed deploy-watch plugin in snapshot")
+	}
+
+	// 2. UpdatePluginSkill persists revised SKILL.md
+	snap, err = svc.UpdatePluginSkill(deployedID, "# Updated Skill\n\n- 优先分析构建失败栈。")
+	if err != nil {
+		t.Fatalf("UpdatePluginSkill failed: %v", err)
+	}
+	var updatedSkillFound bool
+	for _, p := range snap.Plugins {
+		if p.ID == deployedID && strings.Contains(p.SkillMarkdown, "优先分析构建失败栈") {
+			updatedSkillFound = true
+		}
+	}
+	if !updatedSkillFound {
+		t.Fatalf("expected UpdatePluginSkill change to persist in snapshot")
+	}
+
+	// 3. POST to Webhook ingress /events/{pluginId}/{eventCode}?sync=1
+	webhookURL := snap.Preferences.PluginRuntime.WebhookEndpoint + "/" + deployedID + "/deploy.failed?sync=1"
+	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(`{"service":"api-gateway","exitCode":1}`))
+	if err != nil {
+		t.Fatalf("HTTP POST webhook failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected webhook 200 OK, got %d", resp.StatusCode)
+	}
+	var hookBody map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&hookBody); err != nil {
+		t.Fatalf("decode webhook JSON response failed: %v", err)
+	}
+	if hookBody["ok"] != true || hookBody["pluginId"] != deployedID || hookBody["eventCode"] != "deploy.failed" {
+		t.Fatalf("unexpected webhook JSON body: %+v", hookBody)
+	}
+
+	// 4. AddMemory adds a persistent local memory item
+	snap, err = svc.AddMemory("永远不要清理 ~/Work 目录", "手动添加")
+	if err != nil {
+		t.Fatalf("AddMemory failed: %v", err)
+	}
+	if len(snap.Memories) == 0 || snap.Memories[0].Content != "永远不要清理 ~/Work 目录" {
+		t.Fatalf("expected newly added memory at index 0, got %+v", snap.Memories)
+	}
+
+	// 5. ArchiveChatThread archives active chat, switches/creates active chat, and restores cleanly
+	origChatID := snap.ActiveChatID
+	snap, err = svc.ArchiveChatThread(origChatID, true)
+	if err != nil {
+		t.Fatalf("ArchiveChatThread(true) failed: %v", err)
+	}
+	if snap.ActiveChatID == origChatID {
+		t.Fatalf("expected activeChatId to switch away from archived thread %q", origChatID)
+	}
+	var archivedFlag bool
+	for _, c := range snap.ChatThreads {
+		if c.ID == origChatID && c.Archived {
+			archivedFlag = true
+		}
+	}
+	if !archivedFlag {
+		t.Fatalf("expected thread %q to have Archived=true", origChatID)
+	}
+	snap, err = svc.ArchiveChatThread(origChatID, false)
+	if err != nil {
+		t.Fatalf("ArchiveChatThread(false) failed: %v", err)
+	}
+	if snap.ActiveChatID != origChatID {
+		t.Fatalf("expected unarchiving to restore activeChatId=%q, got %q", origChatID, snap.ActiveChatID)
+	}
+
+	// 6. TriggerHeartbeatNow records heartbeat timestamp and writes to HeartbeatLogs (never TimelineEvents)
+	snap, err = svc.TriggerHeartbeatNow(context.Background())
+	if err != nil {
+		t.Fatalf("TriggerHeartbeatNow failed: %v", err)
+	}
+	if snap.Preferences.Heartbeat.LastRunAt == "" {
+		t.Fatalf("expected Preferences.Heartbeat.LastRunAt to be updated after heartbeat")
+	}
+	if len(snap.HeartbeatLogs) != 1 {
+		t.Fatalf("expected 1 HeartbeatRunLog after TriggerHeartbeatNow, got %d (%+v)", len(snap.HeartbeatLogs), snap.HeartbeatLogs)
+	}
+	for _, ev := range snap.TimelineEvents {
+		if ev.EventCode == "agent.heartbeat" {
+			t.Fatalf("heartbeat must not pollute TimelineEvents, found %+v", ev)
+		}
+	}
+	snap, err = svc.ClearHeartbeatLogs()
+	if err != nil {
+		t.Fatalf("ClearHeartbeatLogs failed: %v", err)
+	}
+	if len(snap.HeartbeatLogs) != 0 {
+		t.Fatalf("expected 0 HeartbeatLogs after ClearHeartbeatLogs, got %d", len(snap.HeartbeatLogs))
+	}
+}
+
+func TestGenericBundleScriptsKernelRPCsUninstallAndInteractivePermission(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	downloadsDir := filepath.Join(homeDir, "Downloads")
+	logDir := filepath.Join(homeDir, "Library", "Logs", "Surge")
+	if err := os.MkdirAll(downloadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	nowTS := time.Now().Format("2006-01-02 15:04:05.000000")
+	logContent := strings.Join([]string{
+		nowTS + ` <WARNING> [SGMProfileManager] Update config failed, URL: https://sub.example.com/api?token=superSecretSubToken, error: 第 52 行存在无效配置`,
+		nowTS + ` <ERROR> [SGDNSClient] DNS query failed over DoH`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(logDir, "Surge-2026-11-17.log"), []byte(logContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	trashMe := filepath.Join(downloadsDir, "removable.dmg")
+	if err := os.WriteFile(trashMe, []byte("dmg-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	permCh := make(chan types.PendingPermissionRequest, 4)
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		HomeDir:      homeDir,
+		DataDir:      dataDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+		OnChatStream: func(p types.ChatStreamPayload) {
+			if p.PendingPermission != nil {
+				permCh <- *p.PendingPermission
+			}
+		},
+	}); err != nil {
+		t.Fatalf("svc.start failed: %v", err)
+	}
+	defer func() {
+		if err := svc.close(); err != nil {
+			t.Errorf("close error: %v", err)
+		}
+	}()
+
+	// 1. Verify catalog bundles materialized with 0 static actions and bundled scripts runnable via <dataDir>/bin/bun
+	snap, err := svc.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot failed: %v", err)
+	}
+	var surgePlug *types.PluginState
+	for i := range snap.Plugins {
+		p := snap.Plugins[i]
+		if len(p.Actions) != 0 {
+			t.Fatalf("expected Action-less plugin %s, got %+v", p.ID, p.Actions)
+		}
+		if p.ID == "surge-doctor" {
+			cp := p
+			surgePlug = &cp
+		}
+	}
+	if surgePlug == nil || surgePlug.LocalDir == "" || len(surgePlug.ConfigSchema) < 2 {
+		t.Fatalf("expected materialized surge-doctor with ConfigSchema, got %+v", surgePlug)
+	}
+
+	scriptOutAny, err := svc.handleSidecarHostRequest(
+		context.Background(),
+		"host.kernel.bash",
+		json.RawMessage(`{"command":"bun \"`+filepath.Join(surgePlug.LocalDir, "scripts", "import-logs.mjs")+`\" --minutes 360"}`),
+	)
+	if err != nil {
+		t.Fatalf("running bundled import-logs.mjs failed: %v", err)
+	}
+	scriptOutBytes, _ := json.Marshal(scriptOutAny)
+	scriptOutStr := string(scriptOutBytes)
+	if !strings.Contains(scriptOutStr, "***REDACTED***") || strings.Contains(scriptOutStr, "superSecretSubToken") {
+		t.Fatalf("expected bundled script to redact secrets, got %s", scriptOutStr)
+	}
+
+	// 2. Verify host.kernel.writeFile -> host.kernel.readFile -> host.kernel.listDir
+	notePath := filepath.Join(homeDir, "notes", "valet-note.txt")
+	if _, err := svc.handleSidecarHostRequest(
+		context.Background(),
+		"host.kernel.writeFile",
+		json.RawMessage(`{"path":"`+notePath+`","content":"line1\nline2"}`),
+	); err != nil {
+		t.Fatalf("host.kernel.writeFile failed: %v", err)
+	}
+	readRes, err := svc.handleSidecarHostRequest(
+		context.Background(),
+		"host.kernel.readFile",
+		json.RawMessage(`{"path":"`+notePath+`","offsetLine":1,"limitLines":10}`),
+	)
+	if err != nil || !strings.Contains(readRes.(map[string]any)["content"].(string), "line2") {
+		t.Fatalf("host.kernel.readFile unexpected result: %+v err=%v", readRes, err)
+	}
+	listRes, err := svc.handleSidecarHostRequest(
+		context.Background(),
+		"host.kernel.listDir",
+		json.RawMessage(`{"path":"~/Downloads"}`),
+	)
+	if err != nil {
+		t.Fatalf("host.kernel.listDir failed: %v", err)
+	}
+	if entries, ok := listRes.(map[string]any)["entries"].([]map[string]any); !ok || len(entries) == 0 {
+		t.Fatalf("host.kernel.listDir unexpected entries: %+v", listRes)
+	}
+
+	// 3. Verify equal uninstall -> reinstall lifecycle on catalog plugin
+	uninstalledSnap, err := svc.UninstallPlugin("surge-doctor")
+	if err != nil {
+		t.Fatalf("UninstallPlugin(surge-doctor) failed: %v", err)
+	}
+	var uninstalledFound bool
+	for _, p := range uninstalledSnap.Plugins {
+		if p.ID == "surge-doctor" {
+			uninstalledFound = true
+			if p.Installed || p.Enabled || p.LocalDir != "" {
+				t.Fatalf("expected uninstalled catalog plugin reset, got %+v", p)
+			}
+		}
+	}
+	if !uninstalledFound {
+		t.Fatalf("expected uninstalled catalog plugin to remain discoverable")
+	}
+	if _, statErr := os.Stat(surgePlug.LocalDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected materialized plugin dir %s deleted on uninstall", surgePlug.LocalDir)
+	}
+	reinstalledSnap, err := svc.InstallMarketplacePlugin("surge-doctor")
+	if err != nil {
+		t.Fatalf("InstallMarketplacePlugin(surge-doctor) failed: %v", err)
+	}
+	for _, p := range reinstalledSnap.Plugins {
+		if p.ID == "surge-doctor" && (!p.Installed || !p.Enabled || p.LocalDir == "") {
+			t.Fatalf("expected reinstalled plugin enabled with LocalDir, got %+v", p)
+		}
+	}
+
+	// 4. Verify interactive foreground Chat permission prompt (allow_once -> executes, deny -> aborts)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	chatErrCh := make(chan error, 1)
+	go func() {
+		_, cErr := svc.SendChatMessage(ctx, types.SendChatParams{
+			ChatID:      "chat-interactive-test",
+			Prompt:      "/clean 帮我清理 Downloads 安装包",
+			Model:       "claude-opus-4",
+			Interactive: true,
+		})
+		chatErrCh <- cErr
+	}()
+
+	select {
+	case perm := <-permCh:
+		if perm.ToolName != "trash_files" {
+			t.Fatalf("expected interactive permission for trash_files, got %+v", perm)
+		}
+		ok, rErr := svc.ResolveChatPermission(ctx, perm.ChatID, perm.RequestID, "allow_once", "")
+		if rErr != nil || !ok {
+			t.Fatalf("ResolveChatPermission(allow_once) failed: ok=%v err=%v", ok, rErr)
+		}
+	case err := <-chatErrCh:
+		t.Fatalf("chat finished before emitting pendingPermission: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for interactive PendingPermission")
+	}
+
+	if err := <-chatErrCh; err != nil {
+		t.Fatalf("interactive SendChatMessage failed: %v", err)
+	}
+	if _, statErr := os.Stat(trashMe); !os.IsNotExist(statErr) {
+		t.Fatalf("expected %s moved to Trash after allow_once, statErr=%v", trashMe, statErr)
+	}
+
+	// Verify deny leaves file untouched
+	keepMe := filepath.Join(downloadsDir, "keep-me.dmg")
+	if err := os.WriteFile(keepMe, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		_, cErr := svc.SendChatMessage(ctx, types.SendChatParams{
+			ChatID:      "chat-interactive-deny",
+			Prompt:      "/clean 再清理一次 Downloads",
+			Model:       "claude-opus-4",
+			Interactive: true,
+		})
+		chatErrCh <- cErr
+	}()
+	select {
+	case perm := <-permCh:
+		ok, rErr := svc.ResolveChatPermission(ctx, perm.ChatID, perm.RequestID, "deny", "保留此文件")
+		if rErr != nil || !ok {
+			t.Fatalf("ResolveChatPermission(deny) failed: ok=%v err=%v", ok, rErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for deny test PendingPermission")
+	}
+	if err := <-chatErrCh; err != nil {
+		t.Fatalf("deny SendChatMessage failed: %v", err)
+	}
+	if _, statErr := os.Stat(keepMe); statErr != nil {
+		t.Fatalf("expected %s preserved after user deny, err=%v", keepMe, statErr)
+	}
+}
+
+func TestExecKernelBash(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		HomeDir:      homeDir,
+		DataDir:      dataDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("svc.start failed: %v", err)
+	}
+	defer func() {
+		if err := svc.close(); err != nil {
+			t.Errorf("close error: %v", err)
+		}
+	}()
+
+	resAny, err := svc.handleSidecarHostRequest(
+		context.Background(),
+		"host.kernel.bash",
+		json.RawMessage(`{"command":"echo hello-valet","cwd":"~"}`),
+	)
+	if err != nil {
+		t.Fatalf("expected safe kernel bash command to succeed, got error: %v", err)
+	}
+	resMap, ok := resAny.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected result type: %T", resAny)
+	}
+	if resMap["ok"] != true || resMap["exitCode"] != 0 || resMap["output"] != "hello-valet" {
+		t.Fatalf("unexpected kernel bash output: %+v", resMap)
+	}
+
+	if _, err := svc.handleSidecarHostRequest(
+		context.Background(),
+		"host.kernel.bash",
+		json.RawMessage(`{"command":"cat ~/.ssh/id_rsa"}`),
+	); err == nil || !strings.Contains(err.Error(), "安全边界拒绝") {
+		t.Fatalf("expected forbidden kernel bash command to be rejected, got: %v", err)
 	}
 }

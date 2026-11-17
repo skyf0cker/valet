@@ -8,7 +8,7 @@ export default defineConfig({
   // buildCommand and embeds frontendDist into the app.
   devUrl: "http://localhost:5173",
   devCommand: "bun run dev:web",
-  buildCommand: "bun run build:sidecar && bun run build:web",
+  buildCommand: "bun run build:sidecar && bun run build:cli && bun run build:web",
   frontendDist: "dist",
   bindings: "src/mygo.ts",
   out: "build",

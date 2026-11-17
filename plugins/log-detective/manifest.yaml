@@ -1,0 +1,20 @@
+id: log-detective
+bundle_id: com.valet.log-detective
+name: 日志侦探
+tagline: 监听应用崩溃报告与系统诊断日志并快速总结根因
+description: 监听 ~/Library/Logs/DiagnosticReports 中的新崩溃报告（.ips/.crash），只读提取故障线程与异常类型，给出针对性排查建议。
+version: 1.0.2
+source: core
+icon: log
+default_installed: true
+required_permission: full_disk
+required_permission_label: 完全磁盘访问
+permissions: [full_disk]
+triggers:
+  - id: log.app_crashed
+    description: 检测到新的 .ips 崩溃报告生成
+    sensor: fs_watch
+    watch_dirs: [~/Library/Logs/DiagnosticReports]
+    ops: [create]
+    glob: "*.ips"
+    policy: record

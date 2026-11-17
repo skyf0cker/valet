@@ -1,52 +1,54 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef } from "react";
 import { useValet } from "../../store/ValetContext";
 import { SidebarToggleButton } from "../Sidebar";
 import { BowtieSvg, PlusIcon } from "../ui/Icons";
 import { SelectMenu } from "../ui/SelectMenu";
 import { ChatComposer } from "./ChatComposer";
-import { FormattedText, PluginDraftCard, ProcessTableCard } from "./MessageCards";
+import {
+  FormattedText,
+  PermissionAskCard,
+  PluginDraftCard,
+  ProcessTableCard,
+  ToolStepsList,
+} from "./MessageCards";
 
 export const ChatView: React.FC = () => {
   const {
     state,
     chatStream,
+    runningChatIds,
     sidebarCollapsed,
     createNewChat,
     selectChatThread,
     sendChatMessage,
+    resolveChatPermission,
+    abortChatMessage,
     performProcessAction,
     installPluginDraft,
     setActiveView,
     selectTimelineEvent,
   } = useValet();
 
-  const [sending, setSending] = useState(false);
-  const [thinkingPhase, setThinkingPhase] = useState(0);
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  const activeThreads = state.chatThreads.filter((t) => !t.archived);
   const thread =
-    state.chatThreads.find((t) => t.id === state.activeChatId) ?? state.chatThreads[0];
+    activeThreads.find((t) => t.id === state.activeChatId) ??
+    state.chatThreads.find((t) => t.id === state.activeChatId) ??
+    activeThreads[0] ??
+    state.chatThreads[0];
+  const sending = thread ? (runningChatIds[thread.id] ?? 0) > 0 : false;
   const activeStream =
     chatStream && thread && chatStream.chatId === thread.id ? chatStream : null;
 
-  // M5 thinking shimmer staggered chip progression
-  useEffect(() => {
-    if (!sending) {
-      setThinkingPhase(0);
-      return;
-    }
-    setThinkingPhase(1);
-    const t1 = window.setTimeout(() => setThinkingPhase(2), 260);
-    const t2 = window.setTimeout(() => setThinkingPhase(3), 560);
-    return () => {
-      window.clearTimeout(t1);
-      window.clearTimeout(t2);
-    };
-  }, [sending]);
-
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [thread?.messages.length, sending]);
+  }, [
+    thread?.messages.length,
+    sending,
+    activeStream?.steps?.length,
+    activeStream?.pendingPermission?.requestId,
+  ]);
 
   if (!thread) return null;
 
@@ -64,9 +66,12 @@ export const ChatView: React.FC = () => {
         <div className="app-no-drag min-w-0">
           <SelectMenu
             value={thread.id}
-            options={state.chatThreads.map((t) => ({
+            options={(thread.archived && !activeThreads.some((t) => t.id === thread.id)
+              ? [thread, ...activeThreads]
+              : activeThreads
+            ).map((t) => ({
               value: t.id,
-              label: t.title,
+              label: t.archived ? `${t.title}（已归档）` : t.title,
               hint: t.updatedAt,
             }))}
             onChange={(id) => selectChatThread(id)}
@@ -180,6 +185,10 @@ export const ChatView: React.FC = () => {
                     )}
                   </div>
 
+                  {msg.steps && msg.steps.length > 0 && (
+                    <ToolStepsList steps={msg.steps} />
+                  )}
+
                   <div className="text-[13px] leading-[20px] text-[var(--ink-body)] lg:text-[14px] lg:leading-[23px]">
                     <FormattedText text={msg.content} />
                   </div>
@@ -204,7 +213,7 @@ export const ChatView: React.FC = () => {
             )
           )}
 
-          {/* M5 Thinking Shimmer State */}
+          {/* Live Agent Turn State */}
           {sending && (
             <div className="flex gap-2.5 lg:gap-3.5">
               <div
@@ -224,75 +233,40 @@ export const ChatView: React.FC = () => {
                   </span>
                 </div>
 
-                {(!activeStream?.partialText ||
-                  activeStream?.steps?.some(
-                    (s) => s.status === "running" || s.status === "pending"
-                  )) && (
-                  <div className="valet-shimmer-text max-w-full truncate text-[13.5px] font-semibold leading-[18px]">
-                    {activeStream?.thinkingText || "正在分析当前系统状态并调取工具…"}
-                  </div>
+                {activeStream?.steps && activeStream.steps.length > 0 && (
+                  <ToolStepsList steps={activeStream.steps} />
                 )}
 
-                <div className="flex flex-wrap gap-1.5">
-                  {activeStream?.steps && activeStream.steps.length > 0 ? (
-                    activeStream.steps.map((step) => {
-                      const glyph =
-                        step.status === "done"
-                          ? "✓"
-                          : step.status === "error"
-                            ? "✕"
-                            : "◌";
-                      return (
-                        <span
-                          key={step.id}
-                          className={`animate-valet-chip-pop inline-flex h-[22px] items-center rounded-[6px] border px-2 font-mono text-[10px] ${
-                            step.status === "running"
-                              ? "border-[var(--ink-primary)] bg-[var(--bg-surface)] text-[var(--ink-strong)]"
-                              : step.status === "error"
-                                ? "border-[var(--border-danger)] bg-[var(--bg-danger-subtle)] text-[var(--ink-danger)]"
-                                : "border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-strong)]"
-                          }`}
-                        >
-                          {glyph} {step.name}
-                        </span>
-                      );
-                    })
-                  ) : (
-                    <>
-                      <span className="animate-valet-chip-pop inline-flex h-[22px] items-center rounded-[6px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2 font-mono text-[10px] text-[var(--ink-strong)]">
-                        ✓ 采样
-                      </span>
-                      <span
-                        className={`animate-valet-chip-pop inline-flex h-[22px] items-center rounded-[6px] border px-2 font-mono text-[10px] ${
-                          thinkingPhase >= 3
-                            ? "border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-strong)]"
-                            : "border-[var(--ink-primary)] bg-[var(--bg-surface)] text-[var(--ink-strong)]"
-                        }`}
-                      >
-                        {thinkingPhase >= 3 ? "✓ 定位来源" : "◌ 定位来源"}
-                      </span>
-                      <span
-                        className={`animate-valet-chip-pop inline-flex h-[22px] items-center rounded-[6px] border px-2 font-mono text-[10px] ${
-                          thinkingPhase >= 3
-                            ? "border-[var(--ink-primary)] bg-[var(--bg-surface)] text-[var(--ink-strong)]"
-                            : "border-dashed border-[var(--border-dash)] text-[var(--ink-faint)]"
-                        }`}
-                      >
-                        {thinkingPhase >= 3 ? "◌ 生成建议" : "建议"}
-                      </span>
-                    </>
-                  )}
-                </div>
+                {activeStream?.pendingPermission && (
+                  <PermissionAskCard
+                    key={activeStream.pendingPermission.requestId}
+                    request={activeStream.pendingPermission}
+                    onResolve={(decision, note) =>
+                      void resolveChatPermission(
+                        thread.id,
+                        activeStream.pendingPermission!.requestId,
+                        decision,
+                        note
+                      )
+                    }
+                  />
+                )}
 
                 {activeStream?.partialText ? (
                   <div className="text-[13px] leading-[20px] text-[var(--ink-body)] lg:text-[14px] lg:leading-[23px]">
                     <FormattedText text={activeStream.partialText} />
                   </div>
                 ) : (
-                  <div className="flex flex-col gap-1.5 pt-0.5">
-                    <div className="valet-shimmer-bar h-1.5 w-[240px] rounded-[3px]" />
-                    <div className="valet-shimmer-bar h-1.5 w-[180px] rounded-[3px]" />
-                  </div>
+                  !activeStream?.steps?.some(
+                    (s) => s.status === "running" || s.status === "pending"
+                  ) && (
+                    <div className="flex items-center gap-2 py-0.5 text-[13px] text-[var(--ink-muted)]">
+                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--ink-muted)]" />
+                      <span>
+                        {activeStream?.steps?.length ? "正在整理结果…" : "思考中…"}
+                      </span>
+                    </div>
+                  )
                 )}
               </div>
             </div>
@@ -304,15 +278,10 @@ export const ChatView: React.FC = () => {
 
       {/* Composer */}
       <ChatComposer
+        chatId={thread.id}
         sending={sending}
-        onSend={async (params) => {
-          setSending(true);
-          try {
-            await sendChatMessage(params);
-          } finally {
-            setSending(false);
-          }
-        }}
+        onAbort={() => void abortChatMessage(thread.id)}
+        onSend={(params) => sendChatMessage(params)}
       />
     </div>
   );

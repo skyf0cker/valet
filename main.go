@@ -73,7 +73,7 @@ func main() {
 			return mygo.NewMenu([]*mygo.MenuItem{
 				{
 					ID:          "show",
-					Label:       "打开 Valet 控制台 (Alt+Space)",
+					Label:       "打开 Valet 控制台",
 					Click:       func(_ *mygo.MenuItem, _ *mygo.Window) { win.Show(); win.Focus() },
 				},
 				{
@@ -124,12 +124,6 @@ func main() {
 			}
 		}
 
-		if err := mygo.GlobalShortcut.Register("Alt+Space", func() {
-			win.Show()
-			win.Focus()
-		}); err != nil {
-			log.Printf("[valet] shortcut Alt+Space register skipped: %v", err)
-		}
 		if err := mygo.GlobalShortcut.Register("Alt+Escape", func() {
 			go func() { _, _ = svc.TogglePause() }()
 		}); err != nil {

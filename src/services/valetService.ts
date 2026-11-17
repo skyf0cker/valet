@@ -1,7 +1,12 @@
 import { isMyGo } from "mygo-runtime";
-import { Valet, type AgentProviderConfig as MyGoProviderConfig } from "../mygo";
+import {
+  Valet,
+  type AgentProviderConfig as MyGoProviderConfig,
+  type AutoReviewConfig as MyGoAutoReviewConfig,
+} from "../mygo";
 import type {
   AgentProviderConfig,
+  AutoReviewConfig,
   ChatAttachment,
   ChatMessage,
   InboxApprovalItem,
@@ -35,13 +40,22 @@ export interface ValetService {
   pollPermissionStatus(permissionId: PermissionId): Promise<{ granted: boolean }>;
   verifyProvider(provider: AgentProviderConfig): Promise<ProviderVerifyResult>;
   sendTestAgentMessage(provider: AgentProviderConfig, model: string): Promise<TestMessageResult>;
+  testAutoReview(cfg: AutoReviewConfig): Promise<TestMessageResult>;
   sendChatMessage(params: {
     chatId?: string;
     prompt: string;
     model: string;
     mentionPlugin: PluginState | null;
     attachments: ChatAttachment[];
+    busyMode?: "steer" | "followUp";
+    interactive?: boolean;
   }): Promise<SimulatedChatOutcome>;
+  resolveChatPermission(
+    chatId: string,
+    requestId: string,
+    decision: "allow_once" | "allow_session" | "deny",
+    note?: string
+  ): Promise<boolean>;
   createSimulatedPluginEvent(plugin: PluginState, eventCode: string): {
     event: TimelineEvent;
     inboxItem?: InboxApprovalItem;
@@ -110,11 +124,33 @@ export class MockValetService implements ValetService {
     };
   }
 
+  async testAutoReview(cfg: AutoReviewConfig): Promise<TestMessageResult> {
+    await delay(260);
+    const hasJev = Boolean(cfg.jevApiKey.trim());
+    if (cfg.engine === "jev" && !hasJev) {
+      return {
+        ok: false,
+        latencyMs: 0,
+        reply: "请先输入 Jev API Key 后再测试 Jev System One。",
+      };
+    }
+    const modeLabel =
+      cfg.engine !== "llm" && hasJev
+        ? `Jev System One (${cfg.jevModel || "jev-latest"})`
+        : `审查小模型 (${cfg.fallbackModel || "同快速模型"})`;
+    return {
+      ok: true,
+      latencyMs: hasJev ? 85 : 220,
+      reply: `${modeLabel} 模拟探针通过 · harmful=0.02（自动放行）。`,
+    };
+  }
+
   async sendChatMessage(params: {
     prompt: string;
     model: string;
     mentionPlugin: PluginState | null;
     attachments: ChatAttachment[];
+    busyMode?: "steer" | "followUp";
   }): Promise<SimulatedChatOutcome> {
     await delay(820);
     const trimmed = params.prompt.trim();
@@ -230,11 +266,12 @@ export class MockValetService implements ValetService {
 name: 桌面截图归档器
 version: 0.1.0
 triggers:
-  - event: fs.file_created
-    glob: "~/Desktop/截屏*.png"
-actions:
-  - move_to:
-      target: "~/Pictures/Screenshots"`,
+  - id: fs.file_created
+    sensor: fs_watch
+    watch_dirs: [~/Desktop]
+    ops: [create]
+    glob: "截屏*.png"
+    policy: ask`,
           },
         },
       };
@@ -292,6 +329,15 @@ actions:
     };
   }
 
+  async resolveChatPermission(
+    _chatId: string,
+    _requestId: string,
+    _decision: "allow_once" | "allow_session" | "deny",
+    _note?: string
+  ): Promise<boolean> {
+    return true;
+  }
+
   createSimulatedPluginEvent(
     plugin: PluginState,
     eventCode: string
@@ -330,7 +376,7 @@ actions:
           ? [
               {
                 id: makeId("sim-act"),
-                label: `执行 ${plugin.actions[0]?.id ?? "plugin.default_action"}`,
+                label: `按 Skill 响应事件（${eventCode}）`,
                 path: "~/Library/Caches/ValetSimulated",
                 sizeMB: 240,
                 sizeLabel: "240 MB",
@@ -415,12 +461,18 @@ class MyGoValetService implements ValetService {
     return Valet.sendTestAgentMessage(provider as unknown as MyGoProviderConfig, model);
   }
 
+  async testAutoReview(cfg: AutoReviewConfig): Promise<TestMessageResult> {
+    return Valet.testAutoReview(cfg as unknown as MyGoAutoReviewConfig);
+  }
+
   async sendChatMessage(params: {
     chatId?: string;
     prompt: string;
     model: string;
     mentionPlugin: PluginState | null;
     attachments: ChatAttachment[];
+    busyMode?: "steer" | "followUp";
+    interactive?: boolean;
   }): Promise<SimulatedChatOutcome> {
     const res = await Valet.sendChatMessage({
       chatId: params.chatId ?? "chat-default",
@@ -428,12 +480,23 @@ class MyGoValetService implements ValetService {
       model: params.model,
       mentionPluginId: params.mentionPlugin?.id,
       attachments: params.attachments,
+      busyMode: params.busyMode,
+      interactive: params.interactive,
     });
     return {
       replyMessage: res.replyMessage as unknown as ChatMessage,
       createdEvent: res.createdEvent as unknown as TimelineEvent | undefined,
       createdInboxItem: res.createdInbox as unknown as InboxApprovalItem | undefined,
     };
+  }
+
+  async resolveChatPermission(
+    chatId: string,
+    requestId: string,
+    decision: "allow_once" | "allow_session" | "deny",
+    note = ""
+  ): Promise<boolean> {
+    return Valet.resolveChatPermission(chatId, requestId, decision, note);
   }
 
   createSimulatedPluginEvent(plugin: PluginState, eventCode: string) {
@@ -453,8 +516,17 @@ export const valetService: ValetService = {
     (isMyGo() ? mygoService : mockService).verifyProvider(provider),
   sendTestAgentMessage: (provider, model) =>
     (isMyGo() ? mygoService : mockService).sendTestAgentMessage(provider, model),
+  testAutoReview: (cfg) =>
+    (isMyGo() ? mygoService : mockService).testAutoReview(cfg),
   sendChatMessage: (params) =>
     (isMyGo() ? mygoService : mockService).sendChatMessage(params),
+  resolveChatPermission: (chatId, requestId, decision, note) =>
+    (isMyGo() ? mygoService : mockService).resolveChatPermission(
+      chatId,
+      requestId,
+      decision,
+      note
+    ),
   createSimulatedPluginEvent: (plugin, eventCode) =>
     (isMyGo() ? mygoService : mockService).createSimulatedPluginEvent(plugin, eventCode),
 };

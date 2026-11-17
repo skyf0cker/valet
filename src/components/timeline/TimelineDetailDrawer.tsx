@@ -3,6 +3,7 @@ import { useValet } from "../../store/ValetContext";
 import { PluginTag, StatusPill } from "../ui/Badge";
 import { Checkbox } from "../ui/Checkbox";
 import { CloseIcon, UndoIcon } from "../ui/Icons";
+import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { SlideOverDrawer } from "../ui/Modal";
 import { SegmentedControl } from "../ui/SegmentedControl";
 
@@ -120,9 +121,10 @@ export const TimelineDetailDrawer: React.FC = () => {
                   <div className="font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--ink-subtle)]">
                     02 · 判断
                   </div>
-                  <p className="text-[13px] leading-[21px] text-[var(--ink-body)]">
-                    {event.reasoning}
-                  </p>
+                  <MarkdownRenderer
+                    text={event.reasoning}
+                    className="text-[13px] leading-[21px] text-[var(--ink-body)]"
+                  />
                 </section>
 
                 {/* 03 Action checklist */}
@@ -275,7 +277,9 @@ export const TimelineDetailDrawer: React.FC = () => {
           <div className="flex shrink-0 items-center gap-2 border-t border-[var(--border-light)] px-7 py-4">
             <UndoIcon size={14} className="shrink-0 text-[var(--ink-muted)]" />
             <span className="flex-1 text-[12px] text-[var(--ink-muted)]">
-              移入废纸篓 · 7 天内可一键还原
+              {event.canRestore || event.actionItems.some((i) => i.sizeMB > 0)
+                ? "移入废纸篓 · 7 天内可一键还原"
+                : "所有敏感变更均受收件箱安全策略保护"}
             </span>
 
             {event.status === "pending_confirm" && (

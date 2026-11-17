@@ -5,13 +5,18 @@ import {
   section,
 } from "@earendil-works/pi-durable";
 import { arr, bool, num, obj, opt, str } from "@earendil-works/pi-schema";
-import type { ToolPolicyRegistry, TurnSideEffectTracker } from "../approval.ts";
+import type {
+  InteractivePermissionCoordinator,
+  ToolPolicyRegistry,
+  TurnSideEffectTracker,
+} from "../approval.ts";
 import type {
   HostBridge,
   PluginDraftSpec,
   QueueApprovalParams,
   ValetSyncState,
 } from "../protocol.ts";
+import { resolveBuiltinSkills } from "./builtin-skills.ts";
 
 function textResult(text: string, details?: Record<string, unknown>) {
   return {
@@ -22,16 +27,19 @@ function textResult(text: string, details?: Record<string, unknown>) {
 
 /**
  * Core Valet Steward extension (`valet:core`):
- * Injects persona, safety policy, memories, and active plugins prompt sections,
- * plus system overview, memory persistence, and YAML plugin drafting tools.
+ * Injects persona, safety policy, memories, builtin skills, and active plugin index,
+ * plus universal OS tools (`system_overview`, `bash`, `read_file`, `list_dir`,
+ * `write_file`, `trash_files`, `kill_process`, `ask_user`, `memory_remember`,
+ * `plugin_draft_create`, `inbox_propose_approval`).
  */
 export function createStewardCoreExtension(options: {
   bridge: HostBridge;
   getState: () => ValetSyncState;
   policyRegistry: ToolPolicyRegistry;
   tracker?: TurnSideEffectTracker;
+  permissionCoordinator?: InteractivePermissionCoordinator;
 }): Extension {
-  const { bridge, getState, policyRegistry, tracker } = options;
+  const { bridge, getState, policyRegistry, tracker, permissionCoordinator } = options;
 
   policyRegistry.registerAll([
     {
@@ -46,6 +54,103 @@ export function createStewardCoreExtension(options: {
       reversible7d: true,
       approveLabel: "确定",
       dismissLabel: "关闭",
+    },
+    {
+      toolName: "read_file",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "fs.read",
+      eventCode: "system.inspect",
+      safety: "readonly",
+      category: "files",
+      iconKind: "disk",
+      reversible7d: true,
+      approveLabel: "读取",
+      dismissLabel: "取消",
+    },
+    {
+      toolName: "list_dir",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "fs.list",
+      eventCode: "system.inspect",
+      safety: "readonly",
+      category: "files",
+      iconKind: "disk",
+      reversible7d: true,
+      approveLabel: "列出",
+      dismissLabel: "取消",
+    },
+    {
+      toolName: "write_file",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "fs.write",
+      eventCode: "fs.modified",
+      safety: "reversible",
+      checklistKey: "deleteOrOverwrite",
+      category: "files",
+      iconKind: "disk",
+      reversible7d: false,
+      approveLabel: "批准写入",
+      dismissLabel: "拒绝",
+    },
+    {
+      toolName: "trash_files",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "fs.trash",
+      eventCode: "fs.cleaned",
+      safety: "reversible",
+      checklistKey: "deleteOrOverwrite",
+      category: "files",
+      iconKind: "trash",
+      reversible7d: true,
+      approveLabel: "移入废纸篓",
+      dismissLabel: "拒绝",
+    },
+    {
+      toolName: "kill_process",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "proc.kill",
+      eventCode: "process.terminated",
+      safety: "confirm_always",
+      checklistKey: "runTerminalCommand",
+      warningTag: "不可撤销",
+      category: "process",
+      iconKind: "pulse",
+      reversible7d: false,
+      approveLabel: "结束进程",
+      dismissLabel: "取消",
+    },
+    {
+      toolName: "bash",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "shell.bash",
+      eventCode: "system.command",
+      safety: "reversible",
+      checklistKey: "runTerminalCommand",
+      warningTag: "不可撤销",
+      category: "process",
+      iconKind: "pulse",
+      reversible7d: false,
+      approveLabel: "批准执行",
+      dismissLabel: "拒绝",
+    },
+    {
+      toolName: "ask_user",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "user.ask",
+      eventCode: "user.question",
+      safety: "readonly",
+      category: "outbound",
+      iconKind: "mail",
+      reversible7d: true,
+      approveLabel: "确认",
+      dismissLabel: "取消",
     },
     {
       toolName: "memory_remember",
@@ -88,18 +193,283 @@ export function createStewardCoreExtension(options: {
     },
   ]);
 
+  const bashTool = defineTool({
+    name: "bash",
+    description:
+      "Execute a macOS shell command (/bin/zsh). Read-only inspection commands (ls, ps, df, networksetup, pmset, read-only plugin poll-/import- scripts, etc.) run immediately; mutating commands trigger interactive Chat permission approval or queue an Inbox approval card in background mode.",
+    parameters: obj({
+      command: str({ description: "Shell command string to execute." }),
+      cwd: opt(
+        str({
+          description:
+            "Working directory (supports ~, defaults to user home directory).",
+        }),
+      ),
+      timeoutSec: opt(num({ description: "Timeout in seconds (1-90, default 20)." })),
+      reason: opt(
+        str({
+          description:
+            "Concise Chinese explanation of why this command is needed.",
+        }),
+      ),
+    }),
+    execute: async (args) => {
+      const res = await bridge.callHost<{
+        ok: boolean;
+        command: string;
+        cwd: string;
+        exitCode: number;
+        durationMs: number;
+        output: string;
+        summary: string;
+      }>("host.kernel.bash", {
+        command: args.command,
+        cwd: args.cwd,
+        timeoutSec: args.timeoutSec,
+      });
+      const rawCmd = args.command.trim().replace(/\s+/g, " ");
+      const shortCmd = rawCmd.length > 40 ? `${rawCmd.slice(0, 39)}…` : rawCmd;
+      const body = `[exit=${res.exitCode}, cwd=${res.cwd}, ${res.durationMs}ms]\n${res.output || "(无标准输出)"}`;
+      const details = {
+        bashResult: res,
+        timelineTitle: `已执行命令：${shortCmd}`,
+        timelineSummary: res.summary,
+        canRestore: false,
+      };
+      if (res.exitCode !== 0 && !res.ok) {
+        return {
+          output: [{ type: "text" as const, text: body }],
+          isError: true,
+          details: details as never,
+        };
+      }
+      return textResult(body, details);
+    },
+  });
+
   const systemOverviewTool = defineTool({
     name: "system_overview",
     description:
       "Read live macOS disk capacity, free space, CPU/memory metrics, enabled plugins, and top processes.",
     parameters: obj({}),
     replay: "safe",
-    execute: async () => {
+    execute: async (_args, api, context) => {
       const overview = await bridge.callHost<Record<string, unknown>>(
         "host.kernel.overview",
         {},
       );
-      return textResult(JSON.stringify(overview, null, 2), { overview: overview as never });
+      const topProcesses = Array.isArray(overview?.topProcesses)
+        ? overview.topProcesses
+        : [];
+      const details: Record<string, unknown> = { overview };
+      if (topProcesses.length > 0) {
+        const processTable = {
+          rows: topProcesses,
+          primaryActionDone: false,
+          secondaryActionDone: false,
+          autoRuleAdded: false,
+        };
+        details.processTable = processTable;
+        await api.details({ processTable: processTable as never }, context);
+      }
+      return textResult(JSON.stringify(overview, null, 2), details);
+    },
+  });
+
+  const readFileTool = defineTool({
+    name: "read_file",
+    description:
+      "Read a UTF-8 text file safely (logs, configs, SKILL.md, scripts) with line offset & limit. Never accesses SSH/Keychain credentials.",
+    parameters: obj({
+      path: str({ description: "Absolute or ~/ path to read." }),
+      offsetLine: opt(num({ description: "1-based starting line number (default 1)." })),
+      limitLines: opt(num({ description: "Max lines to read (default 200, max 500)." })),
+    }),
+    replay: "safe",
+    execute: async (args) => {
+      const res = await bridge.callHost<{
+        path: string;
+        totalLines: number;
+        startLine: number;
+        endLine: number;
+        content: string;
+      }>("host.kernel.readFile", args as unknown as Record<string, unknown>);
+      return textResult(
+        `[file=${res.path} lines ${res.startLine}-${res.endLine}/${res.totalLines}]\n${res.content}`,
+        { fileRead: res as never },
+      );
+    },
+  });
+
+  const listDirTool = defineTool({
+    name: "list_dir",
+    description:
+      "List entries in a directory (supports ~) to inspect caches, logs, Applications, or plugin bundles.",
+    parameters: obj({
+      path: str({ description: "Directory path (supports ~)." }),
+      maxEntries: opt(num({ description: "Maximum entries to return (default 100)." })),
+    }),
+    replay: "safe",
+    execute: async (args) => {
+      const res = await bridge.callHost<{
+        path: string;
+        totalCount: number;
+        entries: Array<{
+          name: string;
+          path: string;
+          isDir: boolean;
+          sizeBytes: number;
+          modTime: string;
+        }>;
+      }>("host.kernel.listDir", args as unknown as Record<string, unknown>);
+      return textResult(JSON.stringify(res, null, 2), { dirListing: res as never });
+    },
+  });
+
+  const writeFileTool = defineTool({
+    name: "write_file",
+    description:
+      "Create, overwrite, or append a text file. Subject to safety permission approval.",
+    parameters: obj({
+      path: str({ description: "Target file path (supports ~)." }),
+      content: str({ description: "Text content to write." }),
+      append: opt(bool({ description: "Append instead of overwriting when true." })),
+      reason: opt(str({ description: "Concise Chinese explanation of the write." })),
+    }),
+    execute: async (args) => {
+      const res = await bridge.callHost<{
+        ok: boolean;
+        path: string;
+        bytesWritten: number;
+      }>("host.kernel.writeFile", args as unknown as Record<string, unknown>);
+      return textResult(`已写入文件 ${res.path} (${res.bytesWritten} bytes)`, {
+        timelineTitle: `写入文件：${res.path}`,
+        timelineSummary: `写入 ${res.bytesWritten} 字节`,
+        canRestore: false,
+      });
+    },
+  });
+
+  const trashFilesTool = defineTool({
+    name: "trash_files",
+    description:
+      "Move specific files or directories into Finder Trash / Valet Vault (7-day reversible). Subject to safety permission approval and protectedDirs guard.",
+    parameters: obj({
+      paths: arr(str(), { description: "List of concrete filesystem paths to move to Trash." }),
+      reason: opt(str({ description: "Concise Chinese explanation of why these paths can be trashed." })),
+    }),
+    execute: async (args) => {
+      const res = await bridge.callHost<{
+        ok: boolean;
+        batchId: string;
+        movedCount: number;
+        reclaimedGB: number;
+        summary: string;
+      }>("host.kernel.trashFiles", args as unknown as Record<string, unknown>);
+      return textResult(res.summary || JSON.stringify(res), {
+        timelineTitle: `已移入废纸篓（${res.movedCount} 项）`,
+        timelineSummary: res.summary,
+        canRestore: res.movedCount > 0,
+        reclaimedGB: res.reclaimedGB,
+      });
+    },
+  });
+
+  const killProcessTool = defineTool({
+    name: "kill_process",
+    description:
+      "Terminate a specific OS process PID with SIGTERM or SIGKILL (respects blockedApps). Always requires explicit confirmation.",
+    parameters: obj({
+      pid: num({ description: "Numeric process ID (> 1)." }),
+      name: str({ description: "Process display/binary name." }),
+      signal: opt(str({ description: "Signal to send: SIGTERM (default) or SIGKILL." })),
+      reason: opt(str({ description: "Concise Chinese explanation." })),
+    }),
+    execute: async (args) => {
+      const res = await bridge.callHost<{
+        ok: boolean;
+        pid: number;
+        name: string;
+        signal: string;
+        summary: string;
+      }>("host.kernel.killProcess", args as unknown as Record<string, unknown>);
+      return textResult(res.summary || JSON.stringify(res), {
+        timelineTitle: `结束进程 ${res.name} (PID ${res.pid})`,
+        timelineSummary: res.summary,
+        canRestore: false,
+      });
+    },
+  });
+
+  const askUserTool = defineTool({
+    name: "ask_user",
+    description:
+      "Ask the user a structured question with optional clickable choices when disambiguation, confirmation of strategy, or human judgment is needed. In interactive Chat, suspends until the user responds; in background mode, queues an Inbox question card.",
+    parameters: obj({
+      question: str({ description: "Clear question in Chinese for the user." }),
+      options: opt(arr(str(), { description: "Optional clickable answer choices." })),
+      context: opt(str({ description: "Optional short background context." })),
+    }),
+    execute: async (args, api) => {
+      const optsList = Array.isArray(args.options)
+        ? args.options.map((o) => String(o).trim()).filter(Boolean)
+        : undefined;
+      if (permissionCoordinator?.isForegroundChat(api.conversationId)) {
+        const chatId = permissionCoordinator.getChatId(api.conversationId)!;
+        const res = await permissionCoordinator.requestInteractive({
+          chatId,
+          toolName: "ask_user",
+          title: "需要你的确认或选择",
+          summary: args.context ? `${args.question}\n${args.context}` : args.question,
+          options: optsList,
+          approveLabel: "确认提交",
+          dismissLabel: "跳过",
+        });
+        if (!res.approved && res.decision === "deny") {
+          return textResult(
+            `用户选择暂不处理或拒绝回答${res.note ? `（备注：${res.note}）` : ""}。`,
+            { askUserCancelled: true },
+          );
+        }
+        const chosen = res.note?.trim() || res.decision;
+        return textResult(`用户回复：${chosen}`, {
+          askUserAnswer: chosen,
+        });
+      }
+
+      // Background sensor/heartbeat turn: queue an Inbox card for user review
+      const queued = await bridge.callHost<{
+        inboxId: string;
+        timelineEventId: string;
+      }>("host.queueApproval", {
+        pluginId: "valet-core",
+        pluginName: "Valet 管家",
+        eventCode: "user.question",
+        category: "outbound",
+        iconKind: "mail",
+        title: args.question.slice(0, 60),
+        summary: args.context ? `${args.question} · ${args.context}` : args.question,
+        reasoning: optsList?.length
+          ? `备选方案：${optsList.join(" / ")}`
+          : args.question,
+        reversible7d: true,
+        approveLabel: "已知晓",
+        dismissLabel: "忽略",
+        toolName: "ask_user",
+        toolArgs: { question: args.question, options: optsList },
+        actionItems: [],
+      } satisfies QueueApprovalParams as unknown as Record<string, unknown>);
+      if (queued?.inboxId) {
+        tracker?.recordInbox(
+          api.conversationId,
+          queued.inboxId,
+          queued.timelineEventId,
+        );
+      }
+      return textResult(
+        `当前处于后台运行模式，已将问题提交至「收件箱」(${queued?.inboxId ?? ""})等待用户确认。`,
+        { queued },
+      );
     },
   });
 
@@ -126,39 +496,88 @@ export function createStewardCoreExtension(options: {
   const pluginDraftCreateTool = defineTool({
     name: "plugin_draft_create",
     description:
-      "Draft an executable Valet YAML plugin manifest for an automation request (e.g. auto-cleaning .dmg installers or organizing screenshots).",
+      "Draft an Action-less pluggable Valet plugin bundle (custom event trigger/sensor + SKILL.md processing workflow). Valet core tools execute the Skill without needing static action declarations.",
     parameters: obj({
       name: str({ description: "Display name of the plugin in Chinese or English." }),
       slug: opt(str({ description: "Kebab-case identifier suffix." })),
-      eventCode: str({ description: "Trigger event code such as fs.file_created." }),
-      glob: opt(str({ description: "Path glob pattern if watching filesystem events." })),
-      actionId: str({ description: "Action ID such as move_to_trash or move_to." }),
-      targetPath: opt(str({ description: "Optional destination directory for move actions." })),
-      condition: opt(str({ description: "Optional guard condition such as app_installed_from(dmg)." })),
+      eventCode: str({ description: "Custom event code such as git.ci_failed or fs.file_created." }),
+      sensor: opt(
+        str({
+          description:
+            "Event source type: fs_watch | command_poll | script_poll | http_poll | webhook | cron",
+        }),
+      ),
+      glob: opt(str({ description: "Path glob pattern when sensor=fs_watch." })),
+      command: opt(str({ description: "Shell probe command when sensor=command_poll." })),
+      script: opt(str({ description: "Relative script path when sensor=script_poll." })),
+      url: opt(str({ description: "HTTP/JSON endpoint when sensor=http_poll." })),
+      schedule: opt(str({ description: "5-field cron expression when sensor=cron." })),
+      intervalSec: opt(num({ description: "Polling interval in seconds." })),
+      policy: opt(str({ description: "Default event policy: auto | ask | record." })),
+      actionSummary: opt(str({ description: "Human-readable description of intended response workflow." })),
+      actionId: opt(str({ description: "Optional legacy label describing intended step (not emitted as static action)." })),
+      targetPath: opt(str({ description: "Optional destination directory or file target." })),
+      condition: opt(str({ description: "Optional guard condition expression." })),
+      skillMarkdown: opt(
+        str({
+          description:
+            "Markdown instructions (SKILL.md) defining how Valet analyzes the event payload and calls core tools.",
+        }),
+      ),
     }),
     replay: "safe",
     execute: async (args, api, context) => {
       const id =
         args.slug?.trim() ||
         `local-${Date.now().toString(36).slice(-4)}`;
-      const whenExpression = args.glob
-        ? `when ${args.eventCode}(${args.glob})`
-        : `when ${args.eventCode}`;
-      const condSuffix = args.condition ? ` and ${args.condition}` : "";
-      const actionTarget = args.targetPath ? `(${args.targetPath})` : "";
-      const actionExpression = `${condSuffix ? `${condSuffix.trim()} -> ` : ""}${args.actionId}${actionTarget}`;
+      const resolvedSensor =
+        args.sensor?.trim() ||
+        (args.glob
+          ? "fs_watch"
+          : args.script
+            ? "script_poll"
+            : args.command
+              ? "command_poll"
+              : args.url
+                ? "http_poll"
+                : args.schedule
+                  ? "cron"
+                  : "webhook");
+      const whenExpression =
+        resolvedSensor === "fs_watch" && args.glob
+          ? `when ${args.eventCode}(${args.glob})`
+          : resolvedSensor === "command_poll" && args.command
+            ? `when ${args.eventCode} [cmd: ${args.command}]`
+            : resolvedSensor === "script_poll" && args.script
+              ? `when ${args.eventCode} [script: ${args.script}]`
+              : resolvedSensor === "http_poll" && args.url
+                ? `when ${args.eventCode} [http: ${args.url}]`
+                : resolvedSensor === "cron" && args.schedule
+                  ? `when ${args.eventCode} [cron: ${args.schedule}]`
+                  : `when ${args.eventCode} [${resolvedSensor}]`;
+      const actionLabel =
+        args.actionSummary?.trim() ||
+        args.actionId?.trim() ||
+        (args.targetPath ? `处理 ${args.targetPath}` : "按 Skill 自主响应");
+      const condSuffix = args.condition ? `${args.condition} -> ` : "";
+      const actionExpression = `${condSuffix}${actionLabel}`;
 
-      const driver =
-        args.actionId === "move_to_trash"
-          ? "fs.trash"
-          : args.actionId === "move_to"
-            ? "fs.move"
-            : "plugin.noop";
       const watchDir = args.glob
         ? args.glob.includes("/")
           ? args.glob.slice(0, args.glob.lastIndexOf("/"))
           : "~/Downloads"
         : "";
+      const policy = args.policy?.trim() || "ask";
+      const skillText =
+        args.skillMarkdown?.trim() ||
+        [
+          `### 触发条件`,
+          `- 当通过 \`${resolvedSensor}\` 收到 \`${args.eventCode}\` 事件时触发本插件。`,
+          ``,
+          `### 处理流程`,
+          `1. 使用 \`read_file\` / \`list_dir\` / \`bash\` 检查事件 \`payload\` 中的变更对象与上下文。`,
+          `2. 根据状况调用通用核心工具（${args.targetPath ? `如涉及 \`${args.targetPath}\` 的 \`trash_files\` / \`write_file\`` : "如 \`trash_files\`、\`write_file\`、\`bash\`"}）执行响应；如需人工裁决可调用 \`ask_user\`，危险工具调用也会自动请求用户批准。`,
+        ].join("\n");
 
       const yamlLines = [
         `id: local.valet.${id}`,
@@ -166,24 +585,39 @@ export function createStewardCoreExtension(options: {
         `version: 0.1.0`,
         `triggers:`,
         `  - id: ${args.eventCode}`,
+        `    sensor: ${resolvedSensor}`,
+        `    policy: ${policy}`,
       ];
-      if (args.glob) {
-        yamlLines.push(`    sensor: fs_watch`);
+      if (resolvedSensor === "fs_watch" && args.glob) {
         if (watchDir) yamlLines.push(`    watch_dirs: [${watchDir}]`);
         yamlLines.push(`    ops: [create]`);
         yamlLines.push(`    glob: "${args.glob}"`);
-        yamlLines.push(`    policy: auto`);
+      }
+      if (args.command) {
+        yamlLines.push(`    command: "${args.command.replace(/"/g, '\\"')}"`);
+        yamlLines.push(`    interval_sec: ${args.intervalSec ?? 60}`);
+        yamlLines.push(`    emit_on: change`);
+      }
+      if (args.script) {
+        yamlLines.push(`    script: "${args.script.replace(/"/g, '\\"')}"`);
+        yamlLines.push(`    interval_sec: ${args.intervalSec ?? 30}`);
+        yamlLines.push(`    emit_on: json`);
+      }
+      if (args.url) {
+        yamlLines.push(`    url: "${args.url}"`);
+        yamlLines.push(`    interval_sec: ${args.intervalSec ?? 60}`);
+        yamlLines.push(`    emit_on: change`);
+      }
+      if (args.schedule) {
+        yamlLines.push(`    schedule: "${args.schedule}"`);
       }
       if (args.condition) {
         yamlLines.push(`condition:`);
         yamlLines.push(`  - ${args.condition}`);
       }
-      yamlLines.push(`actions:`);
-      yamlLines.push(`  - id: ${args.actionId}`);
-      yamlLines.push(`    driver: ${driver}`);
-      yamlLines.push(`    safety: reversible`);
-      if (args.targetPath) {
-        yamlLines.push(`    target: "${args.targetPath}"`);
+      yamlLines.push(`skill: |`);
+      for (const line of skillText.split("\n")) {
+        yamlLines.push(`  ${line}`);
       }
 
       const draft: PluginDraftSpec = {
@@ -192,11 +626,13 @@ export function createStewardCoreExtension(options: {
         whenExpression,
         actionExpression,
         manifestYaml: yamlLines.join("\n"),
+        sensor: resolvedSensor,
+        skillMarkdown: skillText,
         installed: false,
       };
       await api.details({ pluginDraft: draft as never }, context);
       return textResult(
-        `已生成插件草稿「${draft.name}」(${whenExpression} -> ${actionExpression})`,
+        `已生成闭环插件草稿「${draft.name}」(${whenExpression} -> ${actionExpression})`,
         { pluginDraft: draft as never },
       );
     },
@@ -205,7 +641,7 @@ export function createStewardCoreExtension(options: {
   const inboxProposeApprovalTool = defineTool({
     name: "inbox_propose_approval",
     description:
-      "Queue an explicit human approval card in Valet Inbox before touching user files or sending external messages. Prefer calling action tools such as disk_move_to_trash or app_trash_remnants directly (they automatically queue Inbox cards when confirmation is required). For file actions, you MUST supply a non-empty paths array of concrete filesystem paths.",
+      "Queue an explicit human approval card in Valet Inbox for background tasks or multi-item file cleanup plans. For file actions, you MUST supply a non-empty paths array.",
     parameters: obj({
       pluginId: opt(str()),
       title: str(),
@@ -228,26 +664,24 @@ export function createStewardCoreExtension(options: {
           output: [
             {
               type: "text" as const,
-              text: "提交文件清理审批失败：必须提供非空的 paths 文件路径列表，或直接调用 disk_move_to_trash / app_trash_remnants 并传入具体 paths。",
+              text: "提交文件清理审批失败：必须提供非空的 paths 文件路径列表，或直接调用 trash_files 并传入具体 paths。",
             },
           ],
           isError: true,
         };
       }
 
+      const state = getState();
       const estimatedGB =
         typeof args.estimatedGB === "number" && Number.isFinite(args.estimatedGB)
           ? args.estimatedGB
           : undefined;
-      const pluginId = args.pluginId ?? "disk-guard";
-      const pluginName =
-        pluginId === "app-uninstaller" ? "卸载清理助手" : "磁盘守卫";
-      const toolName =
-        category === "files"
-          ? pluginId === "app-uninstaller"
-            ? "app_trash_remnants"
-            : "disk_move_to_trash"
-          : "plugin_noop";
+      const pluginId = args.pluginId?.trim() || "valet-core";
+      const matchedPlugin = state.plugins.find(
+        (p) => p.id === pluginId || p.slug === pluginId,
+      );
+      const pluginName = matchedPlugin?.name ?? "Valet 管家";
+      const toolName = category === "files" ? "trash_files" : "ask_user";
 
       const actionItems = cleanPaths.map((p, idx) => ({
         id: `propose-${Date.now()}-${idx + 1}`,
@@ -268,15 +702,15 @@ export function createStewardCoreExtension(options: {
         pluginId,
         pluginName,
         eventCode:
-          pluginId === "app-uninstaller" ? "app.orphan_found" : "disk.large_file",
+          category === "files" ? "fs.cleanup_proposed" : "system.proposed",
         category,
-        iconKind: "disk",
+        iconKind: category === "process" ? "pulse" : "disk",
         title: args.title,
         summary: args.summary,
         reasoning: args.summary,
         reversible7d: args.reversible7d ?? true,
         reclaimableGB: estimatedGB,
-        approveLabel: "批准执行",
+        approveLabel: category === "files" ? "移入废纸篓" : "批准执行",
         dismissLabel: "忽略",
         toolName,
         toolArgs:
@@ -313,7 +747,7 @@ export function createStewardCoreExtension(options: {
           friendly: "温和自然、贴心管家风格",
         };
         return [
-          `你是 Valet，运行在用户 (${s.preferences.userNickname || "用户"}) macOS 设备上的常驻智能管家。`,
+          `你是 Valet，运行在用户 (${s.preferences.userNickname || "用户"}) macOS 电脑上、感知事件并做出响应的常驻智能管家（而非单一磁盘清理工具）。`,
           `语言：${s.preferences.language}；语气风格：${toneDesc[s.preferences.toneStyle] ?? "简洁直接"}。`,
           s.preferences.customInstructions
             ? `用户自定义指令：\n${s.preferences.customInstructions}`
@@ -324,21 +758,58 @@ export function createStewardCoreExtension(options: {
       }),
       section("valet_safety_rules", () => {
         const s = getState();
+        const levelLabel =
+          s.preferences.autonomyLevel === "always_ask"
+            ? "always_ask（每个都询问）"
+            : s.preferences.autonomyLevel === "full_access" ||
+                s.preferences.autonomyLevel === "autonomous"
+              ? "full_access（Full Access）"
+              : "auto_review（Auto Review 智能审查）";
         return [
-          `当前安全自主级别：${s.preferences.autonomyLevel}`,
+          `当前安全自主级别：${levelLabel}`,
           `受保护路径（严禁改动）：${s.preferences.cleanupPolicy.protectedDirs.join(", ")}`,
           `严禁触碰的应用：${s.preferences.blockedApps.join(", ")}`,
-          "规则：清理文件优先移入废纸篓并支持 7 天还原；需要删除或清理文件时，请直接调用对应工具（如 disk_move_to_trash / app_trash_remnants）并传入完整 paths，安全拦截会自动把待批事项推入「收件箱」；若使用 inbox_propose_approval，必须传入具体的 paths 路径列表。",
+          "通用核心工具（所有插件共享这套原语）：",
+          "- 只读探测工具：`system_overview`、`read_file`、`list_dir`、`ask_user`、`memory_remember`、`plugin_draft_create`、`bash`（纯只读命令与插件 `scripts/poll-*`/`import-*`/`read-*`/`inspect-*`/`scan-*`/`sample-*` 脚本直接放行）。",
+          "- 工具使用优先顺序：查看目录文件请优先用 `list_dir`、查看文件内容请优先用 `read_file`；仅在需要系统探测（进程/网络/磁盘元数据）或执行变更命令时使用 `bash`。",
+          "- 变更执行工具：`trash_files`（移入废纸篓，7 天可还原）、`write_file`、`kill_process`、`bash`（修改系统/配置命令）。",
+          "双模安全审批机制：在 `auto_review` 模式下，非纯只读调用会先由 Auto Review 模型评估风险，低风险自动放行，高风险或未配置时升级为人工确认（前台对话实时弹窗、后台任务推送收件箱）；在 `always_ask` 下每次变更都会确认；在 `full_access` 下除受保护目录/应用与安全护栏外的操作均自动放行。严禁访问 `~/.ssh`、`~/.gnupg`、`~/.aws`、Keychain 或使用 `sudo`。",
         ].join("\n");
       }),
       section("valet_memories", () => {
         const s = getState();
-        if (!s.preferences.memoryEnabled || s.memories.length === 0) {
+        if (!s.preferences.memoryEnabled) {
           return undefined;
         }
-        return s.memories
-          .map((m) => `- ${m.content} (${m.source})`)
-          .join("\n");
+        const lines: string[] = [];
+        if (s.preferences.autoLearnMemory) {
+          lines.push(
+            "记忆策略：当前已开启「对话中自动记住偏好」。每当用户明确表达长期偏好、工作习惯、重点关注目录/服务或禁忌规则时，请主动调用 memory_remember 持久化记录。",
+          );
+        }
+        if (s.memories.length > 0) {
+          lines.push(
+            "已知用户偏好与事实记忆：",
+            ...s.memories.map((m) => `- ${m.content} (${m.source})`),
+          );
+        }
+        return lines.length > 0 ? lines.join("\n") : undefined;
+      }),
+      section("valet_builtin_skills", () => {
+        const s = getState();
+        const skills = resolveBuiltinSkills(s);
+        if (skills.length === 0) {
+          return undefined;
+        }
+        const items = skills.map(
+          (sk) => `- ${sk.name} (${sk.title}): ${sk.description}`,
+        );
+        return [
+          "Valet 内置引导技能（调用工具前按需使用 `skill_load` 读取完整手册）：",
+          ...items,
+          "- 在编写、修改、校验或热加载 Valet 插件前，务必先调用 `skill_load({ name: \"valet-plugin-dev\" })`，再通过 `plugin_install` / `plugin_reload` / `plugin_trigger` 完成闭环。",
+          "- 在查看或修改 Valet 自身设置（模型、服务商、心跳、阈值、自动化、MCP、记忆等）前，务必先调用 `skill_load({ name: \"valet-self-config\" })`，再通过 `bash` 执行 `valet` CLI 命令。",
+        ].join("\n");
       }),
       section("valet_active_plugins", () => {
         const s = getState();
@@ -349,9 +820,27 @@ export function createStewardCoreExtension(options: {
           ? `当前已启用插件：\n${active.join("\n")}`
           : "当前没有启用的插件。";
       }),
+      section("valet_plugin_architecture", () => {
+        const s = getState();
+        const webhook = s.preferences.pluginRuntime.webhookEndpoint;
+        return [
+          "Valet 采用「通用核心工具 + 可插拔事件插件（Sensor + SKILL.md + 脚本）」架构，宿主不绑定任何插件专用硬编码：",
+          "- 插件目录包格式：`<dataDir>/plugins/<slug>/` 下包含 `manifest.yaml`（事件/传感器声明与 `config_schema`）、`SKILL.md`（处置方法论与执行流程）及可选 `scripts/*`。",
+          `- 5 类通用传感器（Sensors）：\`fs_watch\`（文件系统变更）、\`command_poll\`（Shell 探针输出对比）、\`script_poll\`（Bun/Python/Shell 脚本输出 JSON \`{triggered, payload}\`）、\`http_poll\`（HTTP 端点轮询）、\`webhook\`（本地网关${webhook ? ` ${webhook}/{pluginId}/{eventCode}` : ""}）、\`cron\`（定时调度）。`,
+          "- 核心工具与审批：插件不再静态声明 `actions` 或宿主 `driver`，Agent 阅读插件注入的 `<plugin_skill>` 后自主选用通用工具诊断，危险操作由统一安全门控拦截并请求用户批准。",
+          "- 外部 MCP 扩展（valet:mcp:*）：通过 stdio / HTTP 接入的外部工具服务器。",
+        ].join("\n");
+      }),
     ],
     tools: [
       systemOverviewTool,
+      readFileTool,
+      listDirTool,
+      writeFileTool,
+      trashFilesTool,
+      killProcessTool,
+      bashTool,
+      askUserTool,
       memoryRememberTool,
       pluginDraftCreateTool,
       inboxProposeApprovalTool,

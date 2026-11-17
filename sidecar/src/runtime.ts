@@ -1,6 +1,8 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { WatchHandle } from "@earendil-works/chord/watch";
 import {
+  type AssistantMessage,
+  type ToolResultMessage,
   fauxAssistantMessage,
   fauxThinking,
   fauxToolCall,
@@ -11,6 +13,7 @@ import {
   type ConversationId,
   type ConversationView,
   type EntryId,
+  type EntryRecord,
   type Extension,
   Harness,
   type LiveState,
@@ -22,10 +25,13 @@ import {
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
+  InteractivePermissionCoordinator,
   ToolPolicyRegistry,
   createSafetyExtension,
 } from "./approval.ts";
+import { AutoReviewEvaluator } from "./auto-review.ts";
 import { compilePluginExtension } from "./extensions/plugin-compiler.ts";
+import { createBuiltinSkillsExtension } from "./extensions/builtin-skills.ts";
 import { createStewardCoreExtension } from "./extensions/steward-core.ts";
 import { McpClientManager } from "./mcp.ts";
 import { ValetModelManager } from "./models.ts";
@@ -36,12 +42,15 @@ import type {
   DispatchPluginEventRequest,
   ExecuteApprovedToolRequest,
   HostBridge,
+  PendingPermissionRequest,
   PluginDraftSpec,
   ProbeMcpRequest,
   ProbeMcpResponse,
   ProcessSampleRow,
+  ResolvePermissionRequest,
   SendChatRequest,
   SendChatResponse,
+  TestAutoReviewRequest,
   TestProviderRequest,
   ValetSyncState,
 } from "./protocol.ts";
@@ -56,17 +65,25 @@ const ValetThreadsDoc = defineDoc<{ map: Record<string, ConversationId> }>({
 });
 
 const TOOL_STATUS_LABELS: Record<string, string> = {
-  disk_scan: "正在扫描磁盘与缓存…",
-  disk_move_to_trash: "正在提交安全清理清单…",
-  disk_empty_trash: "正在检查废纸篓安全审计…",
-  app_scan_remnants: "正在排查应用卸载残留…",
-  app_trash_remnants: "正在提交残留清理清单…",
-  process_sample: "正在采样系统进程负载…",
-  process_terminate: "正在准备安全终止进程…",
-  log_summarize_crashes: "正在分析崩溃诊断日志…",
   system_overview: "正在读取系统状态概览…",
+  read_file: "正在读取本地文件…",
+  list_dir: "正在扫描目录列表…",
+  write_file: "正在写入本地文件…",
+  trash_files: "正在移入废纸篓…",
+  kill_process: "正在处理目标进程…",
+  bash: "正在执行终端命令…",
+  ask_user: "正在等待你的选择或确认…",
   memory_remember: "正在保存本地偏好记忆…",
   plugin_draft_create: "正在起草本地插件规则…",
+  inbox_propose_approval: "正在提交收件箱待批事项…",
+  skill_load: "正在加载内置 Skill 手册…",
+  plugin_list: "正在读取插件列表…",
+  plugin_inspect: "正在检查插件详情…",
+  plugin_install: "正在写入并热加载插件…",
+  plugin_reload: "正在热重载插件…",
+  plugin_configure: "正在更新插件策略与配置…",
+  plugin_trigger: "正在注入插件测试事件…",
+  plugin_remove: "正在卸载/移除插件…",
 };
 
 export function stripThinkTags(raw: string): {
@@ -108,6 +125,86 @@ export function summarizeStreamStatus(
   return "正在思考与分析…";
 }
 
+function humanizeToolStepLabel(
+  name: string,
+  args?: Record<string, unknown>,
+): string {
+  switch (name) {
+    case "bash": {
+      const rawCmd =
+        typeof args?.command === "string"
+          ? args.command.trim().replace(/\s+/g, " ")
+          : "";
+      if (!rawCmd) return "执行终端命令";
+      const shortCmd = rawCmd.length > 28 ? `${rawCmd.slice(0, 27)}…` : rawCmd;
+      return `执行命令 · ${shortCmd}`;
+    }
+    case "read_file": {
+      const p = typeof args?.path === "string" ? args.path : "";
+      return p ? `读取 · ${p.split("/").pop() || p}` : "读取文件";
+    }
+    case "list_dir": {
+      const p = typeof args?.path === "string" ? args.path : "";
+      return p ? `浏览目录 · ${p}` : "浏览目录";
+    }
+    case "write_file": {
+      const p = typeof args?.path === "string" ? args.path : "";
+      return p ? `写入 · ${p.split("/").pop() || p}` : "写入文件";
+    }
+    case "trash_files":
+      return "移入废纸篓（7 天可还原）";
+    case "kill_process":
+      return `终止进程 ${args?.name ? String(args.name) : ""}`.trim();
+    case "ask_user":
+      return "询问用户确认";
+    case "system_overview":
+      return "读取系统概览";
+    case "memory_remember":
+      return "保存偏好记忆";
+    case "plugin_draft_create":
+      return "生成本地插件草稿";
+    case "inbox_propose_approval":
+      return "提交收件箱待批项";
+    case "skill_load":
+      return args?.name ? `加载 Skill · ${String(args.name)}` : "加载内置 Skill";
+    case "plugin_list":
+      return "读取插件列表";
+    case "plugin_inspect":
+      return args?.id ? `检查插件 · ${String(args.id)}` : "检查插件详情";
+    case "plugin_install":
+      return args?.name || args?.slug
+        ? `安装并热加载 · ${String(args.name ?? args.slug)}`
+        : "写入并热加载插件";
+    case "plugin_reload":
+      return args?.id ? `热重载插件 · ${String(args.id)}` : "热重载本地插件";
+    case "plugin_configure":
+      return args?.id ? `配置插件 · ${String(args.id)}` : "更新插件配置";
+    case "plugin_trigger":
+      return args?.eventId ? `触发测试 · ${String(args.eventId)}` : "触发插件事件";
+    case "plugin_remove":
+      return args?.id ? `移除插件 · ${String(args.id)}` : "移除插件";
+    default:
+      return name.replace(/^(plugin_|mcp_)/, "").replace(/_/g, " ");
+  }
+}
+
+function summarizeToolOutput(rawText: string): string | undefined {
+  const trimmed = rawText.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.includes("NEEDS_APPROVAL(")) {
+    return "已转入收件箱等待确认";
+  }
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const picked =
+    lines.find((l) => !l.startsWith("{") && !l.startsWith("[")) ?? lines[0];
+  if (!picked) return undefined;
+  const singleLine = picked.replace(/\s+/g, " ");
+  return singleLine.length > 64 ? `${singleLine.slice(0, 63)}…` : singleLine;
+}
+
 function formatHHMM(ts?: number): string {
   const d = ts ? new Date(ts) : new Date();
   const hh = String(d.getHours()).padStart(2, "0");
@@ -134,12 +231,12 @@ function emptySyncState(): ValetSyncState {
       userNickname: "dd",
       toneStyle: "concise",
       customInstructions: "",
-      autonomyLevel: "sensitive_only",
+      autonomyLevel: "auto_review",
       confirmChecklist: {
-        deleteOrOverwrite: true,
+        deleteOrOverwrite: false,
         sendMessageOrEmail: true,
         paymentOrSubscription: true,
-        runTerminalCommand: true,
+        runTerminalCommand: false,
         modifySystemSettings: false,
       },
       blockedApps: ["钥匙串访问", "1Password"],
@@ -180,7 +277,9 @@ export class ValetDurableRuntime {
   private harness: Harness | null = null;
   private storageClose: (() => Promise<void>) | null = null;
   readonly policyRegistry = new ToolPolicyRegistry();
+  readonly permissionCoordinator = new InteractivePermissionCoordinator();
   readonly models = new ValetModelManager();
+  readonly autoReviewer = new AutoReviewEvaluator(this.models);
   readonly mcp = new McpClientManager();
   readonly registry = createRegistry();
   private readonly approvedConversations = new Set<ConversationId>();
@@ -246,16 +345,30 @@ export class ValetDurableRuntime {
       getState: () => this.state,
       approvedConversations: this.approvedConversations,
       tracker,
+      permissionCoordinator: this.permissionCoordinator,
+      autoReviewer: this.autoReviewer,
     });
     const coreExt = createStewardCoreExtension({
       bridge: this.bridge,
       getState: () => this.state,
       policyRegistry: this.policyRegistry,
       tracker,
+      permissionCoordinator: this.permissionCoordinator,
+    });
+
+    const builtinSkillsExt = createBuiltinSkillsExtension({
+      bridge: this.bridge,
+      getState: () => this.state,
+      policyRegistry: this.policyRegistry,
+      onPluginsUpdated: (plugins) => {
+        this.state = { ...this.state, plugins };
+        this.syncPluginExtensions(plugins);
+      },
     });
 
     this.registry.install(safetyExt);
     this.registry.install(coreExt);
+    this.registry.install(builtinSkillsExt);
 
     this.syncPluginExtensions(params.state.plugins);
     await this.mcp.syncServers(
@@ -311,8 +424,11 @@ export class ValetDurableRuntime {
       const sig = JSON.stringify({
         v: plugin.version,
         y: plugin.manifestYaml,
+        s: plugin.skillMarkdown ?? "",
         e: plugin.events.map((ev) => `${ev.id}:${ev.policy}`),
-        a: plugin.actions.map((ac) => `${ac.id}:${ac.safety}`),
+        l: plugin.localDir ?? "",
+        c: plugin.config?.values ?? {},
+        f: plugin.bundledFiles ?? [],
       });
       const existing = this.installedPluginExts.get(plugin.id);
       if (existing && existing.signature === sig) continue;
@@ -323,6 +439,7 @@ export class ValetDurableRuntime {
 
       const ext = compilePluginExtension({
         plugin,
+        dataDir: this.state.dataDir,
         bridge: this.bridge,
         policyRegistry: this.policyRegistry,
       });
@@ -341,6 +458,7 @@ export class ValetDurableRuntime {
 
   async syncState(nextState: ValetSyncState): Promise<{ ok: true }> {
     this.state = nextState;
+    this.autoReviewer.clearCache();
     this.models.syncProviders(
       nextState.providers,
       nextState.preferences.activeProviderId,
@@ -361,6 +479,14 @@ export class ValetDurableRuntime {
     latencyMs: number;
   }> {
     return this.models.testProvider(req.provider, req.model);
+  }
+
+  async testAutoReview(req: TestAutoReviewRequest): Promise<{
+    ok: boolean;
+    reply: string;
+    latencyMs: number;
+  }> {
+    return this.autoReviewer.testConnection(req.autoReview, this.state);
   }
 
   async probeMcpServer(req: ProbeMcpRequest): Promise<ProbeMcpResponse> {
@@ -388,6 +514,7 @@ export class ValetDurableRuntime {
       );
       if (conv) {
         this.activeConversationHandles.set(chatId, conv);
+        this.permissionCoordinator.setConversationChatId(conv.id, chatId);
         return conv;
       }
     }
@@ -404,6 +531,7 @@ export class ValetDurableRuntime {
       doc.map[chatId] = created.id;
     }, BACKGROUND_CONTEXT);
     this.activeConversationHandles.set(chatId, created);
+    this.permissionCoordinator.setConversationChatId(created.id, chatId);
     return created;
   }
 
@@ -426,7 +554,14 @@ export class ValetDurableRuntime {
         maxTurns: Math.max(1, this.state.preferences.maxStepsPerTask || 25),
         cwd: this.state.homeDir,
         instructions: mentionPlugin
-          ? `用户在本条消息中显式 @${mentionPlugin.name}（${mentionPlugin.id}），请优先使用该插件的能力与视角回答。`
+          ? [
+              `用户在本条消息中显式 @${mentionPlugin.name}（${mentionPlugin.id}），请优先使用该插件的能力与视角回答。`,
+              mentionPlugin.skillMarkdown?.trim()
+                ? `\n\n请遵循该插件的 Skill 处理逻辑：\n${mentionPlugin.skillMarkdown.trim()}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("")
           : null,
       },
       BACKGROUND_CONTEXT,
@@ -501,14 +636,103 @@ export class ValetDurableRuntime {
 
     this.turnSideEffects.set(conv.id, { inboxIds: [], timelineIds: [] });
 
+    const stepMap = new Map<string, ChatStreamStep>();
+    const baselineEntryIds = new Set<EntryId>();
+    let lastStreamSig = "";
+    let lastPartialText = "";
+    let lastThinkingText = "正在思考与分析…";
+    let lastPhase: ChatStreamPayload["phase"] = "thinking";
+
+    const emitStream = (pending?: PendingPermissionRequest) => {
+      const steps = [...stepMap.values()];
+      const activePending =
+        pending !== undefined
+          ? pending
+          : this.permissionCoordinator.getPending(req.chatId);
+      const payload: ChatStreamPayload = {
+        chatId: req.chatId,
+        phase: activePending ? "tools" : lastPhase,
+        partialText: lastPartialText || undefined,
+        thinkingText: activePending
+          ? activePending.toolName === "ask_user"
+            ? "等待你的回答或确认…"
+            : "等待你的权限批准…"
+          : lastThinkingText,
+        steps: steps.length > 0 ? steps : undefined,
+        ...(activePending ? { pendingPermission: activePending } : {}),
+      };
+      const sig = JSON.stringify(payload);
+      if (sig !== lastStreamSig) {
+        lastStreamSig = sig;
+        this.bridge.notifyHost("host.chatStream", payload);
+      }
+    };
+
+    this.permissionCoordinator.setInteractiveChat(
+      req.chatId,
+      Boolean(req.interactive),
+    );
+    this.permissionCoordinator.registerStreamEmitter(req.chatId, (pending) => {
+      emitStream(pending);
+    });
+
+    const collectEntriesIntoStepMap = (entries: readonly EntryRecord[]) => {
+      for (const entry of entries) {
+        if (baselineEntryIds.has(entry.id)) continue;
+        if (AssistantEntry.is(entry)) {
+          const msg = entry.model?.[0] as AssistantMessage | undefined;
+          if (!msg || !Array.isArray(msg.content)) continue;
+          for (const block of msg.content) {
+            if (block.type !== "toolCall") continue;
+            const prev = stepMap.get(block.id);
+            const args =
+              block.arguments && typeof block.arguments === "object"
+                ? (block.arguments as Record<string, unknown>)
+                : undefined;
+            stepMap.set(block.id, {
+              id: block.id,
+              name: block.name,
+              label: prev?.label || humanizeToolStepLabel(block.name, args),
+              status:
+                prev?.status === "done" || prev?.status === "error"
+                  ? prev.status
+                  : "running",
+              detail: prev?.detail,
+            });
+          }
+        } else if (ToolResultEntry.is(entry)) {
+          const toolMsg = entry.model?.[0] as ToolResultMessage | undefined;
+          if (!toolMsg || !toolMsg.toolCallId) continue;
+          const rawText = (toolMsg.content ?? [])
+            .map((b) => (b.type === "text" ? b.text : ""))
+            .filter(Boolean)
+            .join("\n");
+          const isApproval = rawText.includes("NEEDS_APPROVAL(");
+          const prev = stepMap.get(toolMsg.toolCallId);
+          stepMap.set(toolMsg.toolCallId, {
+            id: toolMsg.toolCallId,
+            name: prev?.name || toolMsg.toolName,
+            label: prev?.label || humanizeToolStepLabel(toolMsg.toolName),
+            status: isApproval ? "done" : toolMsg.isError ? "error" : "done",
+            detail: summarizeToolOutput(rawText) ?? prev?.detail,
+          });
+        }
+      }
+    };
+
     let watch: WatchHandle<ConversationView> | null = null;
     try {
-      watch = await conv.watch(BACKGROUND_CONTEXT, { min: 10, max: 30 });
+      watch = await conv.watch(BACKGROUND_CONTEXT, { min: 20, max: 60 });
+      for (const e of watch.value.entries) {
+        baselineEntryIds.add(e.id);
+      }
       const initialLastEntryId =
         watch.value.entries[watch.value.entries.length - 1]?.id;
 
       watch.start(async (call) => {
         if (call.kind !== "value") return;
+        collectEntriesIntoStepMap(call.value.entries);
+
         const live = call.value.docs["pi.live"] as LiveState | undefined;
         if (!live) return;
 
@@ -521,44 +745,51 @@ export class ValetDurableRuntime {
         }
 
         const { cleanText: cleanPartialText } = stripThinkTags(rawPartialText);
+        if (cleanPartialText) {
+          lastPartialText = cleanPartialText;
+        }
 
-        const steps: ChatStreamStep[] = (live.tools ?? []).map((slot) => ({
-          id: slot.callId,
-          name: slot.name,
-          status:
-            slot.status === "done"
-              ? "done"
-              : slot.status === "running"
-                ? "running"
-                : "pending",
-          detail: slot.output?.slice(0, 120),
-        }));
+        for (const slot of live.tools ?? []) {
+          const prev = stepMap.get(slot.callId);
+          const status =
+            prev?.status === "done" || prev?.status === "error"
+              ? prev.status
+              : slot.status === "done"
+                ? "done"
+                : slot.status === "running"
+                  ? "running"
+                  : "pending";
+          stepMap.set(slot.callId, {
+            id: slot.callId,
+            name: slot.name,
+            label: prev?.label || humanizeToolStepLabel(slot.name),
+            status,
+            detail:
+              prev?.detail ||
+              (slot.output ? summarizeToolOutput(slot.output) : undefined),
+          });
+        }
 
-        const statusText = summarizeStreamStatus(
+        const steps = [...stepMap.values()];
+        lastThinkingText = summarizeStreamStatus(
           steps,
           Boolean(cleanPartialText),
         );
-
-        const payload: ChatStreamPayload = {
-          chatId: req.chatId,
-          phase:
-            steps.some((s) => s.status === "running" || s.status === "pending")
-              ? "tools"
-              : cleanPartialText
-                ? "streaming"
-                : "thinking",
-          partialText: cleanPartialText || undefined,
-          thinkingText: statusText,
-          steps: steps.length > 0 ? steps : undefined,
-        };
-        this.bridge.notifyHost("host.chatStream", payload);
+        lastPhase = steps.some(
+          (s) => s.status === "running" || s.status === "pending",
+        )
+          ? "tools"
+          : cleanPartialText
+            ? "streaming"
+            : "thinking";
+        emitStream();
       });
 
       const submission = await conv.submit(
         {
           type: "input",
           content: submitContent,
-          whenBusy: "followUp",
+          whenBusy: req.whenBusy === "steer" ? "steer" : "followUp",
           requestId: req.requestId,
         },
         BACKGROUND_CONTEXT,
@@ -581,7 +812,13 @@ export class ValetDurableRuntime {
           answerText = stripThinkTags(answerText).cleanText.trim();
         }
       } else if (settled.status === "unanswered") {
-        answerText = `本轮执行未完成（原因：${settled.reason ?? "aborted"}）。`;
+        if (settled.reason === "aborted") {
+          answerText = lastPartialText
+            ? `${lastPartialText}\n\n*(已停止生成)*`
+            : "已按你的要求停止生成。";
+        } else {
+          answerText = `本轮执行未完成（原因：${settled.reason ?? "unknown"}）。`;
+        }
       }
 
       // Inspect newly committed entries for rich card details (`processTable`, `pluginDraft`)
@@ -595,11 +832,21 @@ export class ValetDurableRuntime {
         BACKGROUND_CONTEXT,
       );
 
+      const newEntries = recentEntries.filter(
+        (e) => !(initialLastEntryId && e.id === initialLastEntryId),
+      );
+      collectEntriesIntoStepMap([...newEntries].reverse());
+
+      const finalSteps: ChatStreamStep[] = [...stepMap.values()].map((s) =>
+        s.status === "running" || s.status === "pending"
+          ? { ...s, status: "done" }
+          : s,
+      );
+
       let processTable: ChatMessage["processTable"] | undefined;
       let pluginDraft: PluginDraftSpec | undefined;
 
-      for (const entry of recentEntries) {
-        if (initialLastEntryId && entry.id === initialLastEntryId) continue;
+      for (const entry of newEntries) {
         const toolMsg = entry.model?.[0];
         if (ToolResultEntry.is(entry) && toolMsg && toolMsg.role === "toolResult") {
           const det = toolMsg.details as
@@ -648,11 +895,15 @@ export class ValetDurableRuntime {
 
       return {
         replyMessage: {
-          id: `msg-${Date.now().toString(36)}`,
+          id:
+            settled.status === "done" && settled.type === "input"
+              ? `msg-${settled.answer}`
+              : `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
           role: "assistant",
           metaLabel: metaParts.join(" · "),
           createdAt: formatHHMM(),
           content: answerText || "已完成处理。",
+          ...(finalSteps.length > 0 ? { steps: finalSteps } : {}),
           ...(processTable ? { processTable } : {}),
           ...(pluginDraft ? { pluginDraft } : {}),
         },
@@ -670,13 +921,21 @@ export class ValetDurableRuntime {
       } satisfies ChatStreamPayload);
       throw error;
     } finally {
+      this.permissionCoordinator.abortChat(req.chatId, "回合已结束");
+      this.permissionCoordinator.setInteractiveChat(req.chatId, false);
+      this.permissionCoordinator.unregisterStreamEmitter(req.chatId);
       if (watch) {
         await watch.stop().catch(() => {});
       }
     }
   }
 
+  resolvePermission(req: ResolvePermissionRequest): { resolved: boolean } {
+    return { resolved: this.permissionCoordinator.resolve(req) };
+  }
+
   async abortChat(chatId: string): Promise<{ aborted: boolean }> {
+    this.permissionCoordinator.abortChat(chatId, "已停止生成");
     const conv = this.activeConversationHandles.get(chatId);
     if (!conv) return { aborted: false };
     await conv.abort(BACKGROUND_CONTEXT);
@@ -728,10 +987,13 @@ export class ValetDurableRuntime {
       };
     }
 
+    const skillNote = plugin.skillMarkdown?.trim()
+      ? `\n\n请严格按照该插件的 Skill 处理逻辑闭环执行：\n${plugin.skillMarkdown.trim()}`
+      : "";
     const eventChatId = `event:${plugin.id}`;
     const res = await this.sendChat({
       chatId: eventChatId,
-      prompt: `[EVENT_TRIGGER plugin=${plugin.id} event=${req.eventCode}] payload=${JSON.stringify(req.payload ?? {})}`,
+      prompt: `[EVENT_TRIGGER plugin=${plugin.id} event=${req.eventCode} policy=${policy}] payload=${JSON.stringify(req.payload ?? {})}${skillNote}`,
       model: this.state.preferences.models.fast,
     });
 
@@ -749,10 +1011,16 @@ export class ValetDurableRuntime {
     output: string;
   }> {
     const conv = await this.ensureConversation(`approved:${req.inboxId}`);
+    const effectiveToolName =
+      req.toolName === "disk_move_to_trash" || req.toolName === "app_trash_remnants"
+        ? "trash_files"
+        : req.toolName === "process_terminate"
+          ? "kill_process"
+          : req.toolName;
     const snap = this.registry.snapshot();
-    const matched = snap.tools().find((entry) => entry.tool.name === req.toolName);
+    const matched = snap.tools().find((entry) => entry.tool.name === effectiveToolName);
     if (!matched) {
-      return { ok: false, output: `Tool not registered: ${req.toolName}` };
+      return { ok: false, output: `Tool not registered: ${effectiveToolName}` };
     }
 
     const effectiveArgs: Record<string, unknown> = { ...req.toolArgs };
@@ -768,8 +1036,6 @@ export class ValetDurableRuntime {
 
     // Approve one-shot tool execution for this internal approved conversation
     this.approvedConversations.add(conv.id);
-    const savedResponses = undefined;
-    void savedResponses;
 
     const approvalFaux = this.models;
     const resultPromise = new Promise<{ ok: boolean; output: string }>(
@@ -786,8 +1052,8 @@ export class ValetDurableRuntime {
                 calledTool = true;
                 return fauxAssistantMessage(
                   [
-                    fauxThinking(`执行已人工批准的工具 ${req.toolName}`),
-                    fauxToolCall(req.toolName, effectiveArgs as never),
+                    fauxThinking(`执行已人工批准的工具 ${effectiveToolName}`),
+                    fauxToolCall(effectiveToolName, effectiveArgs as never),
                   ],
                   { stopReason: "toolUse" },
                 );

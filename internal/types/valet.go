@@ -39,6 +39,7 @@ type PluginRuntimeSettings struct {
 	AllowUnsignedLocal bool   `json:"allowUnsignedLocal"`
 	MaxEventsPerHour   string `json:"maxEventsPerHour"`
 	QuietHours         string `json:"quietHours"`
+	WebhookEndpoint    string `json:"webhookEndpoint,omitempty"`
 }
 
 // PermissionGuideStep describes one step in the permission grant wizard.
@@ -71,10 +72,12 @@ type PermissionItem struct {
 
 // PluginEventPolicy maps a plugin event code to a routing policy.
 type PluginEventPolicy struct {
-	ID          string `json:"id"`
-	Description string `json:"description"`
-	Policy      string `json:"policy"` // "auto" | "ask" | "record"
-	Count24h    int    `json:"count24h"`
+	ID            string `json:"id"`
+	Description   string `json:"description"`
+	Policy        string `json:"policy"` // "auto" | "ask" | "record"
+	Sensor        string `json:"sensor,omitempty"`
+	SourceSummary string `json:"sourceSummary,omitempty"`
+	Count24h      int    `json:"count24h"`
 }
 
 // PluginActionCapability describes an executable plugin capability and its safety level.
@@ -84,12 +87,24 @@ type PluginActionCapability struct {
 	SafetyLabel string `json:"safetyLabel"`
 }
 
+// PluginConfigField defines one declarative configuration input rendered dynamically on PluginDetailView.
+type PluginConfigField struct {
+	Key         string  `json:"key"`
+	Label       string  `json:"label"`
+	Type        string  `json:"type"` // "slider" | "number" | "text" | "boolean"
+	Min         float64 `json:"min,omitempty"`
+	Max         float64 `json:"max,omitempty"`
+	Default     any     `json:"default,omitempty"`
+	Description string  `json:"description,omitempty"`
+}
+
 // PluginConfig holds plugin-specific configuration fields.
 type PluginConfig struct {
-	LowSpaceThresholdPct *int     `json:"lowSpaceThresholdPct,omitempty"`
-	ProtectedPaths       []string `json:"protectedPaths,omitempty"`
-	SampleIntervalSec    *int     `json:"sampleIntervalSec,omitempty"`
-	CustomNote           string   `json:"customNote,omitempty"`
+	Values               map[string]any `json:"values,omitempty"`
+	LowSpaceThresholdPct *int           `json:"lowSpaceThresholdPct,omitempty"`
+	ProtectedPaths       []string       `json:"protectedPaths,omitempty"`
+	SampleIntervalSec    *int           `json:"sampleIntervalSec,omitempty"`
+	CustomNote           string         `json:"customNote,omitempty"`
 }
 
 // PluginState stores all metadata, state, and manifest YAML for a plugin.
@@ -116,9 +131,13 @@ type PluginState struct {
 	WeeklyImpactLabel       string                   `json:"weeklyImpactLabel,omitempty"`
 	Triggers24h             []int                    `json:"triggers24h"`
 	Events                  []PluginEventPolicy      `json:"events"`
-	Actions                 []PluginActionCapability `json:"actions"`
+	Actions                 []PluginActionCapability `json:"actions,omitempty"`
+	ConfigSchema            []PluginConfigField      `json:"configSchema,omitempty"`
 	Config                  PluginConfig             `json:"config"`
 	ManifestYAML            string                   `json:"manifestYaml"`
+	SkillMarkdown           string                   `json:"skillMarkdown,omitempty"`
+	LocalDir                string                   `json:"localDir,omitempty"`
+	BundledFiles            []string                 `json:"bundledFiles,omitempty"`
 }
 
 // TimelineActionItem represents an individual target item inside an inbox/timeline checklist.
@@ -250,6 +269,8 @@ type PluginDraftSpec struct {
 	WhenExpression   string `json:"whenExpression"`
 	ActionExpression string `json:"actionExpression"`
 	ManifestYAML     string `json:"manifestYaml"`
+	Sensor           string `json:"sensor,omitempty"`
+	SkillMarkdown    string `json:"skillMarkdown,omitempty"`
 	Installed        bool   `json:"installed,omitempty"`
 }
 
@@ -282,6 +303,7 @@ type ChatMessage struct {
 	MetaLabel    string               `json:"metaLabel,omitempty"`
 	CreatedAt    string               `json:"createdAt"`
 	Attachments  []ChatAttachment     `json:"attachments,omitempty"`
+	Steps        []ChatStreamStep     `json:"steps,omitempty"`
 	ProcessTable *ProcessTablePayload `json:"processTable,omitempty"`
 	PluginDraft  *PluginDraftSpec     `json:"pluginDraft,omitempty"`
 }
@@ -294,6 +316,8 @@ type ChatThread struct {
 	TimelineActionCount int           `json:"timelineActionCount"`
 	LinkedEventIDs      []string      `json:"linkedEventIds"`
 	UpdatedAt           string        `json:"updatedAt"`
+	Archived            bool          `json:"archived,omitempty"`
+	ArchivedAt          string        `json:"archivedAt,omitempty"`
 	Messages            []ChatMessage `json:"messages"`
 }
 
@@ -361,6 +385,27 @@ type MemoryEntry struct {
 	CreatedAt string `json:"createdAt"`
 }
 
+// AgentHeartbeatConfig configures periodic background health & safety inspection turns.
+type AgentHeartbeatConfig struct {
+	Enabled     bool   `json:"enabled"`
+	Initialized bool   `json:"initialized,omitempty"`
+	IntervalMin int    `json:"intervalMin"`
+	Prompt      string `json:"prompt"`
+	LastRunAt   string `json:"lastRunAt,omitempty"`
+}
+
+// HeartbeatRunLog records one periodic or manual Agent heartbeat inspection turn (stored separately from Timeline).
+type HeartbeatRunLog struct {
+	ID         string `json:"id"`
+	Timestamp  string `json:"timestamp"`
+	CreatedAt  string `json:"createdAt"`
+	Status     string `json:"status"` // "ok" | "error"
+	Model      string `json:"model,omitempty"`
+	DurationMs int    `json:"durationMs,omitempty"`
+	Summary    string `json:"summary"`
+	Detail     string `json:"detail,omitempty"`
+}
+
 // SafetyConfirmationChecklist tracks fine-grained confirmation switches.
 type SafetyConfirmationChecklist struct {
 	DeleteOrOverwrite    bool `json:"deleteOrOverwrite"`
@@ -370,6 +415,20 @@ type SafetyConfirmationChecklist struct {
 	ModifySystemSettings bool `json:"modifySystemSettings"`
 }
 
+// AutoReviewConfig configures the Auto Review permission evaluation engine
+// (TypeSafe AI Jev System One decision model + configurable small LLM fallback).
+type AutoReviewConfig struct {
+	Engine             string `json:"engine"` // "auto" | "jev" | "llm"
+	JevEndpoint        string `json:"jevEndpoint"`
+	JevAPIKey          string `json:"jevApiKey"`
+	JevAPIKeyMasked    string `json:"jevApiKeyMasked,omitempty"`
+	JevModel           string `json:"jevModel"`
+	JevVerified        bool   `json:"jevVerified,omitempty"`
+	JevLatencyMs       int    `json:"jevLatencyMs,omitempty"`
+	FallbackProviderID string `json:"fallbackProviderId,omitempty"`
+	FallbackModel      string `json:"fallbackModel"`
+}
+
 // ValetPreferences stores all Settings sections.
 type ValetPreferences struct {
 	LaunchAtLogin         bool                        `json:"launchAtLogin"`
@@ -377,21 +436,24 @@ type ValetPreferences struct {
 	Appearance            string                      `json:"appearance"` // "light" | "dark" | "auto"
 	Language              string                      `json:"language"`
 	GlobalHotkey          []string                    `json:"globalHotkey"`
+	BusyMessagePolicy     string                      `json:"busyMessagePolicy,omitempty"` // "queue" | "steer"
 	ActiveProviderID      string                      `json:"activeProviderId"`
 	Models                ModelSelection              `json:"models"`
+	AutoReview            AutoReviewConfig            `json:"autoReview"`
 	DailySpendCurrent     float64                     `json:"dailySpendCurrent"`
 	DailySpendLimit       float64                     `json:"dailySpendLimit"`
 	MaxStepsPerTask       int                         `json:"maxStepsPerTask"`
 	UserNickname          string                      `json:"userNickname"`
 	ToneStyle             string                      `json:"toneStyle"` // "formal" | "concise" | "friendly"
 	CustomInstructions    string                      `json:"customInstructions"`
-	AutonomyLevel         string                      `json:"autonomyLevel"` // "always_ask" | "sensitive_only" | "autonomous"
+	AutonomyLevel         string                      `json:"autonomyLevel"` // "always_ask" | "auto_review" | "full_access"
 	ConfirmChecklist      SafetyConfirmationChecklist `json:"confirmChecklist"`
 	BlockedApps           []string                    `json:"blockedApps"`
 	EmergencyStopShortcut []string                    `json:"emergencyStopShortcut"`
 	Thresholds            MonitoringThresholds        `json:"thresholds"`
 	CleanupPolicy         CleanupPolicySettings       `json:"cleanupPolicy"`
 	PluginRuntime         PluginRuntimeSettings       `json:"pluginRuntime"`
+	Heartbeat             AgentHeartbeatConfig        `json:"heartbeat"`
 	MemoryEnabled         bool                        `json:"memoryEnabled"`
 	AutoLearnMemory       bool                        `json:"autoLearnMemory"`
 	HoldToSpeakKey        string                      `json:"holdToSpeakKey"`
@@ -474,6 +536,7 @@ type ValetSnapshot struct {
 	Automations                []AutomationRule      `json:"automations"`
 	McpServers                 []McpServerItem       `json:"mcpServers"`
 	Memories                   []MemoryEntry         `json:"memories"`
+	HeartbeatLogs              []HeartbeatRunLog     `json:"heartbeatLogs"`
 	Preferences                ValetPreferences      `json:"preferences"`
 	SystemMetrics              SystemMetrics         `json:"systemMetrics"`
 	Scan                       ScanState             `json:"scan"`
@@ -505,6 +568,8 @@ type SendChatParams struct {
 	Model           string           `json:"model"`
 	MentionPluginID string           `json:"mentionPluginId,omitempty"`
 	Attachments     []ChatAttachment `json:"attachments,omitempty"`
+	BusyMode        string           `json:"busyMode,omitempty"` // "steer" | "followUp"
+	Interactive     bool             `json:"interactive,omitempty"`
 }
 
 // SendChatResult returns the completed turn message and any queued Inbox / Timeline items.
@@ -524,30 +589,72 @@ type SimulateEventResult struct {
 
 // InstallCustomPluginParams defines a user-submitted custom plugin manifest.
 type InstallCustomPluginParams struct {
-	Name    string `json:"name"`
-	Tagline string `json:"tagline"`
-	YAML    string `json:"yaml"`
+	Name          string `json:"name"`
+	Tagline       string `json:"tagline"`
+	YAML          string `json:"yaml"`
+	SkillMarkdown string `json:"skillMarkdown,omitempty"`
 }
 
 // ChatStreamStep tracks one live tool call during a turn.
 type ChatStreamStep struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
+	Label  string `json:"label,omitempty"`
 	Status string `json:"status"` // "pending" | "running" | "done" | "error"
 	Detail string `json:"detail,omitempty"`
 }
 
+// PendingPermissionRequest carries an interactive inline permission prompt for a live chat turn.
+type PendingPermissionRequest struct {
+	RequestID         string   `json:"requestId"`
+	ChatID            string   `json:"chatId"`
+	ToolName          string   `json:"toolName"`
+	Title             string   `json:"title"`
+	Summary           string   `json:"summary"`
+	Command           string   `json:"command,omitempty"`
+	Paths             []string `json:"paths,omitempty"`
+	TargetPath        string   `json:"targetPath,omitempty"`
+	Options           []string `json:"options,omitempty"`
+	ApproveLabel      string   `json:"approveLabel"`
+	AllowSessionLabel string   `json:"allowSessionLabel,omitempty"`
+	DismissLabel      string   `json:"dismissLabel"`
+}
+
 // ChatStreamPayload carries incremental thinking, tool steps, and text deltas to the frontend.
 type ChatStreamPayload struct {
-	ChatID       string           `json:"chatId"`
-	Phase        string           `json:"phase"` // "thinking" | "tools" | "streaming" | "done" | "error"
-	PartialText  string           `json:"partialText,omitempty"`
-	ThinkingText string           `json:"thinkingText,omitempty"`
-	Steps        []ChatStreamStep `json:"steps,omitempty"`
-	Error        string           `json:"error,omitempty"`
+	ChatID            string                    `json:"chatId"`
+	Phase             string                    `json:"phase"` // "thinking" | "tools" | "streaming" | "done" | "error"
+	PartialText       string                    `json:"partialText,omitempty"`
+	ThinkingText      string                    `json:"thinkingText,omitempty"`
+	Steps             []ChatStreamStep          `json:"steps,omitempty"`
+	PendingPermission *PendingPermissionRequest `json:"pendingPermission,omitempty"`
+	Error             string                    `json:"error,omitempty"`
 }
 
 // StateChangeNotice notifies frontend listeners when background agent or host work updates stored state.
 type StateChangeNotice struct {
 	Scope string `json:"scope"` // "full" | "inbox" | "timeline" | "plugins" | "settings"
+}
+
+// UpsertLocalPluginParams describes an authored or updated local plugin bundle on disk.
+type UpsertLocalPluginParams struct {
+	ID            string            `json:"id"`
+	Slug          string            `json:"slug,omitempty"`
+	Name          string            `json:"name"`
+	Tagline       string            `json:"tagline,omitempty"`
+	Description   string            `json:"description,omitempty"`
+	ManifestYAML  string            `json:"manifestYaml"`
+	SkillMarkdown string            `json:"skillMarkdown,omitempty"`
+	Files         map[string]string `json:"files,omitempty"`
+	LocalDir      string            `json:"localDir,omitempty"`
+	Enabled       *bool             `json:"enabled,omitempty"`
+}
+
+// BuiltinSkillMeta describes a built-in or user-authored Agent Skill synced to the sidecar.
+type BuiltinSkillMeta struct {
+	Name        string `json:"name"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Content     string `json:"content"`
+	Source      string `json:"source,omitempty"` // "builtin" | "user"
 }

@@ -17,12 +17,12 @@ const SETTINGS_QUICK_LINKS: Array<{
   title: string;
   subtitle: string;
 }> = [
-  { id: "thresholds", title: "设置 · 监控阈值", subtitle: "磁盘可用、CPU 异常、忽略进程与事件节流" },
-  { id: "cleanup", title: "设置 · 清理策略", subtitle: "废纸篓还原期、受保护目录与卸载后扫描" },
-  { id: "runtime", title: "设置 · 插件运行时", subtitle: "沙箱隔离、未签名本地插件与每小时上限" },
-  { id: "safety", title: "设置 · 自主与安全", subtitle: "自主程度、始终确认操作清单与紧急停止" },
+  { id: "heartbeat", title: "设置 · 心跳与自动化", subtitle: "Agent 主动值守心跳巡检与定时事件编排" },
+  { id: "thresholds", title: "设置 · 事件感知阈值", subtitle: "传感器何时将系统与应用状态变化作为事件呈报" },
+  { id: "runtime", title: "设置 · 插件与事件总线", subtitle: "沙箱隔离、未签名本地插件、Webhook 与限流" },
+  { id: "safety", title: "设置 · 自主与安全", subtitle: "自主边界、动作可逆保留期、受保护路径与紧急停止" },
   { id: "models", title: "设置 · 模型与服务商", subtitle: "API Key、每日花费上限与默认模型" },
-  { id: "general", title: "设置 · 通用与外观", subtitle: "深色/浅色主题、开机启动与全局快捷键" },
+  { id: "general", title: "设置 · 通用与外观", subtitle: "深色/浅色主题、开机启动与运行中消息策略" },
 ];
 
 export const CommandPalette: React.FC = () => {
@@ -165,7 +165,9 @@ export const CommandPalette: React.FC = () => {
       onSelect: () => openSettingsSection(sec.id),
     }));
 
-    const chats: PaletteItem[] = state.chatThreads.map((ch) => ({
+    const chats: PaletteItem[] = state.chatThreads
+      .filter((ch) => !ch.archived)
+      .map((ch) => ({
       id: `chat-${ch.id}`,
       group: "历史对话",
       title: ch.title,
@@ -216,7 +218,18 @@ export const CommandPalette: React.FC = () => {
 
   useEffect(() => {
     if (!commandPaletteOpen) return;
+    let lastCompEnd = 0;
+    const onCompEnd = () => {
+      lastCompEnd = performance.now();
+    };
     const onKeyDown = (e: KeyboardEvent) => {
+      if (
+        e.isComposing ||
+        e.keyCode === 229 ||
+        performance.now() - lastCompEnd < 100
+      ) {
+        return;
+      }
       if (e.key === "Escape") {
         setCommandPaletteOpen(false);
       } else if (e.key === "ArrowDown") {
@@ -236,8 +249,12 @@ export const CommandPalette: React.FC = () => {
         }
       }
     };
+    window.addEventListener("compositionend", onCompEnd, true);
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("compositionend", onCompEnd, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, [activeIndex, commandPaletteOpen, filtered, setCommandPaletteOpen]);
 
   if (!commandPaletteOpen) return null;
@@ -262,6 +279,9 @@ export const CommandPalette: React.FC = () => {
               setActiveIndex(0);
             }}
             placeholder="搜索动作、收件箱、时间线事件、插件、设置或对话…"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
             className="min-w-0 flex-1 bg-transparent text-[13px] text-[var(--ink-strong)] outline-none placeholder:text-[var(--ink-subtle)]"
           />
           <kbd className="rounded-[4px] border border-[var(--border-control)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-muted)]">

@@ -66,8 +66,129 @@ func OpenWithOptions(dataDir, homeDir string, stripAPIKeyFromDisk bool) (*Store,
 	}
 
 	normalizeLoadedSnapshot(&loaded)
+	addedSeed := appendMissingSeededPlugins(&loaded)
 	s.data = loaded
+	if addedSeed {
+		_ = s.saveLocked()
+	}
 	return s, nil
+}
+
+func appendMissingSeededPlugins(s *types.ValetSnapshot) bool {
+	catalog := seedPlugins()
+	seededMap := make(map[string]types.PluginState, len(catalog))
+	for _, seeded := range catalog {
+		seededMap[seeded.ID] = seeded
+	}
+
+	existing := make(map[string]bool, len(s.Plugins))
+	changed := false
+
+	for i := range s.Plugins {
+		cur := &s.Plugins[i]
+		existing[cur.ID] = true
+		if cur.Config.Values == nil {
+			cur.Config.Values = map[string]any{}
+		}
+		if len(cur.Actions) > 0 {
+			cur.Actions = nil
+			changed = true
+		}
+
+		seeded, ok := seededMap[cur.ID]
+		if !ok {
+			continue
+		}
+
+		isLegacyV1 := strings.Contains(cur.ManifestYAML, "\nactions:") ||
+			strings.Contains(cur.ManifestYAML, "actions:") ||
+			strings.Contains(cur.ManifestYAML, "metric_threshold") ||
+			(cur.ID == "surge-doctor" && cur.Slug != "surge-doctor")
+
+		if isLegacyV1 {
+			oldPolicyByID := make(map[string]types.PluginEventPolicy, len(cur.Events))
+			for _, ev := range cur.Events {
+				oldPolicyByID[ev.ID] = ev
+			}
+
+			cur.Slug = seeded.Slug
+			cur.Name = seeded.Name
+			cur.Tagline = seeded.Tagline
+			cur.Description = seeded.Description
+			cur.Version = seeded.Version
+			cur.BundleID = seeded.BundleID
+			cur.IconKind = seeded.IconKind
+			cur.IconLabel = seeded.IconLabel
+			cur.Source = seeded.Source
+			cur.RequiredPermission = seeded.RequiredPermission
+			cur.RequiredPermissionLabel = seeded.RequiredPermissionLabel
+			cur.DefaultBehaviorHint = seeded.DefaultBehaviorHint
+			cur.StatusSubtitle = seeded.StatusSubtitle
+			cur.ManifestYAML = seeded.ManifestYAML
+			cur.SkillMarkdown = seeded.SkillMarkdown
+			cur.ConfigSchema = append([]types.PluginConfigField(nil), seeded.ConfigSchema...)
+			cur.BundledFiles = append([]string(nil), seeded.BundledFiles...)
+			cur.Actions = nil
+			cur.LocalDir = ""
+
+			mergedEvents := make([]types.PluginEventPolicy, len(seeded.Events))
+			for idx, ev := range seeded.Events {
+				if prev, ok := oldPolicyByID[ev.ID]; ok {
+					if prev.Policy != "" {
+						ev.Policy = prev.Policy
+					}
+					ev.Count24h = prev.Count24h
+				}
+				mergedEvents[idx] = ev
+			}
+			cur.Events = mergedEvents
+			changed = true
+		} else {
+			if len(cur.ConfigSchema) == 0 && len(seeded.ConfigSchema) > 0 {
+				cur.ConfigSchema = append([]types.PluginConfigField(nil), seeded.ConfigSchema...)
+				changed = true
+			}
+			if len(cur.BundledFiles) == 0 && len(seeded.BundledFiles) > 0 {
+				cur.BundledFiles = append([]string(nil), seeded.BundledFiles...)
+				changed = true
+			}
+			if cur.Tagline == "" {
+				cur.Tagline = seeded.Tagline
+			}
+			if cur.Description == "" {
+				cur.Description = seeded.Description
+			}
+		}
+
+		// Ensure catalog defaults exist in Config.Values without overwriting user values
+		for k, v := range seeded.Config.Values {
+			if _, exists := cur.Config.Values[k]; !exists {
+				cur.Config.Values[k] = v
+				changed = true
+			}
+		}
+		if cur.Config.LowSpaceThresholdPct != nil {
+			if _, exists := cur.Config.Values["lowSpaceThresholdPct"]; !exists {
+				cur.Config.Values["lowSpaceThresholdPct"] = *cur.Config.LowSpaceThresholdPct
+				changed = true
+			}
+		}
+		if cur.Config.SampleIntervalSec != nil {
+			if _, exists := cur.Config.Values["sampleIntervalSec"]; !exists {
+				cur.Config.Values["sampleIntervalSec"] = *cur.Config.SampleIntervalSec
+				changed = true
+			}
+		}
+	}
+
+	for _, seeded := range catalog {
+		if !existing[seeded.ID] {
+			s.Plugins = append(s.Plugins, seeded)
+			existing[seeded.ID] = true
+			changed = true
+		}
+	}
+	return changed
 }
 
 func migrateLegacySnapshot(old types.ValetSnapshot, homeDir string) types.ValetSnapshot {
@@ -151,6 +272,105 @@ func normalizeLoadedSnapshot(s *types.ValetSnapshot) {
 	if s.Memories == nil {
 		s.Memories = []types.MemoryEntry{}
 	}
+	if s.HeartbeatLogs == nil {
+		s.HeartbeatLogs = []types.HeartbeatRunLog{}
+	}
+	for i := range s.Plugins {
+		if s.Plugins[i].Config.Values == nil {
+			s.Plugins[i].Config.Values = map[string]any{}
+		}
+		if !s.Plugins[i].Installed && s.Plugins[i].Enabled {
+			s.Plugins[i].Enabled = false
+		}
+		s.Plugins[i].Actions = nil
+	}
+	if len(s.TimelineEvents) > 0 {
+		kept := make([]types.TimelineEvent, 0, len(s.TimelineEvents))
+		existingIDs := make(map[string]bool, len(s.HeartbeatLogs))
+		for _, lg := range s.HeartbeatLogs {
+			existingIDs[lg.ID] = true
+		}
+		for _, ev := range s.TimelineEvents {
+			if ev.PluginID == "valet-core" && (ev.EventCode == "system.command" || ev.EventCode == "user.question") {
+				continue
+			}
+			if ev.EventCode == "agent.heartbeat" || ev.PluginBadge == "HB" {
+				if !existingIDs[ev.ID] {
+					s.HeartbeatLogs = append(s.HeartbeatLogs, types.HeartbeatRunLog{
+						ID:        ev.ID,
+						Timestamp: ev.Timestamp,
+						CreatedAt: ev.TimeLabel,
+						Status:    "ok",
+						Summary:   ev.Summary,
+						Detail:    ev.Summary,
+					})
+					existingIDs[ev.ID] = true
+				}
+				continue
+			}
+			kept = append(kept, ev)
+		}
+		s.TimelineEvents = kept
+	}
+	if s.Preferences.BusyMessagePolicy != "steer" && s.Preferences.BusyMessagePolicy != "queue" {
+		s.Preferences.BusyMessagePolicy = "queue"
+	}
+	if !s.Preferences.Heartbeat.Initialized {
+		def := DefaultHeartbeatConfig()
+		s.Preferences.Heartbeat.Enabled = true
+		s.Preferences.Heartbeat.Initialized = true
+		if s.Preferences.Heartbeat.IntervalMin <= 0 {
+			s.Preferences.Heartbeat.IntervalMin = def.IntervalMin
+		}
+		if strings.TrimSpace(s.Preferences.Heartbeat.Prompt) == "" ||
+			strings.Contains(s.Preferences.Heartbeat.Prompt, "巡检系统磁盘可用空间") {
+			s.Preferences.Heartbeat.Prompt = def.Prompt
+		}
+	}
+	if s.Preferences.Heartbeat.IntervalMin <= 0 {
+		s.Preferences.Heartbeat.IntervalMin = DefaultHeartbeatConfig().IntervalMin
+	}
+	if strings.TrimSpace(s.Preferences.Heartbeat.Prompt) == "" {
+		s.Preferences.Heartbeat.Prompt = DefaultHeartbeatConfig().Prompt
+	}
+
+	switch s.Preferences.AutonomyLevel {
+	case "always_ask", "auto_review", "full_access":
+	case "sensitive_only", "":
+		s.Preferences.AutonomyLevel = "auto_review"
+		// Upgrade legacy sensitive_only preset checklist so Auto Review evaluates these instead of short-circuiting.
+		if s.Preferences.ConfirmChecklist.DeleteOrOverwrite &&
+			s.Preferences.ConfirmChecklist.RunTerminalCommand &&
+			!s.Preferences.ConfirmChecklist.ModifySystemSettings {
+			s.Preferences.ConfirmChecklist.DeleteOrOverwrite = false
+			s.Preferences.ConfirmChecklist.RunTerminalCommand = false
+		}
+	case "autonomous":
+		s.Preferences.AutonomyLevel = "full_access"
+	default:
+		s.Preferences.AutonomyLevel = "auto_review"
+	}
+
+	defAR := DefaultAutoReviewConfig()
+	if s.Preferences.AutoReview.Engine != "auto" &&
+		s.Preferences.AutoReview.Engine != "jev" &&
+		s.Preferences.AutoReview.Engine != "llm" {
+		s.Preferences.AutoReview.Engine = defAR.Engine
+	}
+	if strings.TrimSpace(s.Preferences.AutoReview.JevEndpoint) == "" {
+		s.Preferences.AutoReview.JevEndpoint = defAR.JevEndpoint
+	}
+	if strings.TrimSpace(s.Preferences.AutoReview.JevModel) == "" {
+		s.Preferences.AutoReview.JevModel = defAR.JevModel
+	}
+	if strings.TrimSpace(s.Preferences.AutoReview.FallbackModel) == "" {
+		s.Preferences.AutoReview.FallbackModel = defAR.FallbackModel
+	}
+	if s.Preferences.AutoReview.JevAPIKey == "" && defAR.JevAPIKey != "" {
+		s.Preferences.AutoReview.JevAPIKey = defAR.JevAPIKey
+		s.Preferences.AutoReview.JevAPIKeyMasked = defAR.JevAPIKeyMasked
+		s.Preferences.AutoReview.JevVerified = true
+	}
 }
 
 // Snapshot returns a deep-cloned copy of the current application state.
@@ -177,6 +397,7 @@ func (s *Store) saveLocked() error {
 		for i := range toWrite.Providers {
 			toWrite.Providers[i].APIKey = ""
 		}
+		toWrite.Preferences.AutoReview.JevAPIKey = ""
 	}
 	data, err := json.MarshalIndent(toWrite, "", "  ")
 	if err != nil {

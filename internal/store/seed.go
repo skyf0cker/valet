@@ -7,12 +7,11 @@ import (
 	"strings"
 	"time"
 
+	"valet/internal/plugins"
 	"valet/internal/sys"
 	"valet/internal/types"
+	pluginsbundle "valet/plugins"
 )
-
-func strPtr(s string) *string { return &s }
-func intPtr(i int) *int       { return &i }
 
 // NewSeedSnapshot builds a Clean Slate SchemaVersion 2 initial state with real host metrics,
 // declarative core & community plugins, zero mock inbox/timeline/chat history, and real env provider keys if set.
@@ -50,6 +49,7 @@ func NewSeedSnapshot(homeDir string) types.ValetSnapshot {
 		Automations:                []types.AutomationRule{},
 		McpServers:                 []types.McpServerItem{},
 		Memories:                   []types.MemoryEntry{},
+		HeartbeatLogs:              []types.HeartbeatRunLog{},
 		Preferences:                prefs,
 		SystemMetrics:              metrics,
 		Scan:                       seedScanState(),
@@ -67,20 +67,22 @@ func seedPreferences() types.ValetPreferences {
 		Appearance:         "auto",
 		Language:           "简体中文",
 		GlobalHotkey:       []string{"⌥", "Space"},
+		BusyMessagePolicy:  "queue",
 		ActiveProviderID:   "anthropic",
 		Models:             types.ModelSelection{Primary: "claude-sonnet-4-5", Fast: "claude-haiku-4-5", Vision: "同主模型"},
+		AutoReview:         DefaultAutoReviewConfig(),
 		DailySpendCurrent:  0,
 		DailySpendLimit:    30,
 		MaxStepsPerTask:    50,
 		UserNickname:       nick,
 		ToneStyle:          "concise",
 		CustomInstructions: "",
-		AutonomyLevel:      "sensitive_only",
+		AutonomyLevel:      "auto_review",
 		ConfirmChecklist: types.SafetyConfirmationChecklist{
-			DeleteOrOverwrite:     true,
+			DeleteOrOverwrite:     false,
 			SendMessageOrEmail:    true,
 			PaymentOrSubscription: true,
-			RunTerminalCommand:    true,
+			RunTerminalCommand:    false,
 			ModifySystemSettings:  false,
 		},
 		BlockedApps:           []string{"钥匙串访问", "1Password"},
@@ -88,6 +90,7 @@ func seedPreferences() types.ValetPreferences {
 		Thresholds:            DefaultThresholds(),
 		CleanupPolicy:         DefaultCleanupPolicy(),
 		PluginRuntime:         DefaultPluginRuntime(),
+		Heartbeat:             DefaultHeartbeatConfig(),
 		MemoryEnabled:         true,
 		AutoLearnMemory:       true,
 		HoldToSpeakKey:        "fn",
@@ -127,6 +130,31 @@ func DefaultCleanupPolicy() types.CleanupPolicySettings {
 		RestoreRetentionDays:   "7 天",
 		ProtectedDirs:          []string{"~/Documents", "~/Projects"},
 		AutoScanAfterUninstall: true,
+	}
+}
+
+// DefaultHeartbeatConfig returns canonical agent periodic heartbeat inspection defaults.
+func DefaultHeartbeatConfig() types.AgentHeartbeatConfig {
+	return types.AgentHeartbeatConfig{
+		Enabled:     true,
+		Initialized: true,
+		IntervalMin: 30,
+		Prompt:      "巡检当前待处理的系统与应用事件、收件箱待确认事项及后台服务状态；若发现需要关注的异常则按自治策略响应或汇总至收件箱，若一切平稳则静默记录心跳。",
+	}
+}
+
+// DefaultAutoReviewConfig returns canonical Auto Review model evaluation defaults.
+func DefaultAutoReviewConfig() types.AutoReviewConfig {
+	jevEnv := strings.TrimSpace(os.Getenv("TYPESAFE_API_KEY"))
+	return types.AutoReviewConfig{
+		Engine:             "auto",
+		JevEndpoint:        "https://api.typesafe.ai/v1/systemone",
+		JevAPIKey:          jevEnv,
+		JevAPIKeyMasked:    maskKey(jevEnv),
+		JevModel:           "jev-latest",
+		JevVerified:        jevEnv != "",
+		FallbackProviderID: "",
+		FallbackModel:      "同快速模型",
 	}
 }
 
@@ -247,335 +275,12 @@ func seedPermissions() []types.PermissionItem {
 	}
 }
 
-func zeroBars() []int {
-	return []int{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
-}
-
 func seedPlugins() []types.PluginState {
-	return []types.PluginState{
-		{
-			ID: "disk-guard", Slug: "disk-guard", Name: "磁盘守卫",
-			Tagline: "可用空间检测、开发缓存清理与大文件回收",
-			Description: "通过 metric_threshold 传感器持续监测磁盘占用，并提供可撤销的缓存清理与安全回收工具。",
-			Version: "v1.2.0", BundleID: "com.valet.disk-guard", IconKind: "disk", Source: "core",
-			Enabled: true, Installed: true, RequiredPermission: "full_disk", RequiredPermissionLabel: "完全磁盘访问",
-			DefaultBehaviorHint: "扫描只读，删除自动进废纸篓或先问你", StatusSubtitle: "在岗监听中 · 每 30s 检查磁盘阈值",
-			Triggers24h: zeroBars(),
-			Events: []types.PluginEventPolicy{
-				{ID: "disk.low_space", Description: "可用空间低于设定阈值", Policy: "auto", Count24h: 0},
-				{ID: "disk.cache_bloat", Description: "开发缓存增长异常", Policy: "auto", Count24h: 0},
-				{ID: "disk.large_file", Description: "长期未访问的大文件建议回收", Policy: "ask", Count24h: 0},
-			},
-			Actions: []types.PluginActionCapability{
-				{ID: "disk.scan", Safety: "readonly", SafetyLabel: "只读"},
-				{ID: "disk.move_to_trash", Safety: "reversible", SafetyLabel: "可撤销 · 7 天"},
-				{ID: "disk.empty_trash", Safety: "confirm_always", SafetyLabel: "每次确认"},
-			},
-			Config: types.PluginConfig{LowSpaceThresholdPct: intPtr(15), ProtectedPaths: []string{"~/Documents", "~/Projects"}},
-			ManifestYAML: `id: com.valet.disk-guard
-name: 磁盘守卫
-version: 1.2.0
-permissions: [full_disk]
-triggers:
-  - id: disk.low_space
-    description: 可用空间低于阈值
-    sensor: metric_threshold
-    metric: disk.used_pct
-    operator: gt
-    threshold: 85
-    interval_sec: 30
-    policy: auto
-  - id: disk.large_file
-    description: 发现长期闲置大文件
-    sensor: manual
-    policy: ask
-actions:
-  - id: disk.scan
-    tool: disk_scan
-    driver: fs.scan_cleanable
-    safety: readonly
-    category: files
-    description: Read-only scan for safe developer caches and idle large files above size/age thresholds, skipping protected directories.
-  - id: disk.move_to_trash
-    tool: disk_move_to_trash
-    driver: fs.trash
-    event: disk.large_file
-    safety: reversible
-    category: files
-    checklist: deleteOrOverwrite
-    description: Move specific cache directories or idle large files into Trash (7-day reversible). Subject to Valet Inbox approval when required.
-  - id: disk.empty_trash
-    tool: disk_empty_trash
-    driver: fs.empty_trash
-    safety: confirm_always
-    category: files
-    checklist: deleteOrOverwrite
-    description: Audit and confirm permanently emptying Finder Trash.`,
-		},
-		{
-			ID: "uninstall-scrubber", Slug: "uninstall-scrubber", Name: "卸载清道夫",
-			Tagline: "监听 /Applications 卸载变更并排查残留缓存",
-			Description: "使用 fs_watch 传感器实时关注 /Applications 与 ~/Applications 移除的应用，自动排查 ~/Library 孤儿目录。",
-			Version: "v1.1.0", BundleID: "com.valet.uninstall-scrubber", IconKind: "trash", Source: "core",
-			Enabled: true, Installed: true, RequiredPermission: "full_disk", RequiredPermissionLabel: "完全磁盘访问",
-			DefaultBehaviorHint: "发现残留后先提交收件箱确认", StatusSubtitle: "在岗监听 /Applications 目录变更",
-			Triggers24h: zeroBars(),
-			Events: []types.PluginEventPolicy{
-				{ID: "app.uninstalled", Description: "检测到应用从 /Applications 移除", Policy: "ask", Count24h: 0},
-				{ID: "app.orphan_found", Description: "扫描到已移除应用的残留目录", Policy: "ask", Count24h: 0},
-			},
-			Actions: []types.PluginActionCapability{
-				{ID: "app.scan_remnants", Safety: "readonly", SafetyLabel: "只读"},
-				{ID: "app.trash_remnants", Safety: "reversible", SafetyLabel: "可撤销 · 7 天"},
-				{ID: "app.unload_agent", Safety: "confirm_always", SafetyLabel: "每次确认"},
-			},
-			Config: types.PluginConfig{ProtectedPaths: []string{"~/Documents/Exports"}},
-			ManifestYAML: `id: com.valet.uninstall-scrubber
-name: 卸载清道夫
-version: 1.1.0
-permissions: [full_disk]
-triggers:
-  - id: app.uninstalled
-    description: 检测到应用从应用程序目录移除
-    sensor: fs_watch
-    watch_dirs: [/Applications, ~/Applications]
-    ops: [remove]
-    glob: "*.app"
-    policy: ask
-  - id: app.orphan_found
-    description: 扫描到疑似遗留支持目录
-    sensor: manual
-    policy: ask
-actions:
-  - id: app.scan_remnants
-    tool: app_scan_remnants
-    driver: fs.scan_orphans
-    safety: readonly
-    category: files
-    description: Scan ~/Library/Caches for orphaned directories left by uninstalled apps.
-  - id: app.trash_remnants
-    tool: app_trash_remnants
-    driver: fs.trash
-    safety: reversible
-    category: files
-    checklist: deleteOrOverwrite
-    description: Move scanned orphaned app remnants to Trash cleanly.
-  - id: app.unload_agent
-    tool: app_unload_agent
-    driver: launchd.unload
-    safety: confirm_always
-    category: process
-    checklist: runTerminalCommand
-    description: Unload an orphaned LaunchAgent plist after confirmation.`,
-		},
-		{
-			ID: "process-sentinel", Slug: "process-sentinel", Name: "进程哨兵",
-			Tagline: "盯住 CPU 与内存异常占用的后台进程",
-			Description: "定期采样系统活跃进程，发现持续超高 CPU 占用或卡死进程时先征求你的意见。",
-			Version: "v1.0.4", BundleID: "com.valet.process-sentinel", IconKind: "pulse", Source: "core",
-			Enabled: true, Installed: true,
-			DefaultBehaviorHint: "无需额外权限 · 结束进程前始终询问", StatusSubtitle: "在岗采样中 · 监控异常 CPU 占用",
-			Triggers24h: zeroBars(),
-			Events: []types.PluginEventPolicy{
-				{ID: "process.cpu_spike", Description: "非忽略进程 CPU 持续超过阈值", Policy: "ask", Count24h: 0},
-				{ID: "memory.pressure", Description: "系统内存占用进入预警区", Policy: "record", Count24h: 0},
-			},
-			Actions: []types.PluginActionCapability{
-				{ID: "process.sample", Safety: "readonly", SafetyLabel: "只读"},
-				{ID: "process.terminate", Safety: "confirm_always", SafetyLabel: "每次确认"},
-			},
-			Config: types.PluginConfig{SampleIntervalSec: intPtr(15)},
-			ManifestYAML: `id: com.valet.process-sentinel
-name: 进程哨兵
-version: 1.0.4
-triggers:
-  - id: process.cpu_spike
-    description: 非忽略进程持续高 CPU 占用
-    sensor: metric_threshold
-    metric: proc.max_cpu
-    operator: gt
-    threshold: 200
-    interval_sec: 15
-    sustained_sec: 30
-    policy: ask
-actions:
-  - id: process.sample
-    tool: process_sample
-    driver: proc.sample
-    safety: readonly
-    category: process
-    ui_card: process_table
-    description: Sample top CPU and memory-consuming macOS processes right now.
-  - id: process.terminate
-    tool: process_terminate
-    driver: proc.signal
-    safety: confirm_always
-    category: process
-    checklist: runTerminalCommand
-    description: Send SIGTERM or SIGKILL to an abnormal process PID after user approval.`,
-		},
-		{
-			ID: "log-detective", Slug: "log-detective", Name: "日志侦探",
-			Tagline: "盯住 DiagnosticReports 新增崩溃日志并归因",
-			Description: "监听系统 DiagnosticReports 新出现的崩溃报告，分析高频故障进程原因。",
-			Version: "v1.0.2", BundleID: "com.valet.log-detective", IconKind: "log", Source: "core",
-			Enabled: false, Installed: true, RequiredPermission: "full_disk", RequiredPermissionLabel: "完全磁盘访问",
-			DefaultBehaviorHint: "默认仅记录并生成报告", StatusSubtitle: "已安装 · 暂未启用",
-			Triggers24h: zeroBars(),
-			Events: []types.PluginEventPolicy{
-				{ID: "log.crash_loop", Description: "检测到新的应用或系统崩溃报告", Policy: "record", Count24h: 0},
-			},
-			Actions: []types.PluginActionCapability{{ID: "log.summarize", Safety: "readonly", SafetyLabel: "只读"}},
-			Config:  types.PluginConfig{},
-			ManifestYAML: `id: com.valet.log-detective
-name: 日志侦探
-version: 1.0.2
-permissions: [full_disk]
-triggers:
-  - id: log.crash_loop
-    description: 检测到新的 DiagnosticReports 崩溃日志
-    sensor: metric_threshold
-    metric: logs.crash_count
-    interval_sec: 30
-    policy: record
-actions:
-  - id: log.summarize
-    tool: log_summarize_crashes
-    driver: log.summarize_crashes
-    safety: readonly
-    category: process
-    description: Inspect ~/Library/Logs/DiagnosticReports for recent crash logs and summarize culprits.`,
-		},
-		{
-			ID: "battery-guardian", Slug: "battery-guardian", Name: "电池健康",
-			Tagline: "实时读取电池电量、电源适配器与状态报告",
-			Description: "通过 macOS pmset 实时检查电源模式、电量百分比与充放电状态。",
-			Version: "v1.3.1", BundleID: "com.community.battery-guardian", IconKind: "battery", IconLabel: "⚡", Source: "community",
-			Enabled: false, Installed: false, StatusSubtitle: "可安装 · 社区扩展",
-			Triggers24h: zeroBars(),
-			Events:      []types.PluginEventPolicy{{ID: "battery.drain_spike", Description: "检查电池当前电源状态", Policy: "ask", Count24h: 0}},
-			Actions:     []types.PluginActionCapability{{ID: "battery.report", Safety: "readonly", SafetyLabel: "只读"}},
-			Config:      types.PluginConfig{},
-			ManifestYAML: `id: com.community.battery-guardian
-name: 电池健康
-version: 1.3.1
-triggers:
-  - id: battery.drain_spike
-    description: 电池耗电状态检查
-    sensor: manual
-    policy: ask
-actions:
-  - id: battery.report
-    tool: battery_status
-    driver: macos.battery_status
-    safety: readonly
-    category: process
-    description: Read live macOS battery level, charging state, and power source via pmset.`,
-		},
-		{
-			ID: "wifi-sentinel", Slug: "wifi-sentinel", Name: "Wi-Fi",
-			Tagline: "检查当前无线接口与网络状态",
-			Description: "采集当前机场/Wi-Fi SSID 与网络连接状态，协助排查断流与 DNS 异常。",
-			Version: "v1.0.6", BundleID: "com.community.wifi-sentinel", IconKind: "wifi", IconLabel: "Wi", Source: "community",
-			Enabled: false, Installed: false, StatusSubtitle: "可安装 · 社区扩展",
-			Triggers24h: zeroBars(),
-			Events:      []types.PluginEventPolicy{{ID: "net.ssid_changed", Description: "检查当前无线网络接入状态", Policy: "ask", Count24h: 0}},
-			Actions:     []types.PluginActionCapability{{ID: "net.flush_dns", Safety: "readonly", SafetyLabel: "只读"}},
-			Config:      types.PluginConfig{},
-			ManifestYAML: `id: com.community.wifi-sentinel
-name: Wi-Fi
-version: 1.0.6
-triggers:
-  - id: net.ssid_changed
-    description: 检查网络接口连接情况
-    sensor: manual
-    policy: ask
-actions:
-  - id: net.flush_dns
-    tool: wifi_status
-    driver: macos.network_status
-    safety: readonly
-    category: process
-    description: Read active macOS Wi-Fi network interface and SSID status.`,
-		},
-		{
-			ID: "github-watcher", Slug: "github-watcher", Name: "GitHub",
-			Tagline: "通过 HTTP 接口检查仓库 CI 状态或触发后续操作",
-			Description: "调用 net.http_json 驱动读取公开或已配置 URL 的构建状态，外发操作需经收件箱确认。",
-			Version: "v0.9.3", BundleID: "com.community.github", IconKind: "gh", IconLabel: "gh", Source: "community",
-			Enabled: false, Installed: false, StatusSubtitle: "可安装 · 社区扩展",
-			Triggers24h: zeroBars(),
-			Events: []types.PluginEventPolicy{
-				{ID: "github.ci_failed", Description: "仓库工作流失败告警", Policy: "ask", Count24h: 0},
-			},
-			Actions: []types.PluginActionCapability{
-				{ID: "github.fetch_logs", Safety: "readonly", SafetyLabel: "只读"},
-				{ID: "github.comment", Safety: "confirm_always", SafetyLabel: "每次确认"},
-			},
-			Config: types.PluginConfig{},
-			ManifestYAML: `id: com.community.github
-name: GitHub
-version: 0.9.3
-triggers:
-  - id: github.ci_failed
-    description: 检查 GitHub 仓库工作流状态
-    sensor: manual
-    policy: ask
-actions:
-  - id: github.fetch_logs
-    tool: github_fetch_failed_runs
-    driver: net.http_json
-    safety: readonly
-    category: outbound
-    description: Fetch JSON status from a GitHub API URL via net.http_json.
-  - id: github.comment
-    tool: github_post_comment
-    driver: plugin.noop
-    safety: confirm_always
-    category: outbound
-    checklist: sendMessageOrEmail
-    description: Prepare an outbound GitHub PR/Issue comment (requires Inbox confirmation).`,
-		},
-		{
-			ID: "calendar-focus", Slug: "calendar-focus", Name: "日历与专注",
-			Tagline: "会前自动进入勿扰状态，外发日程回复前先确认",
-			Description: "结合系统专注模式开关与安全外发拦截，防止误发送会议变更消息。",
-			Version: "v1.0.0", BundleID: "com.community.calendar-focus", IconKind: "calendar", IconLabel: "Cal", Source: "community",
-			Enabled: false, Installed: false, RequiredPermission: "automation", RequiredPermissionLabel: "自动化",
-			StatusSubtitle: "可安装 · 社区扩展",
-			Triggers24h: zeroBars(),
-			Events: []types.PluginEventPolicy{
-				{ID: "calendar.meeting_soon", Description: "日程临近专注提醒", Policy: "auto", Count24h: 0},
-			},
-			Actions: []types.PluginActionCapability{
-				{ID: "calendar.list", Safety: "readonly", SafetyLabel: "只读"},
-				{ID: "system.set_focus", Safety: "reversible", SafetyLabel: "可恢复"},
-			},
-			Config: types.PluginConfig{},
-			ManifestYAML: `id: com.community.calendar-focus
-name: 日历与专注
-version: 1.0.0
-permissions: [automation]
-triggers:
-  - id: calendar.meeting_soon
-    description: 会前专注模式切换
-    sensor: manual
-    policy: auto
-actions:
-  - id: calendar.list
-    tool: calendar_list_upcoming
-    driver: macos.calendar_upcoming
-    safety: readonly
-    category: outbound
-    description: Scan upcoming calendar schedule window.
-  - id: system.set_focus
-    tool: calendar_set_focus_mode
-    driver: macos.focus_mode
-    safety: reversible
-    category: outbound
-    description: Toggle macOS Focus mode state.`,
-		},
+	catalog, err := plugins.LoadCatalogFromFS(pluginsbundle.CatalogFS)
+	if err != nil {
+		return []types.PluginState{}
 	}
+	return catalog
 }
 
 func seedProviders() []types.AgentProviderConfig {
@@ -641,7 +346,7 @@ func seedChatThreads(primaryModel, nick string) []types.ChatThread {
 				{
 					ID: "welcome-default", Role: "assistant",
 					MetaLabel: fmt.Sprintf("%s · 就绪", primaryModel), CreatedAt: nowHHMM,
-					Content: fmt.Sprintf("%s好，我可以帮你排查 Mac 卡顿、扫描并安全清理磁盘缓存、查看系统崩溃日志，或者通过自然语言帮你生成一个常驻触发的本地插件。", nick),
+					Content: fmt.Sprintf("%s好，我是驻留在你 Mac 上的事件管家。我可以监听本机与外部事件、按策略自动响应异常，或用自然语言为你编排专属插件与 Skill。", nick),
 				},
 			},
 		},

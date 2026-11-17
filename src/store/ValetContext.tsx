@@ -45,6 +45,7 @@ import type {
   PluginDraftSpec,
   PluginState,
   ProviderId,
+  QueuedChatMessage,
   ScanTaskItem,
   SettingsSectionId,
   TimelineEvent,
@@ -78,6 +79,7 @@ function createCleanSlateShell(): ValetSnapshot {
     automations: [],
     mcpServers: [],
     memories: [],
+    heartbeatLogs: [],
     activeChatId: "chat-default",
     chatThreads: [
       {
@@ -112,6 +114,20 @@ function createCleanSlateShell(): ValetSnapshot {
   };
 }
 
+function normalizeClientAutonomy(raw?: string): AutonomyLevel {
+  switch (raw) {
+    case "always_ask":
+      return "always_ask";
+    case "full_access":
+    case "autonomous":
+      return "full_access";
+    case "auto_review":
+    case "sensitive_only":
+    default:
+      return "auto_review";
+  }
+}
+
 function loadInitialState(): ValetSnapshot {
   if (isMyGo()) {
     return createCleanSlateShell();
@@ -127,6 +143,7 @@ function loadInitialState(): ValetSnapshot {
       preferences: {
         ...base.preferences,
         ...(parsed.preferences ?? {}),
+        autonomyLevel: normalizeClientAutonomy(parsed.preferences?.autonomyLevel),
         confirmChecklist: {
           ...base.preferences.confirmChecklist,
           ...(parsed.preferences?.confirmChecklist ?? {}),
@@ -134,6 +151,10 @@ function loadInitialState(): ValetSnapshot {
         models: {
           ...base.preferences.models,
           ...(parsed.preferences?.models ?? {}),
+        },
+        autoReview: {
+          ...base.preferences.autoReview,
+          ...(parsed.preferences?.autoReview ?? {}),
         },
         thresholds: {
           ...DEFAULT_THRESHOLDS,
@@ -229,7 +250,9 @@ function mergeBackendSnapshot(
   remoteRaw: MyGoSnapshot
 ): ValetSnapshot {
   const remote = remoteRaw as unknown as ValetSnapshot;
-  const hasActiveChat = remote.chatThreads.some((t) => t.id === prev.activeChatId);
+  const hasActiveChat = remote.chatThreads.some(
+    (t) => t.id === prev.activeChatId && !t.archived
+  );
   return {
     ...prev,
     ...remote,
@@ -247,6 +270,8 @@ function mergeBackendSnapshot(
 export interface ValetContextValue {
   state: ValetSnapshot;
   chatStream: ChatStreamPayload | null;
+  runningChatIds: Record<string, number>;
+  queuedMessages: Record<string, QueuedChatMessage[]>;
   toasts: ToastMessage[];
   nodTick: number;
   commandPaletteOpen: boolean;
@@ -289,12 +314,25 @@ export interface ValetContextValue {
   // Plugins
   togglePluginEnabled: (pluginId: string) => void;
   installMarketplacePlugin: (pluginId: string) => void;
-  installCustomPlugin: (params: { name: string; tagline: string; yaml: string }) => void;
+  uninstallPlugin: (pluginId: string) => void;
+  installCustomPlugin: (params: {
+    name: string;
+    tagline: string;
+    yaml: string;
+    skillMarkdown?: string;
+  }) => void;
   updatePluginManifest: (pluginId: string, yaml: string) => void;
+  updatePluginSkill: (pluginId: string, skillMarkdown: string) => void;
+  reloadPlugin: (pluginId: string) => void;
   fixPluginAuth: (pluginId: string) => void;
   updatePluginEventPolicy: (pluginId: string, eventId: string, policy: EventPolicyMode) => void;
   updatePluginConfig: (pluginId: string, patch: Partial<PluginConfig>) => void;
   simulatePluginEvent: (pluginId: string, eventId: string) => void;
+  triggerCustomPluginEvent: (
+    pluginId: string,
+    eventId: string,
+    payloadJson?: string
+  ) => void;
 
   // Providers & Agent
   selectProvider: (providerId: ProviderId) => void;
@@ -316,12 +354,22 @@ export interface ValetContextValue {
   // Chat
   selectChatThread: (chatId: string) => void;
   createNewChat: () => void;
+  archiveChatThread: (chatId: string, archived?: boolean) => void;
   updateChatThreadModel: (chatId: string, model: string) => void;
   sendChatMessage: (params: {
     prompt: string;
     mentionPlugin: PluginState | null;
     attachments: ChatAttachment[];
   }) => Promise<void>;
+  resolveChatPermission: (
+    chatId: string,
+    requestId: string,
+    decision: "allow_once" | "allow_session" | "deny",
+    note?: string
+  ) => Promise<void>;
+  removeQueuedMessage: (chatId: string, queueId: string) => QueuedChatMessage | null;
+  sendQueuedMessageNow: (chatId: string, queueId: string) => Promise<void>;
+  abortChatMessage: (chatId?: string) => Promise<void>;
   performProcessAction: (
     chatId: string,
     messageId: string,
@@ -341,7 +389,10 @@ export interface ValetContextValue {
   addMcpServer: (server: Omit<McpServerItem, "id">) => void;
   deleteMcpServer: (id: string) => void;
   deleteMemory: (id: string) => void;
+  addMemoryEntry: (content: string, source?: string) => Promise<void>;
   clearMemories: () => void;
+  triggerHeartbeatNow: () => Promise<void>;
+  clearHeartbeatLogs: () => void;
   resetAllData: () => void;
 }
 
@@ -353,6 +404,11 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   stateRef.current = state;
 
   const [chatStream, setChatStream] = useState<ChatStreamPayload | null>(null);
+  const [runningChatIds, setRunningChatIds] = useState<Record<string, number>>({});
+  const runningChatCountRef = useRef<Record<string, number>>({});
+  const [queuedMessages, setQueuedMessages] = useState<Record<string, QueuedChatMessage[]>>({});
+  const queuedMessagesRef = useRef<Record<string, QueuedChatMessage[]>>({});
+  const abortedChatRef = useRef<Record<string, boolean>>({});
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [nodTick, setNodTick] = useState(0);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
@@ -1065,8 +1121,38 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     [pushToast, syncFromBackend, triggerNod]
   );
 
+  const uninstallPlugin = useCallback(
+    (pluginId: string) => {
+      if (isMyGo()) {
+        void Valet.uninstallPlugin(pluginId)
+          .then((snap) => {
+            setState((prev) => mergeBackendSnapshot(prev, snap));
+            triggerNod();
+            pushToast("插件已卸载，可在「发现」中重新安装", "success");
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+        return;
+      }
+      setState((prev) => ({
+        ...prev,
+        activePluginDetailId:
+          prev.activePluginDetailId === pluginId ? null : prev.activePluginDetailId,
+        plugins: prev.plugins.flatMap((pl) => {
+          if (pl.id !== pluginId) return [pl];
+          if (pl.source === "local") return [];
+          return [{ ...pl, installed: false, enabled: false, localDir: undefined }];
+        }),
+      }));
+      triggerNod();
+      pushToast("插件已卸载，可在「发现」中重新安装", "success");
+    },
+    [pushToast, triggerNod]
+  );
+
   const installCustomPlugin = useCallback(
-    (params: { name: string; tagline: string; yaml: string }) => {
+    (params: { name: string; tagline: string; yaml: string; skillMarkdown?: string }) => {
       if (isMyGo()) {
         void Valet.installCustomPlugin(params)
           .then((snap) => {
@@ -1086,7 +1172,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         slug,
         name: params.name.trim() || "自定义本地插件",
         tagline: params.tagline.trim() || "~/Valet/plugins/custom · 本地开发",
-        description: "通过本地 Manifest YAML 导入的自定义事件响应插件。",
+        description: "通过本地 Manifest YAML 与 Skill 创建的自定义事件处理插件。",
         version: "v0.1.0",
         bundleId: `local.valet.${slug}`,
         iconKind: "code",
@@ -1101,12 +1187,13 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             id: "custom.event_triggered",
             description: "自定义 Manifest 触发规则",
             policy: "ask",
+            sensor: "webhook",
             count24h: 0,
           },
         ],
-        actions: [{ id: "custom.run_action", safety: "reversible", safetyLabel: "可撤销" }],
-        config: {},
+        config: { values: {} },
         manifestYaml: params.yaml,
+        skillMarkdown: params.skillMarkdown?.trim() || undefined,
       };
       setState((prev) => ({
         ...prev,
@@ -1146,6 +1233,66 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }));
       triggerNod();
       pushToast("已保存插件 Manifest 并热重载", "success");
+    },
+    [pushToast, triggerNod]
+  );
+
+  const reloadPlugin = useCallback(
+    (pluginId: string) => {
+      if (isMyGo()) {
+        void Valet.reloadPlugin(pluginId)
+          .then((snap) => {
+            setState((prev) => mergeBackendSnapshot(prev, snap));
+            triggerNod();
+            pushToast("已从磁盘热重载插件", "success");
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+        return;
+      }
+      setState((prev) => ({
+        ...prev,
+        plugins: prev.plugins.map((pl) =>
+          pl.id === pluginId
+            ? { ...pl, statusSubtitle: "刚刚热重载 · 插件配置已刷新" }
+            : pl
+        ),
+      }));
+      triggerNod();
+      pushToast("已热重载插件", "success");
+    },
+    [pushToast, triggerNod]
+  );
+
+  const updatePluginSkill = useCallback(
+    (pluginId: string, skillMarkdown: string) => {
+      if (isMyGo()) {
+        void Valet.updatePluginSkill(pluginId, skillMarkdown)
+          .then((snap) => {
+            setState((prev) => mergeBackendSnapshot(prev, snap));
+            triggerNod();
+            pushToast("已保存插件 Skill 处理逻辑并热重载", "success");
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+        return;
+      }
+      setState((prev) => ({
+        ...prev,
+        plugins: prev.plugins.map((pl) =>
+          pl.id === pluginId
+            ? {
+                ...pl,
+                skillMarkdown: skillMarkdown.trim(),
+                statusSubtitle: "刚刚更新 Skill · 处理逻辑已热重载",
+              }
+            : pl
+        ),
+      }));
+      triggerNod();
+      pushToast("已保存插件 Skill 处理逻辑并热重载", "success");
     },
     [pushToast, triggerNod]
   );
@@ -1282,6 +1429,30 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     [pushToast, syncFromBackend, triggerNod]
   );
 
+  const triggerCustomPluginEvent = useCallback(
+    (pluginId: string, eventId: string, payloadJson?: string) => {
+      if (isMyGo()) {
+        void Valet.triggerPluginEvent(pluginId, eventId, payloadJson ?? "")
+          .then((res) => {
+            setArrivalNotice({
+              id: res.event.id,
+              pluginName: res.event.pluginName,
+              eventCode: eventId,
+            });
+            triggerNod();
+            pushToast("已注入事件并按 Skill 执行处理", "success");
+            syncFromBackend(Valet.getSnapshot());
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+        return;
+      }
+      simulatePluginEvent(pluginId, eventId);
+    },
+    [pushToast, simulatePluginEvent, syncFromBackend, triggerNod]
+  );
+
   const selectProvider = useCallback(
     (providerId: ProviderId) => {
       setState((prev) => {
@@ -1365,12 +1536,35 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   const setAutonomyLevel = useCallback(
     (level: AutonomyLevel) => {
-      setState((prev) => ({
-        ...prev,
-        preferences: { ...prev.preferences, autonomyLevel: level },
-      }));
+      const normalized = normalizeClientAutonomy(level);
+      setState((prev) => {
+        const nextChecklist =
+          normalized === "always_ask"
+            ? {
+                deleteOrOverwrite: true,
+                sendMessageOrEmail: true,
+                paymentOrSubscription: true,
+                runTerminalCommand: true,
+                modifySystemSettings: true,
+              }
+            : {
+                deleteOrOverwrite: false,
+                sendMessageOrEmail: true,
+                paymentOrSubscription: true,
+                runTerminalCommand: false,
+                modifySystemSettings: false,
+              };
+        return {
+          ...prev,
+          preferences: {
+            ...prev.preferences,
+            autonomyLevel: normalized,
+            confirmChecklist: nextChecklist,
+          },
+        };
+      });
       if (isMyGo()) {
-        syncFromBackend(Valet.setAutonomyLevel(level));
+        syncFromBackend(Valet.setAutonomyLevel(normalized));
       }
     },
     [syncFromBackend]
@@ -1800,7 +1994,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             role: "assistant",
             metaLabel: `${prev.preferences.models.primary} · 就绪`,
             createdAt: new Date().toTimeString().slice(0, 5),
-            content: `${prev.preferences.userNickname || "你"}好，我可以帮你排查 Mac 卡顿、清理磁盘缓存、查看崩溃日志，或者直接用自然语言帮你写一个本地插件。`,
+            content: `${prev.preferences.userNickname || "你"}好，我是驻留在你 Mac 上的事件管家。我可以监听本机与外部事件、按策略自动响应异常，或用自然语言为你编排专属插件与 Skill。`,
           },
         ],
       };
@@ -1812,6 +2006,66 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       };
     });
   }, [syncFromBackend]);
+
+  const archiveChatThread = useCallback(
+    (chatId: string, archived = true) => {
+      if (isMyGo()) {
+        syncFromBackend(Valet.archiveChatThread(chatId, archived), true);
+        pushToast(archived ? "对话已归档" : "已恢复归档对话", "success");
+        return;
+      }
+      setState((prev) => {
+        const nowTime = new Date().toTimeString().slice(0, 5);
+        let updated = prev.chatThreads.map((t) =>
+          t.id === chatId
+            ? {
+                ...t,
+                archived,
+                archivedAt: archived ? nowTime : undefined,
+              }
+            : t
+        );
+        const activeVisible = updated.filter((t) => !t.archived);
+        let nextActiveId = prev.activeChatId;
+        if (archived && prev.activeChatId === chatId) {
+          const firstVisible = activeVisible[0];
+          if (firstVisible) {
+            nextActiveId = firstVisible.id;
+          } else {
+            const newId = `chat-${Date.now().toString(36)}`;
+            const fallback: ChatThread = {
+              id: newId,
+              title: "新对话",
+              model: prev.preferences.models.primary,
+              timelineActionCount: 0,
+              linkedEventIds: [],
+              updatedAt: "刚刚",
+              messages: [
+                {
+                  id: `welcome-${newId}`,
+                  role: "assistant",
+                  metaLabel: `${prev.preferences.models.primary} · 就绪`,
+                  createdAt: nowTime,
+                  content: `${prev.preferences.userNickname || "你"}好，我是驻留在你 Mac 上的事件管家。我可以监听本机与外部事件、按策略自动响应异常，或用自然语言为你编排专属插件与 Skill。`,
+                },
+              ],
+            };
+            updated = [fallback, ...updated];
+            nextActiveId = newId;
+          }
+        } else if (!archived) {
+          nextActiveId = chatId;
+        }
+        return {
+          ...prev,
+          activeChatId: nextActiveId,
+          chatThreads: updated,
+        };
+      });
+      pushToast(archived ? "对话已归档" : "已恢复归档对话", "success");
+    },
+    [pushToast, syncFromBackend]
+  );
 
   const updateChatThreadModel = useCallback(
     (chatId: string, model: string) => {
@@ -1826,15 +2080,31 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     [syncFromBackend]
   );
 
-  const sendChatMessage = useCallback(
-    async (params: {
-      prompt: string;
-      mentionPlugin: PluginState | null;
-      attachments: ChatAttachment[];
-    }) => {
-      const activeId = stateRef.current.activeChatId;
-      const activeChat = stateRef.current.chatThreads.find((c) => c.id === activeId);
-      const model = stateRef.current.preferences.models.primary || activeChat?.model || "claude-opus-4";
+  const executeChatTurnRef = useRef<
+    ((
+      chatId: string,
+      params: {
+        prompt: string;
+        mentionPlugin: PluginState | null;
+        attachments: ChatAttachment[];
+      },
+      busyMode?: "steer" | "followUp"
+    ) => Promise<void>) | null
+  >(null);
+
+  const executeChatTurn = useCallback(
+    async (
+      chatId: string,
+      params: {
+        prompt: string;
+        mentionPlugin: PluginState | null;
+        attachments: ChatAttachment[];
+      },
+      busyMode?: "steer" | "followUp"
+    ) => {
+      const targetChat = stateRef.current.chatThreads.find((c) => c.id === chatId);
+      const model =
+        stateRef.current.preferences.models.primary || targetChat?.model || "claude-opus-4";
       const nowTime = new Date().toTimeString().slice(0, 5);
       const userMsg: ChatMessage = {
         id: `usr-${Date.now()}`,
@@ -1847,7 +2117,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setState((prev) => ({
         ...prev,
         chatThreads: prev.chatThreads.map((t) => {
-          if (t.id !== activeId) return t;
+          if (t.id !== chatId) return t;
           const nextTitle =
             t.title === "新对话" ? params.prompt.slice(0, 18) : t.title;
           return {
@@ -1859,14 +2129,31 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }),
       }));
 
+      const bumpRun = (delta: number) => {
+        const nextCount = Math.max(
+          0,
+          (runningChatCountRef.current[chatId] ?? 0) + delta
+        );
+        if (nextCount === 0) {
+          delete runningChatCountRef.current[chatId];
+        } else {
+          runningChatCountRef.current[chatId] = nextCount;
+        }
+        setRunningChatIds({ ...runningChatCountRef.current });
+        return nextCount;
+      };
+
+      bumpRun(1);
       triggerNod();
       try {
         const outcome = await valetService.sendChatMessage({
-          chatId: activeId,
+          chatId,
           prompt: params.prompt,
           model,
           mentionPlugin: params.mentionPlugin,
           attachments: params.attachments,
+          busyMode,
+          interactive: true,
         });
 
         if (isMyGo()) {
@@ -1882,7 +2169,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
               ? [outcome.createdInboxItem, ...prev.inboxItems]
               : prev.inboxItems,
             chatThreads: prev.chatThreads.map((t) => {
-              if (t.id !== activeId) return t;
+              if (t.id !== chatId) return t;
+              const exists = t.messages.some((m) => m.id === outcome.replyMessage.id);
               return {
                 ...t,
                 timelineActionCount:
@@ -1890,7 +2178,11 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 linkedEventIds: outcome.createdEvent
                   ? [outcome.createdEvent.id, ...t.linkedEventIds]
                   : t.linkedEventIds,
-                messages: [...t.messages, outcome.replyMessage],
+                messages: exists
+                  ? t.messages.map((m) =>
+                      m.id === outcome.replyMessage.id ? outcome.replyMessage : m
+                    )
+                  : [...t.messages, outcome.replyMessage],
               };
             }),
           }));
@@ -1902,10 +2194,137 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       } catch (err: unknown) {
         pushToast(err instanceof Error ? err.message : String(err), "danger");
       } finally {
-        setChatStream(null);
+        const remaining = bumpRun(-1);
+        if (remaining === 0) {
+          setChatStream((cur) => (cur?.chatId === chatId ? null : cur));
+          if (abortedChatRef.current[chatId]) {
+            delete abortedChatRef.current[chatId];
+          } else {
+            const list = queuedMessagesRef.current[chatId];
+            if (list && list.length > 0) {
+              const [nextItem, ...rest] = list;
+              if (rest.length === 0) {
+                delete queuedMessagesRef.current[chatId];
+              } else {
+                queuedMessagesRef.current[chatId] = rest;
+              }
+              setQueuedMessages({ ...queuedMessagesRef.current });
+              if (nextItem) {
+                void executeChatTurnRef.current?.(chatId, {
+                  prompt: nextItem.prompt,
+                  mentionPlugin: nextItem.mentionPlugin,
+                  attachments: nextItem.attachments,
+                });
+              }
+            }
+          }
+        }
       }
     },
     [pushToast, triggerNod]
+  );
+  executeChatTurnRef.current = executeChatTurn;
+
+  const sendChatMessage = useCallback(
+    async (params: {
+      prompt: string;
+      mentionPlugin: PluginState | null;
+      attachments: ChatAttachment[];
+    }) => {
+      const activeId = stateRef.current.activeChatId;
+      if (!activeId) return;
+      if ((runningChatCountRef.current[activeId] ?? 0) > 0) {
+        const policy = stateRef.current.preferences.busyMessagePolicy ?? "queue";
+        if (policy === "steer") {
+          await executeChatTurn(activeId, params, "steer");
+          return;
+        }
+        const item: QueuedChatMessage = {
+          id: `queue-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+          chatId: activeId,
+          prompt: params.prompt,
+          mentionPlugin: params.mentionPlugin,
+          attachments: params.attachments,
+          createdAt: new Date().toTimeString().slice(0, 5),
+        };
+        const prevList = queuedMessagesRef.current[activeId] ?? [];
+        queuedMessagesRef.current[activeId] = [...prevList, item];
+        setQueuedMessages({ ...queuedMessagesRef.current });
+        return;
+      }
+      await executeChatTurn(activeId, params, "followUp");
+    },
+    [executeChatTurn]
+  );
+
+  const removeQueuedMessage = useCallback(
+    (chatId: string, queueId: string): QueuedChatMessage | null => {
+      const prevList = queuedMessagesRef.current[chatId] ?? [];
+      const removed = prevList.find((it) => it.id === queueId) ?? null;
+      if (!removed) return null;
+      const nextList = prevList.filter((it) => it.id !== queueId);
+      if (nextList.length === 0) {
+        delete queuedMessagesRef.current[chatId];
+      } else {
+        queuedMessagesRef.current[chatId] = nextList;
+      }
+      setQueuedMessages({ ...queuedMessagesRef.current });
+      return removed;
+    },
+    []
+  );
+
+  const sendQueuedMessageNow = useCallback(
+    async (chatId: string, queueId: string) => {
+      const removed = removeQueuedMessage(chatId, queueId);
+      if (!removed) return;
+      delete abortedChatRef.current[chatId];
+      await executeChatTurn(
+        chatId,
+        {
+          prompt: removed.prompt,
+          mentionPlugin: removed.mentionPlugin,
+          attachments: removed.attachments,
+        },
+        "steer"
+      );
+    },
+    [executeChatTurn, removeQueuedMessage]
+  );
+
+  const abortChatMessage = useCallback(
+    async (chatId?: string) => {
+      const targetId = chatId || stateRef.current.activeChatId;
+      if (!targetId) return;
+      abortedChatRef.current[targetId] = true;
+      if (!isMyGo()) {
+        pushToast("当前处于预览模式", "warning");
+        return;
+      }
+      try {
+        await Valet.abortChat(targetId);
+        pushToast("已发送停止生成指令", "warning");
+      } catch (err: unknown) {
+        pushToast(err instanceof Error ? err.message : String(err), "danger");
+      }
+    },
+    [pushToast]
+  );
+
+  const resolveChatPermission = useCallback(
+    async (
+      chatId: string,
+      requestId: string,
+      decision: "allow_once" | "allow_session" | "deny",
+      note?: string
+    ) => {
+      try {
+        await valetService.resolveChatPermission(chatId, requestId, decision, note);
+      } catch (err: unknown) {
+        pushToast(err instanceof Error ? err.message : String(err), "danger");
+      }
+    },
+    [pushToast]
   );
 
   const performProcessAction = useCallback(
@@ -2019,14 +2438,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     count24h: 0,
                   },
                 ],
-                actions: [
-                  {
-                    id: "move_to_trash",
-                    safety: "reversible" as const,
-                    safetyLabel: "可撤销 · 7 天",
-                  },
-                ],
-                config: {},
+                config: { values: {} },
                 manifestYaml: draft.manifestYaml,
               },
             ];
@@ -2242,11 +2654,94 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     [syncFromBackend]
   );
 
+  const addMemoryEntry = useCallback(
+    async (content: string, source = "手动添加") => {
+      const trimmed = content.trim();
+      if (!trimmed) return;
+      if (isMyGo()) {
+        try {
+          const snap = await Valet.addMemory(trimmed, source);
+          setState((prev) => mergeBackendSnapshot(prev, snap));
+          pushToast("已保存本地记忆", "success");
+        } catch (err: unknown) {
+          pushToast(err instanceof Error ? err.message : String(err), "danger");
+        }
+        return;
+      }
+      setState((prev) => ({
+        ...prev,
+        memories: [
+          {
+            id: `mem-${Date.now().toString(36)}`,
+            content: trimmed,
+            source,
+            createdAt: "刚刚",
+          },
+          ...prev.memories,
+        ],
+      }));
+      pushToast("已保存本地记忆", "success");
+    },
+    [pushToast]
+  );
+
   const clearMemories = useCallback(() => {
     setState((prev) => ({ ...prev, memories: [] }));
     pushToast("已清空本地记忆", "warning");
     if (isMyGo()) {
       syncFromBackend(Valet.clearMemories());
+    }
+  }, [pushToast, syncFromBackend]);
+
+  const triggerHeartbeatNow = useCallback(async () => {
+    if (!isMyGo()) {
+      const now = new Date().toTimeString().slice(0, 5);
+      const summary = "系统整体运行平稳，暂无高危事件与待批阻塞事项。";
+      setState((prev) => ({
+        ...prev,
+        heartbeatLogs: [
+          {
+            id: `hb-log-${Date.now().toString(36)}`,
+            timestamp: new Date().toISOString(),
+            createdAt: now,
+            status: "ok",
+            model: prev.preferences.models.fast || prev.preferences.models.primary,
+            durationMs: 420,
+            summary,
+            detail: summary,
+          },
+          ...(prev.heartbeatLogs ?? []),
+        ].slice(0, 50),
+        preferences: {
+          ...prev.preferences,
+          heartbeat: {
+            enabled: prev.preferences.heartbeat?.enabled ?? true,
+            initialized: true,
+            intervalMin: prev.preferences.heartbeat?.intervalMin ?? 30,
+            prompt:
+              prev.preferences.heartbeat?.prompt ??
+              "巡检当前待处理的系统与应用事件、收件箱待确认事项及后台服务状态；若发现需要关注的异常则按自治策略响应或汇总至收件箱，若一切平稳则静默记录心跳。",
+            lastRunAt: now,
+          },
+        },
+      }));
+      pushToast("已执行一次 Agent 心跳巡检", "success");
+      return;
+    }
+    try {
+      const snap = await Valet.triggerHeartbeatNow();
+      setState((prev) => mergeBackendSnapshot(prev, snap));
+      pushToast("已完成一次 Agent 心跳巡检", "success");
+    } catch (err: unknown) {
+      pushToast(err instanceof Error ? err.message : String(err), "danger");
+    }
+  }, [pushToast]);
+
+  const clearHeartbeatLogs = useCallback(() => {
+    setState((prev) => ({ ...prev, heartbeatLogs: [] }));
+    pushToast("已清空心跳运行记录", "warning");
+    if (isMyGo()) {
+      syncFromBackend(Valet.clearHeartbeatLogs());
     }
   }, [pushToast, syncFromBackend]);
 
@@ -2265,6 +2760,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     () => ({
       state,
       chatStream,
+      queuedMessages,
+      runningChatIds,
       toasts,
       nodTick,
       commandPaletteOpen,
@@ -2297,12 +2794,16 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       refreshPermissions,
       togglePluginEnabled,
       installMarketplacePlugin,
+      uninstallPlugin,
       installCustomPlugin,
       updatePluginManifest,
+      updatePluginSkill,
+      reloadPlugin,
       fixPluginAuth,
       updatePluginEventPolicy,
       updatePluginConfig,
       simulatePluginEvent,
+      triggerCustomPluginEvent,
       selectProvider,
       updateProvider,
       updateModels,
@@ -2316,8 +2817,13 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       restoreTimelineEvent,
       selectChatThread,
       createNewChat,
+      archiveChatThread,
       updateChatThreadModel,
       sendChatMessage,
+      resolveChatPermission,
+      removeQueuedMessage,
+      sendQueuedMessageNow,
+      abortChatMessage,
       performProcessAction,
       installPluginDraft,
       updatePreferences,
@@ -2331,17 +2837,26 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       addMcpServer,
       deleteMcpServer,
       deleteMemory,
+      addMemoryEntry,
       clearMemories,
+      triggerHeartbeatNow,
+      clearHeartbeatLogs,
       resetAllData,
     }),
     [
+      abortChatMessage,
       addAutomationRule,
       addMcpServer,
+      addMemoryEntry,
       approveAllReversibleInboxItems,
       approveInboxItem,
+      archiveChatThread,
       arrivalNotice,
       chatStream,
+      queuedMessages,
+      runningChatIds,
       clearArrivalNotice,
+      clearHeartbeatLogs,
       clearMemories,
       commandPaletteOpen,
       completeOnboarding,
@@ -2366,9 +2881,12 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       pushToast,
       reconnectMcpServer,
       refreshPermissions,
+      reloadPlugin,
+      removeQueuedMessage,
       resetAllData,
       resetOnboarding,
       resetThresholdsToDefault,
+      resolveChatPermission,
       restoreApprovedInboxItem,
       restoreTimelineEvent,
       runAutomationNow,
@@ -2378,6 +2896,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       selectProvider,
       selectTimelineEvent,
       sendChatMessage,
+      sendQueuedMessageNow,
       setActiveSettingsSection,
       setActiveView,
       setAutonomyLevel,
@@ -2396,12 +2915,16 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       togglePluginEnabled,
       toggleSidebarCollapsed,
       toggleTimelineActionItem,
+      triggerCustomPluginEvent,
+      triggerHeartbeatNow,
       triggerNod,
+      uninstallPlugin,
       updateChatThreadModel,
       updateModels,
       updatePluginConfig,
       updatePluginEventPolicy,
       updatePluginManifest,
+      updatePluginSkill,
       updatePreferences,
       updateProvider,
     ]

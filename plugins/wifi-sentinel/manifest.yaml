@@ -1,0 +1,18 @@
+id: wifi-sentinel
+bundle_id: com.community.wifi-sentinel
+name: Wi-Fi
+tagline: 监听网络接口与 SSID 切换变化，辅助诊断断流与 DNS
+description: 通过 networksetup 监测本机 Wi-Fi 接入点与网卡变更，切换陌生公共网络或断流时快速排查代理与 DNS 配置。
+version: 1.0.6
+source: community
+icon: wifi
+icon_label: "Wi"
+default_installed: false
+triggers:
+  - id: net.wifi_changed
+    description: 检测到 Wi-Fi 接口或 SSID 变化
+    sensor: command_poll
+    command: "networksetup -getairportnetwork en0"
+    interval_sec: 30
+    emit_on: change
+    policy: auto

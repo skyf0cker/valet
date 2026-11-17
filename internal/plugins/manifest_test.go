@@ -1,13 +1,15 @@
 package plugins
 
 import (
-	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"valet/internal/types"
+	pluginsbundle "valet/plugins"
 )
 
 func TestParseCoreAndShorthandManifests(t *testing.T) {
@@ -17,31 +19,32 @@ version: 1.2.0
 permissions: [full_disk]
 triggers:
   - id: disk.low_space
-    sensor: metric_threshold
-    metric: disk.used_pct
-    operator: gt
-    threshold: 85
+    sensor: script_poll
+    script: scripts/poll-disk.mjs
+    interval_config_key: sampleIntervalSec
     interval_sec: 30
+    emit_on: json
     policy: auto
-actions:
-  - id: disk.scan
-    tool: disk_scan
-    driver: fs.scan_cleanable
-    safety: readonly
-  - id: disk.move_to_trash
-    tool: disk_move_to_trash
-    driver: fs.trash
-    safety: reversible
+config_schema:
+  - key: lowSpaceThresholdPct
+    label: 低空间告警阈值（可用百分比）
+    type: slider
+    min: 5
+    max: 40
+    default: 15
 `
 	parsed, err := ParseManifestYAML(coreDisk)
 	if err != nil {
 		t.Fatalf("ParseManifestYAML coreDisk failed: %v", err)
 	}
-	if len(parsed.TriggerSpecs) != 1 || parsed.TriggerSpecs[0].Sensor != "metric_threshold" {
+	if len(parsed.TriggerSpecs) != 1 || parsed.TriggerSpecs[0].Sensor != "script_poll" || parsed.TriggerSpecs[0].Script != "scripts/poll-disk.mjs" {
 		t.Fatalf("unexpected trigger specs: %+v", parsed.TriggerSpecs)
 	}
-	if len(parsed.ActionSpecs) != 2 || parsed.ActionSpecs[1].Driver != "fs.trash" || parsed.ActionSpecs[1].ToolName != "disk_move_to_trash" {
-		t.Fatalf("unexpected action specs: %+v", parsed.ActionSpecs)
+	if len(parsed.ActionSpecs) != 0 {
+		t.Fatalf("expected Action-less manifest with 0 ActionSpecs, got %+v", parsed.ActionSpecs)
+	}
+	if len(parsed.ConfigSchema) != 1 || parsed.ConfigSchema[0].Key != "lowSpaceThresholdPct" {
+		t.Fatalf("unexpected ConfigSchema: %+v", parsed.ConfigSchema)
 	}
 
 	shorthandDmg := `id: local.valet.dmg-cleaner
@@ -50,9 +53,6 @@ version: 0.1.0
 triggers:
   - event: fs.file_created
     glob: "~/Downloads/*.dmg"
-actions:
-  - move_to_trash:
-      retention_days: 7
 `
 	dmgParsed, err := ParseManifestYAML(shorthandDmg)
 	if err != nil {
@@ -61,8 +61,8 @@ actions:
 	if len(dmgParsed.TriggerSpecs) != 1 || dmgParsed.TriggerSpecs[0].Sensor != "fs_watch" || len(dmgParsed.TriggerSpecs[0].WatchDirs) == 0 || dmgParsed.TriggerSpecs[0].WatchDirs[0] != "~/Downloads" {
 		t.Fatalf("expected fs_watch sensor inferred from glob, got %+v", dmgParsed.TriggerSpecs)
 	}
-	if len(dmgParsed.ActionSpecs) != 1 || dmgParsed.ActionSpecs[0].Driver != "fs.trash" {
-		t.Fatalf("expected fs.trash driver inferred for move_to_trash, got %+v", dmgParsed.ActionSpecs)
+	if len(dmgParsed.ActionSpecs) != 0 {
+		t.Fatalf("expected 0 action specs, got %+v", dmgParsed.ActionSpecs)
 	}
 }
 
@@ -115,9 +115,13 @@ actions:
 		},
 	}
 
-	// Disabled plugin must refuse invocation
-	if _, err := eng.Invoke(context.Background(), snap, "dmg-cleaner", "move_to_trash", "", map[string]any{"path": "~/Downloads/a.dmg"}); err == nil {
-		t.Fatalf("expected disabled plugin invocation to be rejected")
+	// Disabled plugin must not register live fs_watch sensors
+	eng.Sync(snap)
+	eng.mu.Lock()
+	disabledWatches := len(eng.fsWatches)
+	eng.mu.Unlock()
+	if disabledWatches != 0 {
+		t.Fatalf("expected 0 active fs_watch sensors while plugin disabled, got %d", disabledWatches)
 	}
 
 	// Enable plugin and sync -> sensor should start watching Downloads
@@ -137,5 +141,224 @@ actions:
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for fs_watch plugin trigger on new .dmg file")
+	}
+}
+
+func TestParseExtendedSensorsAndSkillBlock(t *testing.T) {
+	rawYAML := `id: local.valet.dev-sentinel
+name: 开发哨兵
+version: 0.2.0
+permissions: [full_disk]
+skill: |
+  # Dev Sentinel Skill
+  - 当收到 deploy.failed Webhook 时，读取构建日志并总结失败原因。
+  - 若命令探针检测到版本变更，记录摘要。
+triggers:
+  - id: cmd.probe
+    sensor: command_poll
+    command: "echo ok"
+    interval_sec: 10
+    emit_on: change
+    policy: auto
+  - id: api.health
+    sensor: http_poll
+    url: "http://127.0.0.1:9999/healthz"
+    interval_sec: 15
+    emit_on: non_empty
+  - id: deploy.failed
+    sensor: webhook
+    policy: ask
+  - id: daily.digest
+    sensor: cron
+    schedule: "*/5 * * * *"
+actions:
+  - id: probe.exec
+    driver: shell.exec
+    command: "echo probe"
+    safety: readonly
+  - id: log.tail
+    driver: fs.read_text
+    path: "~/Library/Logs/build.log"
+    safety: readonly
+`
+	parsed, err := ParseManifestYAML(rawYAML)
+	if err != nil {
+		t.Fatalf("ParseManifestYAML failed: %v", err)
+	}
+	if !strings.Contains(parsed.Skill, "# Dev Sentinel Skill") || !strings.Contains(parsed.Skill, "deploy.failed Webhook") {
+		t.Fatalf("expected skill block scalar to be preserved, got %q", parsed.Skill)
+	}
+	if len(parsed.TriggerSpecs) != 4 {
+		t.Fatalf("expected 4 trigger specs, got %d (%+v)", len(parsed.TriggerSpecs), parsed.TriggerSpecs)
+	}
+	if parsed.TriggerSpecs[0].Sensor != "command_poll" || parsed.TriggerSpecs[0].Command != "echo ok" {
+		t.Fatalf("unexpected command_poll spec: %+v", parsed.TriggerSpecs[0])
+	}
+	if parsed.TriggerSpecs[1].Sensor != "http_poll" || parsed.TriggerSpecs[1].URL != "http://127.0.0.1:9999/healthz" {
+		t.Fatalf("unexpected http_poll spec: %+v", parsed.TriggerSpecs[1])
+	}
+	if parsed.TriggerSpecs[2].Sensor != "webhook" {
+		t.Fatalf("unexpected webhook spec: %+v", parsed.TriggerSpecs[2])
+	}
+	if parsed.TriggerSpecs[3].Sensor != "cron" || parsed.TriggerSpecs[3].Schedule != "*/5 * * * *" {
+		t.Fatalf("unexpected cron spec: %+v", parsed.TriggerSpecs[3])
+	}
+	if len(parsed.ActionSpecs) != 2 || parsed.ActionSpecs[0].Driver != "shell.exec" || parsed.ActionSpecs[1].Driver != "fs.read_text" {
+		t.Fatalf("unexpected action drivers: %+v", parsed.ActionSpecs)
+	}
+	cmdSummary := DescribeTriggerSource(parsed.TriggerSpecs[0])
+	hookSummary := DescribeTriggerSource(parsed.TriggerSpecs[2])
+	if !strings.Contains(cmdSummary, "command_poll") || !strings.Contains(hookSummary, "webhook") {
+		t.Fatalf("unexpected trigger source summary: cmd=%q hook=%q", cmdSummary, hookSummary)
+	}
+}
+
+func TestEngineCommandPollTriggersOnOutputChange(t *testing.T) {
+	tmpDir := t.TempDir()
+	probeFile := filepath.Join(tmpDir, "probe.txt")
+	if err := os.WriteFile(probeFile, []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	triggered := make(chan TriggerDispatch, 4)
+	eng := NewEngine(EngineConfig{
+		HomeDir: tmpDir,
+		DataDir: filepath.Join(tmpDir, "data"),
+		OnTrigger: func(d TriggerDispatch) {
+			triggered <- d
+		},
+	})
+	defer eng.Close()
+
+	plugin := types.PluginState{
+		ID:        "probe-watch",
+		Slug:      "probe-watch",
+		Name:      "探针监视器",
+		Version:   "0.1.0",
+		Source:    "local",
+		Installed: true,
+		Enabled:   true,
+		ManifestYAML: "id: local.valet.probe-watch\nname: 探针监视器\nversion: 0.1.0\ntriggers:\n  - id: probe.changed\n    sensor: command_poll\n    command: \"cat " + probeFile + "\"\n    interval_sec: 1\n    emit_on: change\n    policy: auto\n",
+	}
+
+	eng.Sync(types.ValetSnapshot{Plugins: []types.PluginState{plugin}})
+	time.Sleep(250 * time.Millisecond)
+
+	if err := os.WriteFile(probeFile, []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case ev := <-triggered:
+		if ev.PluginID != "probe-watch" || ev.EventCode != "probe.changed" {
+			t.Fatalf("unexpected command_poll dispatch: %+v", ev)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for command_poll output change trigger")
+	}
+}
+
+func TestCatalogBundlesActionLessAndScriptPollSensor(t *testing.T) {
+	catalog, err := LoadCatalogFromFS(pluginsbundle.CatalogFS)
+	if err != nil {
+		t.Fatalf("LoadCatalogFromFS failed: %v", err)
+	}
+	if len(catalog) < 9 {
+		t.Fatalf("expected >= 9 embedded catalog bundles, got %d", len(catalog))
+	}
+	var surgePlug *types.PluginState
+	for i := range catalog {
+		p := catalog[i]
+		if len(p.Actions) != 0 {
+			t.Fatalf("expected plugin %s to have 0 static actions, got %+v", p.ID, p.Actions)
+		}
+		if p.ID == "surge-doctor" {
+			cp := p
+			surgePlug = &cp
+		}
+	}
+	if surgePlug == nil {
+		t.Fatalf("expected surge-doctor in embedded catalog")
+	}
+
+	parsed, err := ParseManifestYAML(surgePlug.ManifestYAML)
+	if err != nil {
+		t.Fatalf("ParseManifestYAML(surge-doctor) failed: %v", err)
+	}
+	if len(parsed.TriggerSpecs) != 2 {
+		t.Fatalf("expected 2 trigger specs, got %d (%+v)", len(parsed.TriggerSpecs), parsed.TriggerSpecs)
+	}
+	if parsed.TriggerSpecs[0].ID != "surge.error_detected" ||
+		parsed.TriggerSpecs[0].Sensor != "script_poll" ||
+		parsed.TriggerSpecs[0].Script != "scripts/poll-errors.mjs" {
+		t.Fatalf("unexpected primary surge trigger: %+v", parsed.TriggerSpecs[0])
+	}
+	if parsed.TriggerSpecs[1].ID != "surge.webhook_alert" || parsed.TriggerSpecs[1].Sensor != "webhook" {
+		t.Fatalf("unexpected webhook surge trigger: %+v", parsed.TriggerSpecs[1])
+	}
+	if len(parsed.ConfigSchema) < 2 {
+		t.Fatalf("expected ConfigSchema fields on surge-doctor, got %+v", parsed.ConfigSchema)
+	}
+
+	tmpDir := t.TempDir()
+	dataDir := filepath.Join(tmpDir, "data")
+	logDir := filepath.Join(tmpDir, "Library", "Logs", "Surge")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	matDir, matFiles, err := MaterializeCatalogPlugin(pluginsbundle.CatalogFS, "surge-doctor", filepath.Join(dataDir, "plugins"))
+	if err != nil {
+		t.Fatalf("MaterializeCatalogPlugin(surge-doctor) failed: %v", err)
+	}
+	if len(matFiles) < 4 {
+		t.Fatalf("expected materialized files including scripts, got %+v", matFiles)
+	}
+
+	triggered := make(chan TriggerDispatch, 4)
+	eng := NewEngine(EngineConfig{
+		HomeDir: tmpDir,
+		DataDir: dataDir,
+		OnTrigger: func(d TriggerDispatch) {
+			triggered <- d
+		},
+	})
+	defer eng.Close()
+
+	fastManifest := strings.Replace(surgePlug.ManifestYAML, "interval_sec: 30", "interval_sec: 1", 1)
+	plugin := *surgePlug
+	plugin.Installed = true
+	plugin.Enabled = true
+	plugin.LocalDir = matDir
+	plugin.ManifestYAML = fastManifest
+	plugin.Config.Values = map[string]any{"pollIntervalSec": 1, "windowMinutes": 60}
+
+	eng.Sync(types.ValetSnapshot{Plugins: []types.PluginState{plugin}})
+	time.Sleep(150 * time.Millisecond)
+
+	nowTS := time.Now().Format("2006-01-02 15:04:05.123456")
+	line := nowTS + " <WARNING> [SGMProfileManager] Update config failed, URL: https://sub.example.com?token=liveSecret123, error: 第 12 行存在无效配置\n"
+	if err := os.WriteFile(filepath.Join(logDir, "Surge-live.log"), []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case ev := <-triggered:
+		if ev.PluginID != "surge-doctor" || ev.EventCode != "surge.error_detected" {
+			t.Fatalf("unexpected surge trigger event: %+v", ev)
+		}
+		raw, err := json.Marshal(ev.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(raw)
+		if !strings.Contains(body, "***REDACTED***") {
+			t.Fatalf("expected redacted token marker in payload, got %s", body)
+		}
+		if strings.Contains(body, "liveSecret123") {
+			t.Fatalf("expected liveSecret123 to be stripped from payload, got %s", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for script_poll surge.error_detected sensor trigger")
 	}
 }

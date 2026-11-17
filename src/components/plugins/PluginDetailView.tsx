@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from "react";
 import { useValet } from "../../store/ValetContext";
-import type { EventPolicyMode, PluginState } from "../../types/valet";
+import type { EventPolicyMode, PluginConfigField, PluginState } from "../../types/valet";
 import { SidebarToggleButton } from "../Sidebar";
 import { PluginBadgeIcon } from "../ui/Icons";
+import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { SegmentedControl } from "../ui/SegmentedControl";
 import { Slider } from "../ui/Slider";
+import { Switch } from "../ui/Switch";
 import { TagInputList } from "../ui/TagInputList";
 
 const POLICY_OPTIONS: Array<{ value: EventPolicyMode; label: string; widthClass: string }> = [
@@ -15,24 +17,35 @@ const POLICY_OPTIONS: Array<{ value: EventPolicyMode; label: string; widthClass:
 
 export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) => {
   const {
+    state,
     openPluginDetail,
     togglePluginEnabled,
+    uninstallPlugin,
     updatePluginEventPolicy,
     updatePluginConfig,
     updatePluginManifest,
+    updatePluginSkill,
+    reloadPlugin,
     simulatePluginEvent,
     setActiveView,
     setTimelinePluginFilter,
     fixPluginAuth,
+    pushToast,
   } = useValet();
 
   const [editingManifest, setEditingManifest] = useState(false);
   const [draftYaml, setDraftYaml] = useState(plugin.manifestYaml);
+  const [editingSkill, setEditingSkill] = useState(false);
+  const [draftSkill, setDraftSkill] = useState(plugin.skillMarkdown ?? "");
 
   useEffect(() => {
     setDraftYaml(plugin.manifestYaml);
     setEditingManifest(false);
-  }, [plugin.id, plugin.manifestYaml]);
+    setDraftSkill(plugin.skillMarkdown ?? "");
+    setEditingSkill(false);
+  }, [plugin.id, plugin.manifestYaml, plugin.skillMarkdown]);
+
+  const webhookBase = state.preferences.pluginRuntime.webhookEndpoint;
 
   const sourceLabel =
     plugin.source === "core"
@@ -42,59 +55,109 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
         : "社区插件";
 
   const total24h = plugin.events.reduce((acc, ev) => acc + ev.count24h, 0);
+  const schemaFields: PluginConfigField[] = plugin.configSchema ?? [];
+  const configValues: Record<string, unknown> = plugin.config.values ?? {};
+
+  const readFieldValue = (field: PluginConfigField): unknown => {
+    if (field.key in configValues && configValues[field.key] !== undefined) {
+      return configValues[field.key];
+    }
+    if (field.key === "lowSpaceThresholdPct" && plugin.config.lowSpaceThresholdPct !== undefined) {
+      return plugin.config.lowSpaceThresholdPct;
+    }
+    if (field.key === "sampleIntervalSec" && plugin.config.sampleIntervalSec !== undefined) {
+      return plugin.config.sampleIntervalSec;
+    }
+    if (field.key === "protectedPaths" && plugin.config.protectedPaths !== undefined) {
+      return plugin.config.protectedPaths;
+    }
+    return field.default;
+  };
+
+  const updateFieldValue = (key: string, value: unknown) => {
+    const nextValues = { ...configValues, [key]: value };
+    const patch: Partial<PluginState["config"]> = { values: nextValues };
+    if (key === "lowSpaceThresholdPct" && typeof value === "number") {
+      patch.lowSpaceThresholdPct = value;
+    } else if (key === "sampleIntervalSec" && typeof value === "number") {
+      patch.sampleIntervalSec = value;
+    } else if (key === "protectedPaths" && Array.isArray(value)) {
+      patch.protectedPaths = value.map(String);
+    }
+    updatePluginConfig(plugin.id, patch);
+  };
 
   return (
     <div className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-[var(--bg-canvas)]">
-      {/* Breadcrumb bar */}
-      <header className="app-drag flex h-[52px] shrink-0 items-center gap-2 pr-7 pl-6 lg:pl-12">
-        <SidebarToggleButton />
-        <button
-          type="button"
-          onClick={() => openPluginDetail(null)}
-          className="app-no-drag cursor-pointer text-[12px] text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
-        >
-          ‹ 插件
-        </button>
-        <span className="text-[12px] text-[var(--ink-faint)]">/</span>
-        <span className="text-[12px] font-semibold text-[var(--ink-strong)]">
-          {plugin.name}
-        </span>
-
-        <div className="flex-1" />
-
-        {plugin.authError && (
+      {/* Sticky Breadcrumb + Hero Header */}
+      <div className="z-10 flex shrink-0 flex-col bg-[var(--bg-canvas)]">
+        {/* Breadcrumb bar */}
+        <header className="app-drag flex h-[52px] shrink-0 items-center gap-2 pr-7 pl-6 lg:pl-12">
+          <SidebarToggleButton />
           <button
             type="button"
-            onClick={() => fixPluginAuth(plugin.id)}
-            className="app-no-drag inline-flex h-[30px] cursor-pointer items-center rounded-[8px] border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 text-[12px] font-semibold text-[var(--danger)]"
+            onClick={() => openPluginDetail(null)}
+            className="app-no-drag cursor-pointer text-[12px] text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
           >
-            修复授权
+            ‹ 插件
           </button>
-        )}
+          <span className="text-[12px] text-[var(--ink-faint)]">/</span>
+          <span className="text-[12px] font-semibold text-[var(--ink-strong)]">
+            {plugin.name}
+          </span>
 
-        <button
-          type="button"
-          onClick={() => {
-            setTimelinePluginFilter(plugin.id);
-            setActiveView("timeline");
-          }}
-          className="app-no-drag inline-flex h-[30px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3 text-[12px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
-        >
-          查看全部事件
-        </button>
+          <div className="flex-1" />
 
-        <button
-          type="button"
-          onClick={() => togglePluginEnabled(plugin.id)}
-          className="app-no-drag inline-flex h-[30px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3 text-[12px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
-        >
-          {plugin.enabled ? "停用" : "启用"}
-        </button>
-      </header>
+          {plugin.authError && (
+            <button
+              type="button"
+              onClick={() => fixPluginAuth(plugin.id)}
+              className="app-no-drag inline-flex h-[30px] cursor-pointer items-center rounded-[8px] border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 text-[12px] font-semibold text-[var(--danger)]"
+            >
+              修复授权
+            </button>
+          )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto pb-10">
+          <button
+            type="button"
+            onClick={() => {
+              setTimelinePluginFilter(plugin.id);
+              setActiveView("timeline");
+            }}
+            className="app-no-drag inline-flex h-[30px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3 text-[12px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+          >
+            查看全部事件
+          </button>
+
+          {(plugin.localDir || plugin.source === "local") && (
+            <button
+              type="button"
+              onClick={() => reloadPlugin(plugin.id)}
+              className="app-no-drag inline-flex h-[30px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3 text-[12px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+            >
+              热重载
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => togglePluginEnabled(plugin.id)}
+            className="app-no-drag inline-flex h-[30px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3 text-[12px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+          >
+            {plugin.enabled ? "停用" : "启用"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => uninstallPlugin(plugin.id)}
+            className="app-no-drag inline-flex h-[30px] cursor-pointer items-center rounded-[8px] border border-[var(--danger-border)] bg-[var(--danger-bg)]/60 px-3 text-[12px] font-medium text-[var(--danger)] hover:bg-[var(--danger-bg)]"
+          >
+            卸载
+          </button>
+        </header>
+
         {/* Hero */}
-        <div className="flex flex-wrap items-center gap-[18px] border-b border-[var(--border-light)] px-12 pt-2 pb-[22px]">
+        <div className="flex flex-wrap items-center gap-[18px] border-b border-[var(--border-light)] px-6 pt-2 pb-[22px] lg:px-12">
           <PluginBadgeIcon plugin={plugin} size="lg" />
 
           <div className="flex min-w-0 flex-1 flex-col gap-1.5">
@@ -107,6 +170,14 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
               <span>{plugin.version}</span>
               <span>·</span>
               <span className="text-[var(--ink-primary)]">{sourceLabel}</span>
+              {plugin.localDir && (
+                <>
+                  <span>·</span>
+                  <span className="max-w-[360px] truncate" title={plugin.localDir}>
+                    {plugin.localDir}
+                  </span>
+                </>
+              )}
               {plugin.requiredPermissionLabel && (
                 <>
                   <span>·</span>
@@ -137,9 +208,11 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
             </div>
           </div>
         </div>
+      </div>
 
+      <div className="min-h-0 flex-1 overflow-y-auto pb-10">
         {/* Body sections */}
-        <div className="flex flex-col gap-[26px] px-12 pt-[22px]">
+        <div className="flex flex-col gap-[26px] px-6 pt-[22px] lg:px-12">
           {/* Event policies */}
           <section className="flex flex-col">
             <div className="flex items-baseline justify-between pb-2.5">
@@ -158,43 +231,145 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
 
             {plugin.events.map((ev, idx) => {
               const isLast = idx === plugin.events.length - 1;
+              const webhookUrl = webhookBase ? `${webhookBase}/${plugin.id}/${ev.id}` : "";
               return (
                 <div
                   key={ev.id}
-                  className={`flex min-h-[52px] flex-wrap items-center gap-4 border-t border-[var(--border-subtle)] py-2 ${
+                  className={`flex min-h-[56px] flex-wrap items-center gap-x-5 gap-y-2.5 border-t border-[var(--border-subtle)] py-3 ${
                     isLast ? "border-b border-b-[var(--border-light)]" : ""
                   }`}
                 >
-                  <span className="w-[190px] shrink-0 font-mono text-[12px] font-semibold text-[var(--ink-strong)]">
-                    {ev.id}
-                  </span>
-                  <span className="min-w-[160px] flex-1 text-[13px] text-[var(--ink-secondary)]">
+                  <div className="flex w-full min-w-0 shrink-0 flex-col gap-1 overflow-hidden lg:w-[280px]">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="break-all font-mono text-[12px] font-semibold leading-[16px] text-[var(--ink-strong)]">
+                        {ev.id}
+                      </span>
+                      {ev.sensor && (
+                        <span className="shrink-0 rounded-[4px] border border-[var(--border-control)] bg-[var(--bg-subtle)] px-1.5 py-[1px] font-mono text-[9.5px] leading-[14px] text-[var(--ink-muted)]">
+                          {ev.sensor}
+                        </span>
+                      )}
+                    </div>
+                    {ev.sourceSummary && (
+                      <div
+                        title={ev.sourceSummary}
+                        className="truncate font-mono text-[10px] leading-[14px] text-[var(--ink-subtle)]"
+                      >
+                        {ev.sourceSummary}
+                      </div>
+                    )}
+                  </div>
+                  <span className="min-w-[180px] flex-1 text-[13px] leading-[19px] text-[var(--ink-secondary)]">
                     {ev.description}
                   </span>
 
-                  <SegmentedControl<EventPolicyMode>
-                    variant="ink"
-                    value={ev.policy}
-                    options={POLICY_OPTIONS}
-                    onChange={(next) => updatePluginEventPolicy(plugin.id, ev.id, next)}
-                  />
+                  <div className="ml-auto flex shrink-0 items-center gap-2.5">
+                    <SegmentedControl<EventPolicyMode>
+                      variant="ink"
+                      value={ev.policy}
+                      options={POLICY_OPTIONS}
+                      onChange={(next) => updatePluginEventPolicy(plugin.id, ev.id, next)}
+                    />
 
-                  <span className="w-9 shrink-0 text-right font-mono text-[12px] text-[var(--ink-strong)]">
-                    {ev.count24h}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => simulatePluginEvent(plugin.id, ev.id)}
-                    className="inline-flex h-[24px] shrink-0 cursor-pointer items-center rounded-[6px] border border-[var(--border-control)] px-2 text-[11px] font-medium text-[var(--ink-muted)] hover:border-[var(--border-strong)] hover:text-[var(--ink-strong)]"
-                  >
-                    测试触发
-                  </button>
+                    <span className="w-8 shrink-0 text-right font-mono text-[12px] text-[var(--ink-strong)]">
+                      {ev.count24h}
+                    </span>
+                    {webhookUrl && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void navigator.clipboard?.writeText(webhookUrl);
+                          pushToast(`已复制事件推送端点 ${webhookUrl}`, "success");
+                        }}
+                        title={webhookUrl}
+                        className="inline-flex h-[24px] shrink-0 cursor-pointer items-center rounded-[6px] border border-[var(--border-control)] px-2 font-mono text-[10px] text-[var(--ink-muted)] hover:border-[var(--border-strong)] hover:text-[var(--ink-strong)]"
+                      >
+                        Webhook
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => simulatePluginEvent(plugin.id, ev.id)}
+                      className="inline-flex h-[24px] shrink-0 cursor-pointer items-center rounded-[6px] border border-[var(--border-control)] px-2 text-[11px] font-medium text-[var(--ink-muted)] hover:border-[var(--border-strong)] hover:text-[var(--ink-strong)]"
+                    >
+                      测试触发
+                    </button>
+                  </div>
                 </div>
               );
             })}
           </section>
 
-          {/* Bottom 2 columns: Config & Actions */}
+          {/* Skill Handling Logic (SKILL.md) */}
+          <section className="flex flex-col gap-2.5 border-t border-[var(--border-subtle)] pt-5">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-baseline gap-2.5">
+                <h2 className="font-[family-name:var(--font-serif-zh)] text-[18px] font-semibold leading-[22px] text-[var(--ink-strong)]">
+                  Skill 处理逻辑（SKILL.md）
+                </h2>
+                <span className="text-[12px] text-[var(--ink-muted)]">
+                  定义事件触发或 @该插件 时，Agent 如何借助核心通用工具排查与处理
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                {editingSkill ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDraftSkill(plugin.skillMarkdown ?? "");
+                        setEditingSkill(false);
+                      }}
+                      className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-2.5 text-[11px] font-medium text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        updatePluginSkill(plugin.id, draftSkill);
+                        setEditingSkill(false);
+                      }}
+                      className="inline-flex h-7 cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] px-3 text-[11px] font-semibold text-[var(--ink-on-primary)]"
+                    >
+                      保存并热重载
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setEditingSkill(true)}
+                    className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-2.5 text-[11px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                  >
+                    编辑 Skill
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {editingSkill ? (
+              <textarea
+                value={draftSkill}
+                onChange={(e) => setDraftSkill(e.target.value)}
+                rows={8}
+                placeholder="使用 Markdown 描述触发条件、Payload 字段含义、工具调用步骤与安全边界…"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+                className="w-full rounded-[10px] border border-[var(--border-control)] bg-[var(--bg-subtle)] p-3.5 font-mono text-[12px] leading-[18px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+              />
+            ) : plugin.skillMarkdown ? (
+              <div className="rounded-[10px] border border-[var(--border-light)] bg-[var(--bg-subtle)] p-4 text-[13px] leading-[20px] text-[var(--ink-body)]">
+                <MarkdownRenderer text={plugin.skillMarkdown} />
+              </div>
+            ) : (
+              <div className="rounded-[10px] border border-dashed border-[var(--border-dash)] px-4 py-3 text-[12px] text-[var(--ink-subtle)]">
+                尚未配置 Skill 说明，点击右上角「编辑 Skill」补充处理逻辑以形成闭环。
+              </div>
+            )}
+          </section>
+
+          {/* Bottom 2 columns: Dynamic Config & Bundle Files */}
           <div className="flex flex-col gap-10 md:flex-row">
             {/* Left config */}
             <section className="flex flex-1 flex-col gap-3.5">
@@ -202,7 +377,92 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
                 配置
               </h2>
 
-              {plugin.config.lowSpaceThresholdPct !== undefined && (
+              {schemaFields.map((field) => {
+                const val = readFieldValue(field);
+                if (field.type === "slider" || field.type === "number") {
+                  const fallbackNum =
+                    typeof field.default === "number"
+                      ? field.default
+                      : (field.min ?? 1);
+                  const numVal =
+                    typeof val === "number" && Number.isFinite(val)
+                      ? val
+                      : Number(val ?? fallbackNum) || fallbackNum;
+                  return (
+                    <div key={field.key} className="flex flex-col gap-2">
+                      <div className="flex items-baseline justify-between gap-2">
+                        <div>
+                          <span className="text-[13px] font-medium text-[var(--ink-strong)]">
+                            {field.label}
+                          </span>
+                          {field.description && (
+                            <div className="text-[11px] text-[var(--ink-subtle)]">
+                              {field.description}
+                            </div>
+                          )}
+                        </div>
+                        <span className="font-mono text-[12px] font-semibold text-[var(--ink-strong)]">
+                          {numVal}
+                        </span>
+                      </div>
+                      <Slider
+                        min={field.min ?? 1}
+                        max={field.max ?? 120}
+                        step={1}
+                        value={numVal}
+                        ariaLabel={field.label}
+                        onChange={(nextVal) => updateFieldValue(field.key, nextVal)}
+                      />
+                    </div>
+                  );
+                }
+
+                if (field.type === "boolean") {
+                  return (
+                    <div key={field.key} className="flex items-center justify-between gap-3 py-1">
+                      <div>
+                        <div className="text-[13px] font-medium text-[var(--ink-strong)]">
+                          {field.label}
+                        </div>
+                        {field.description && (
+                          <div className="text-[11px] text-[var(--ink-subtle)]">
+                            {field.description}
+                          </div>
+                        )}
+                      </div>
+                      <Switch
+                        checked={Boolean(val)}
+                        onChange={(nextVal) => updateFieldValue(field.key, nextVal)}
+                        ariaLabel={field.label}
+                      />
+                    </div>
+                  );
+                }
+
+                return (
+                  <label key={field.key} className="flex flex-col gap-1">
+                    <span className="text-[13px] font-medium text-[var(--ink-strong)]">
+                      {field.label}
+                    </span>
+                    {field.description && (
+                      <span className="text-[11px] text-[var(--ink-subtle)]">
+                        {field.description}
+                      </span>
+                    )}
+                    <input
+                      type="text"
+                      value={String(val ?? "")}
+                      onChange={(e) => updateFieldValue(field.key, e.target.value)}
+                      autoCorrect="off"
+                      autoCapitalize="off"
+                      spellCheck={false}
+                      className="h-[32px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-subtle)] px-2.5 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                    />
+                  </label>
+                );
+              })}
+
+              {schemaFields.length === 0 && plugin.config.lowSpaceThresholdPct !== undefined && (
                 <div className="flex flex-col gap-2.5">
                   <div className="flex justify-between">
                     <span className="text-[13px] font-medium text-[var(--ink-strong)]">
@@ -217,18 +477,16 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
                     max={40}
                     value={plugin.config.lowSpaceThresholdPct}
                     ariaLabel="低空间阈值百分比"
-                    onChange={(val) =>
-                      updatePluginConfig(plugin.id, { lowSpaceThresholdPct: val })
-                    }
+                    onChange={(val) => updateFieldValue("lowSpaceThresholdPct", val)}
                   />
                 </div>
               )}
 
-              {plugin.config.sampleIntervalSec !== undefined && (
+              {schemaFields.length === 0 && plugin.config.sampleIntervalSec !== undefined && (
                 <div className="flex flex-col gap-2.5">
                   <div className="flex justify-between">
                     <span className="text-[13px] font-medium text-[var(--ink-strong)]">
-                      进程采样间隔
+                      采样间隔
                     </span>
                     <span className="font-mono text-[12px] font-semibold text-[var(--ink-strong)]">
                       {plugin.config.sampleIntervalSec} 秒
@@ -236,57 +494,72 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
                   </div>
                   <Slider
                     min={2}
-                    max={30}
+                    max={60}
                     value={plugin.config.sampleIntervalSec}
-                    ariaLabel="进程采样间隔秒数"
-                    onChange={(val) =>
-                      updatePluginConfig(plugin.id, { sampleIntervalSec: val })
-                    }
+                    ariaLabel="采样间隔秒数"
+                    onChange={(val) => updateFieldValue("sampleIntervalSec", val)}
                   />
                 </div>
               )}
 
-              <div className="flex flex-col gap-2">
-                <div className="text-[13px] font-medium text-[var(--ink-strong)]">
-                  受保护目录{" "}
-                  <span className="text-[12px] font-normal text-[var(--ink-subtle)]">
-                    · 永不清理
-                  </span>
+              {plugin.config.protectedPaths !== undefined && (
+                <div className="flex flex-col gap-2">
+                  <div className="text-[13px] font-medium text-[var(--ink-strong)]">
+                    受保护目录{" "}
+                    <span className="text-[12px] font-normal text-[var(--ink-subtle)]">
+                      · 严禁改动
+                    </span>
+                  </div>
+                  <TagInputList
+                    items={plugin.config.protectedPaths ?? []}
+                    onChange={(next) =>
+                      updatePluginConfig(plugin.id, { protectedPaths: next })
+                    }
+                    mono
+                    removable={false}
+                    placeholder="~/Path"
+                  />
                 </div>
-                <TagInputList
-                  items={plugin.config.protectedPaths ?? []}
-                  onChange={(next) =>
-                    updatePluginConfig(plugin.id, { protectedPaths: next })
-                  }
-                  mono
-                  removable={false}
-                  placeholder="~/Path"
-                />
-              </div>
+              )}
+
+              {schemaFields.length === 0 &&
+                plugin.config.lowSpaceThresholdPct === undefined &&
+                plugin.config.sampleIntervalSec === undefined &&
+                plugin.config.protectedPaths === undefined && (
+                  <div className="rounded-[10px] border border-dashed border-[var(--border-dash)] px-3.5 py-2.5 text-[12px] text-[var(--ink-subtle)]">
+                    该插件暂无可调参数，所有行为由 Skill 与事件策略控制。
+                  </div>
+                )}
             </section>
 
-            {/* Right actions */}
+            {/* Right: Self-contained plugin bundle files */}
             <section className="flex flex-1 flex-col gap-2.5">
               <h2 className="font-[family-name:var(--font-serif-zh)] text-[18px] font-semibold leading-[22px] text-[var(--ink-strong)]">
-                提供给 Valet 的动作
+                插件包目录与文件
               </h2>
 
-              {plugin.actions.map((act) => (
-                <div key={act.id} className="flex items-center gap-2.5 py-0.5">
-                  <span className="flex-1 font-mono text-[12px] text-[var(--ink-strong)]">
-                    {act.id}
-                  </span>
-                  {act.safety === "confirm_always" ? (
-                    <span className="inline-flex h-[18px] items-center rounded-[4px] border border-[var(--amber-pill)] px-1.5 text-[10px] font-semibold text-[var(--amber-text)]">
-                      {act.safetyLabel}
-                    </span>
-                  ) : (
-                    <span className="text-[11px] text-[var(--ink-muted)]">
-                      {act.safetyLabel}
-                    </span>
-                  )}
+              <div className="rounded-[10px] border border-[var(--border-light)] bg-[var(--bg-subtle)] p-3 font-mono text-[11.5px] leading-[18px] text-[var(--ink-secondary)]">
+                <div className="truncate text-[var(--ink-strong)]">
+                  {plugin.localDir || `plugins/${plugin.slug || plugin.id}/`}
                 </div>
-              ))}
+                <div className="mt-1 text-[10.5px] text-[var(--ink-subtle)]">
+                  运行时由 Valet 注入 VALET_PLUGIN_DIR / VALET_PLUGIN_STATE_DIR，无需宿主特化代码。
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5">
+                {(plugin.bundledFiles && plugin.bundledFiles.length > 0
+                  ? plugin.bundledFiles
+                  : ["manifest.yaml", "SKILL.md"]
+                ).map((file) => (
+                  <span
+                    key={file}
+                    className="inline-flex h-[24px] items-center rounded-[6px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2 font-mono text-[11px] text-[var(--ink-strong)]"
+                  >
+                    {file}
+                  </span>
+                ))}
+              </div>
             </section>
           </div>
 
@@ -298,7 +571,7 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
                   声明式 Manifest (YAML)
                 </h2>
                 <span className="text-[12px] text-[var(--ink-muted)]">
-                  内核与社区插件统一经由传感器与驱动编排生效
+                  插件包统一仅声明传感器、配置项与 Skill，执行由核心通用工具完成
                 </span>
               </div>
               <div className="flex items-center gap-2">
@@ -342,6 +615,8 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
                 value={draftYaml}
                 onChange={(e) => setDraftYaml(e.target.value)}
                 rows={12}
+                autoCorrect="off"
+                autoCapitalize="off"
                 spellCheck={false}
                 className="w-full rounded-[10px] border border-[var(--border-control)] bg-[var(--bg-subtle)] p-3.5 font-mono text-[12px] leading-[18px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
               />

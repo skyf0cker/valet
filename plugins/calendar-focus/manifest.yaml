@@ -1,0 +1,19 @@
+id: calendar-focus
+bundle_id: com.community.calendar-focus
+name: 日历与专注
+tagline: 定时巡检即将开始的日程，在会前提醒或配合切换专注状态
+description: 通过 Cron 定时触发检查近期会议安排，会前协助开启勿扰专注并梳理参会上下文（外发回复必经确认）。
+version: 1.0.0
+source: community
+icon: calendar
+icon_label: "Cal"
+default_installed: false
+required_permission: automation
+required_permission_label: 自动化控制
+permissions: [automation]
+triggers:
+  - id: calendar.meeting_soon
+    description: 每 15 分钟检查即将开始的日程与会前专注状态
+    sensor: cron
+    schedule: "*/15 * * * *"
+    policy: auto

@@ -22,6 +22,7 @@ interface SelectMenuProps {
   mono?: boolean;
   align?: "left" | "right";
   compact?: boolean;
+  variant?: "default" | "ghost";
   triggerClassName?: string;
   triggerLabel?: string;
   searchable?: boolean;
@@ -44,6 +45,7 @@ export const SelectMenu: React.FC<SelectMenuProps> = ({
   mono = false,
   align = "right",
   compact = true,
+  variant = "default",
   triggerClassName = "",
   triggerLabel,
   searchable,
@@ -213,7 +215,13 @@ export const SelectMenu: React.FC<SelectMenuProps> = ({
             return !o;
           });
         }}
-        className={`flex min-w-0 max-w-[min(100%,280px)] cursor-pointer items-center gap-2 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-elevated)] px-2.5 text-[12px] text-[var(--ink-strong)] transition-colors hover:border-[var(--border-strong)] ${
+        className={`flex min-w-0 ${
+          triggerClassName.includes("max-w-") ? "" : "max-w-[min(100%,280px)]"
+        } cursor-pointer items-center gap-1.5 rounded-[7px] transition-colors ${
+          variant === "ghost"
+            ? "border border-transparent bg-transparent px-2 text-[12px] text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+            : "border border-[var(--border-control)] bg-[var(--bg-elevated)] px-2.5 text-[12px] text-[var(--ink-strong)] hover:border-[var(--border-strong)]"
+        } ${
           compact ? "h-[28px]" : "h-[34px]"
         } ${triggerClassName}`}
       >
@@ -255,6 +263,9 @@ export const SelectMenu: React.FC<SelectMenuProps> = ({
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="筛选选项…"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                   className="min-w-0 flex-1 bg-transparent text-[12px] text-[var(--ink-strong)] outline-none placeholder:text-[var(--ink-subtle)]"
                 />
                 {query && (

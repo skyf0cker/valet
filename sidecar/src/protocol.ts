@@ -6,7 +6,13 @@ export type ProviderId =
   | "ollama"
   | "custom";
 
-export type AutonomyLevel = "always_ask" | "sensitive_only" | "autonomous";
+export type AutonomyLevel =
+  | "always_ask"
+  | "auto_review"
+  | "full_access"
+  | "sensitive_only"
+  | "autonomous";
+export type CanonicalAutonomyLevel = "always_ask" | "auto_review" | "full_access";
 export type EventPolicyMode = "auto" | "ask" | "record";
 export type ActionSafety = "readonly" | "reversible" | "confirm_always";
 export type InboxCategory = "files" | "process" | "outbound";
@@ -17,6 +23,18 @@ export interface SafetyConfirmationChecklist {
   paymentOrSubscription: boolean;
   runTerminalCommand: boolean;
   modifySystemSettings: boolean;
+}
+
+export interface AutoReviewConfig {
+  engine: "auto" | "jev" | "llm";
+  jevEndpoint: string;
+  jevApiKey: string;
+  jevApiKeyMasked?: string;
+  jevModel: string;
+  jevVerified?: boolean;
+  jevLatencyMs?: number;
+  fallbackProviderId?: string;
+  fallbackModel: string;
 }
 
 export interface MonitoringThresholds {
@@ -44,6 +62,7 @@ export interface PluginRuntimeSettings {
   allowUnsignedLocal: boolean;
   maxEventsPerHour: string;
   quietHours: string;
+  webhookEndpoint?: string;
 }
 
 export interface ValetPreferences {
@@ -54,6 +73,7 @@ export interface ValetPreferences {
     vision: string;
   };
   activeProviderId: ProviderId;
+  autoReview?: AutoReviewConfig;
   dailySpendCurrent: number;
   dailySpendLimit: number;
   maxStepsPerTask: number;
@@ -66,6 +86,14 @@ export interface ValetPreferences {
   thresholds: MonitoringThresholds;
   cleanupPolicy: CleanupPolicySettings;
   pluginRuntime: PluginRuntimeSettings;
+  busyMessagePolicy?: "queue" | "steer";
+  heartbeat?: {
+    enabled: boolean;
+    initialized?: boolean;
+    intervalMin: number;
+    prompt: string;
+    lastRunAt?: string;
+  };
   memoryEnabled: boolean;
   autoLearnMemory: boolean;
 }
@@ -87,6 +115,8 @@ export interface PluginEventPolicy {
   id: string;
   description: string;
   policy: EventPolicyMode;
+  sensor?: string;
+  sourceSummary?: string;
   count24h: number;
 }
 
@@ -96,7 +126,18 @@ export interface PluginActionCapability {
   safetyLabel: string;
 }
 
+export interface PluginConfigField {
+  key: string;
+  label: string;
+  type: "slider" | "number" | "text" | "boolean";
+  min?: number;
+  max?: number;
+  default?: unknown;
+  description?: string;
+}
+
 export interface PluginConfig {
+  values?: Record<string, unknown>;
   lowSpaceThresholdPct?: number;
   protectedPaths?: string[];
   sampleIntervalSec?: number;
@@ -116,9 +157,13 @@ export interface PluginState {
   installed: boolean;
   requiredPermission?: string;
   events: PluginEventPolicy[];
-  actions: PluginActionCapability[];
+  actions?: PluginActionCapability[];
+  configSchema?: PluginConfigField[];
   config: PluginConfig;
   manifestYaml: string;
+  skillMarkdown?: string;
+  localDir?: string;
+  bundledFiles?: string[];
 }
 
 export interface MemoryEntry {
@@ -157,6 +202,8 @@ export interface PluginDraftSpec {
   whenExpression: string;
   actionExpression: string;
   manifestYaml: string;
+  sensor?: string;
+  skillMarkdown?: string;
   installed?: boolean;
 }
 
@@ -167,6 +214,7 @@ export interface ChatMessage {
   metaLabel?: string;
   createdAt: string;
   attachments?: ChatAttachment[];
+  steps?: ChatStreamStep[];
   processTable?: {
     rows: ProcessSampleRow[];
     primaryActionDone?: boolean;
@@ -191,6 +239,14 @@ export interface McpServerConfig {
   statusError?: string;
 }
 
+export interface BuiltinSkillMeta {
+  name: string;
+  title: string;
+  description: string;
+  content: string;
+  source?: string;
+}
+
 export interface ValetSyncState {
   homeDir: string;
   dataDir: string;
@@ -200,11 +256,16 @@ export interface ValetSyncState {
   plugins: PluginState[];
   mcpServers?: McpServerConfig[];
   memories: MemoryEntry[];
+  builtinSkills?: BuiltinSkillMeta[];
 }
 
 export interface TestProviderRequest {
   provider: AgentProviderConfig;
   model: string;
+}
+
+export interface TestAutoReviewRequest {
+  autoReview: AutoReviewConfig;
 }
 
 export interface ProbeMcpRequest {
@@ -281,8 +342,24 @@ export interface RecordTimelineParams {
 export interface ChatStreamStep {
   id: string;
   name: string;
+  label?: string;
   status: "pending" | "running" | "done" | "error";
   detail?: string;
+}
+
+export interface PendingPermissionRequest {
+  requestId: string;
+  chatId: string;
+  toolName: string;
+  title: string;
+  summary: string;
+  command?: string;
+  paths?: string[];
+  targetPath?: string;
+  options?: string[];
+  approveLabel: string;
+  allowSessionLabel?: string;
+  dismissLabel: string;
 }
 
 export interface ChatStreamPayload {
@@ -291,7 +368,15 @@ export interface ChatStreamPayload {
   partialText?: string;
   thinkingText?: string;
   steps?: ChatStreamStep[];
+  pendingPermission?: PendingPermissionRequest;
   error?: string;
+}
+
+export interface ResolvePermissionRequest {
+  chatId: string;
+  requestId: string;
+  decision: "allow_once" | "allow_session" | "deny";
+  note?: string;
 }
 
 export interface SendChatRequest {
@@ -301,6 +386,8 @@ export interface SendChatRequest {
   mentionPluginId?: string;
   attachments?: ChatAttachment[];
   requestId?: string;
+  whenBusy?: "steer" | "followUp";
+  interactive?: boolean;
 }
 
 export interface SendChatResponse {

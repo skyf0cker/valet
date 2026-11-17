@@ -1,0 +1,38 @@
+id: surge-doctor
+bundle_id: com.community.surge-doctor
+name: Surge 诊断
+tagline: 自动监测并脱敏导入 Surge 错误日志，定位配置、DNS、TUN 与节点故障
+description: 持续监测 ~/Library/Logs/Surge 与 Surge Event Webhook 异常事件，通过自带脱敏导入脚本与 SKILL.md 指导 Agent 排查与修复（变更需授权）。
+version: 1.0.0
+source: community
+icon: surge
+icon_label: Sg
+default_installed: true
+required_permission: full_disk
+required_permission_label: 完全磁盘访问
+permissions: [full_disk]
+config_schema:
+  - key: pollIntervalSec
+    label: 日志巡检间隔（秒）
+    type: slider
+    min: 10
+    max: 120
+    default: 30
+    description: 后台监测 ~/Library/Logs/Surge 新增错误日志的间隔秒数
+  - key: windowMinutes
+    label: 默认日志回溯窗口（分钟）
+    type: number
+    default: 360
+    description: 排查时默认回溯的最近 Surge 日志分钟数
+triggers:
+  - id: surge.error_detected
+    description: 监测 ~/Library/Logs/Surge 新增错误与告警日志并自动导入归因
+    sensor: script_poll
+    script: scripts/poll-errors.mjs
+    interval_config_key: pollIntervalSec
+    interval_sec: 30
+    policy: auto
+  - id: surge.webhook_alert
+    description: 接收 Surge Event 脚本或外部探针推送的实时网络/脚本异常
+    sensor: webhook
+    policy: ask

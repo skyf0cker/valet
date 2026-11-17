@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 
 interface TagInputListProps {
   items: string[];
@@ -19,6 +19,8 @@ export const TagInputList: React.FC<TagInputListProps> = ({
 }) => {
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
+  const isComposingRef = useRef(false);
+  const compositionEndedAtRef = useRef(0);
 
   const commit = () => {
     const val = draft.trim();
@@ -58,8 +60,27 @@ export const TagInputList: React.FC<TagInputListProps> = ({
           autoFocus
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          onCompositionStart={() => {
+            isComposingRef.current = true;
+          }}
+          onCompositionEnd={() => {
+            isComposingRef.current = false;
+            compositionEndedAtRef.current = performance.now();
+          }}
           onBlur={commit}
           onKeyDown={(e) => {
+            if (
+              isComposingRef.current ||
+              e.nativeEvent.isComposing ||
+              e.keyCode === 229 ||
+              e.nativeEvent.keyCode === 229 ||
+              performance.now() - compositionEndedAtRef.current < 100
+            ) {
+              return;
+            }
             if (e.key === "Enter") {
               e.preventDefault();
               commit();

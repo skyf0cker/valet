@@ -1,0 +1,32 @@
+id: process-sentinel
+bundle_id: com.valet.process-sentinel
+name: 进程哨兵
+tagline: 持续采样进程 CPU/内存占用，识别失控或无响应进程
+description: 通过轻量探针定期检测持续超过阈值的异常进程，结合 Skill 与终端排查其父进程和端口占用后再经授权处理。
+version: 1.0.4
+source: core
+icon: pulse
+default_installed: true
+config_schema:
+  - key: sampleIntervalSec
+    label: 采样间隔（秒）
+    type: slider
+    min: 5
+    max: 60
+    default: 15
+    description: 后台进程探针轮询频率
+  - key: cpuThresholdPct
+    label: 高负载触发阈值（%）
+    type: slider
+    min: 100
+    max: 400
+    default: 200
+    description: 单进程 CPU 连续超出该百分比两次即唤醒排查
+triggers:
+  - id: process.cpu_spike
+    description: 单个进程 CPU 连续超过阈值
+    sensor: script_poll
+    script: scripts/poll-cpu.mjs
+    interval_config_key: sampleIntervalSec
+    interval_sec: 15
+    policy: ask

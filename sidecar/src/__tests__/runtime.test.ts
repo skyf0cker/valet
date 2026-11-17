@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -7,8 +9,10 @@ import {
   fauxThinking,
   fauxToolCall,
 } from "@earendil-works/pi-ai";
-import { evaluateToolPolicy } from "../approval.ts";
+import { evaluateToolPolicy, isReadOnlyBashCommand } from "../approval.ts";
+import { AutoReviewEvaluator, normalizeJevEndpoint } from "../auto-review.ts";
 import type {
+  ChatStreamPayload,
   HostBridge,
   PluginState,
   QueueApprovalParams,
@@ -33,27 +37,18 @@ function makeBaseState(dataDir: string): ValetSyncState {
         { id: "disk.low_space", description: "low space", policy: "auto", count24h: 1 },
         { id: "disk.large_file", description: "large file", policy: "ask", count24h: 2 },
       ],
-      actions: [
-        { id: "disk.scan", safety: "readonly", safetyLabel: "只读" },
-        { id: "disk.move_to_trash", safety: "reversible", safetyLabel: "可撤销" },
-      ],
-      config: {},
+      config: { values: { lowSpaceThresholdPct: 15 } },
       manifestYaml: `id: com.valet.disk-guard
 name: 磁盘守卫
 version: 1.2.0
-actions:
-  - id: disk.scan
-    tool: disk_scan
-    driver: fs.scan_cleanable
-    safety: readonly
-    category: files
-  - id: disk.move_to_trash
-    tool: disk_move_to_trash
-    driver: fs.trash
-    event: disk.large_file
-    safety: reversible
-    category: files
-    checklist: deleteOrOverwrite`,
+triggers:
+  - id: disk.low_space
+    sensor: script_poll
+    script: scripts/poll-disk.mjs
+    interval_sec: 60
+    emit_on: json
+    policy: auto`,
+      skillMarkdown: "使用 list_dir 与 trash_files 处理磁盘候选文件。",
     },
     {
       id: "process-sentinel",
@@ -69,27 +64,19 @@ actions:
       events: [
         { id: "process.cpu_spike", description: "cpu spike", policy: "ask", count24h: 1 },
       ],
-      actions: [
-        { id: "process.sample", safety: "readonly", safetyLabel: "只读" },
-        { id: "process.terminate", safety: "confirm_always", safetyLabel: "每次确认" },
-      ],
-      config: {},
+      config: { values: { sampleIntervalSec: 15 } },
       manifestYaml: `id: com.valet.process-sentinel
 name: 进程哨兵
 version: 1.0.4
-actions:
-  - id: process.sample
-    tool: process_sample
-    driver: proc.sample
-    safety: readonly
-    category: process
-    ui_card: process_table
-  - id: process.terminate
-    tool: process_terminate
-    driver: proc.signal
-    safety: confirm_always
-    category: process
-    checklist: runTerminalCommand`,
+triggers:
+  - id: process.cpu_spike
+    sensor: script_poll
+    script: scripts/poll-cpu.mjs
+    interval_config_key: sampleIntervalSec
+    interval_sec: 15
+    emit_on: json
+    policy: ask`,
+      skillMarkdown: "使用 system_overview 采样高占用进程，需终止时调用 kill_process。",
     },
   ];
 
@@ -107,13 +94,21 @@ actions:
       userNickname: "dd",
       toneStyle: "concise",
       customInstructions: "",
-      autonomyLevel: "sensitive_only",
+      autonomyLevel: "auto_review",
       confirmChecklist: {
-        deleteOrOverwrite: true,
+        deleteOrOverwrite: false,
         sendMessageOrEmail: true,
         paymentOrSubscription: true,
-        runTerminalCommand: true,
+        runTerminalCommand: false,
         modifySystemSettings: false,
+      },
+      autoReview: {
+        engine: "auto",
+        jevEndpoint: "https://api.typesafe.ai/v1/systemone",
+        jevApiKey: "",
+        jevModel: "jev-latest",
+        fallbackProviderId: "",
+        fallbackModel: "同快速模型",
       },
       blockedApps: ["1Password", "钥匙串访问"],
       thresholds: {
@@ -163,71 +158,24 @@ actions:
 class FakeHostBridge implements HostBridge {
   readonly queued: QueueApprovalParams[] = [];
   readonly recorded: Record<string, unknown>[] = [];
-  readonly pluginActions: Record<string, unknown>[] = [];
-  readonly streamEvents: unknown[] = [];
+  readonly bashCalls: Record<string, unknown>[] = [];
+  readonly listCalls: Record<string, unknown>[] = [];
+  readonly readCalls: Record<string, unknown>[] = [];
+  readonly writeCalls: Record<string, unknown>[] = [];
+  readonly trashCalls: Record<string, unknown>[] = [];
+  readonly killCalls: Record<string, unknown>[] = [];
+  readonly streamEvents: ChatStreamPayload[] = [];
+  private streamListeners: Array<(payload: ChatStreamPayload) => void> = [];
+
+  onChatStream(fn: (payload: ChatStreamPayload) => void): void {
+    this.streamListeners.push(fn);
+  }
 
   async callHost<T = unknown>(
     method: string,
     params: Record<string, unknown> = {},
   ): Promise<T> {
     switch (method) {
-      case "host.plugin.invoke": {
-        const pluginId = String(params.pluginId ?? "");
-        const actionId = String(params.actionId ?? "");
-        const driver = String(params.driver ?? "");
-        const args = (params.args ?? {}) as Record<string, unknown>;
-        this.pluginActions.push(params);
-
-        if (driver === "fs.scan_cleanable") {
-          return {
-            ok: true,
-            driver,
-            summary: "扫描完成",
-            data: {
-              cleanablePaths: ["/Users/testuser/Downloads/old.ipsw"],
-              estimatedReclaimableGB: 4.2,
-              items: [{ path: "/Users/testuser/Downloads/old.ipsw", sizeGB: 4.2 }],
-            },
-          } as T;
-        }
-        if (driver === "fs.trash") {
-          const paths = Array.isArray(args.paths) ? args.paths : [];
-          return {
-            ok: true,
-            driver,
-            summary: "已移入废纸篓",
-            movedCount: paths.length,
-            reclaimedGB: Number(args.estimatedGB ?? 4.2),
-            trashBatchId: "trash-test-1",
-            data: { movedCount: paths.length, reclaimedGB: Number(args.estimatedGB ?? 4.2) },
-          } as T;
-        }
-        if (driver === "proc.sample") {
-          return {
-            ok: true,
-            driver,
-            summary: "采样完成",
-            rows: [
-              {
-                id: "p1",
-                name: "vite",
-                pid: 48211,
-                cpuPct: 210,
-                memLabel: "1.9 GB",
-                sourceLabel: "Terminal",
-                severity: "high",
-              },
-            ],
-            data: { cpuPct: 48, memPct: 62 },
-          } as T;
-        }
-        return {
-          ok: true,
-          driver,
-          summary: `${pluginId}.${actionId} executed`,
-          data: { ok: true, actionId },
-        } as T;
-      }
       case "host.queueApproval": {
         this.queued.push(params as unknown as QueueApprovalParams);
         return {
@@ -239,6 +187,73 @@ class FakeHostBridge implements HostBridge {
         this.recorded.push(params);
         return { timelineEventId: `evt-rec-${this.recorded.length}` } as T;
       }
+      case "host.kernel.bash": {
+        this.bashCalls.push(params);
+        return {
+          ok: true,
+          command: String(params.command ?? ""),
+          cwd: String(params.cwd ?? "/Users/testuser"),
+          exitCode: 0,
+          durationMs: 12,
+          output: "mock-bash-output",
+          summary: "exit=0 · mock-bash-output",
+        } as T;
+      }
+      case "host.kernel.listDir": {
+        this.listCalls.push(params);
+        return {
+          path: "/Users/testuser/Downloads",
+          totalCount: 1,
+          entries: [
+            {
+              name: "old.ipsw",
+              path: "/Users/testuser/Downloads/old.ipsw",
+              isDir: false,
+              sizeBytes: 4200000000,
+              modTime: "2026-11-16T00:00:00Z",
+            },
+          ],
+        } as T;
+      }
+      case "host.kernel.readFile": {
+        this.readCalls.push(params);
+        return {
+          path: String(params.path ?? ""),
+          totalLines: 2,
+          startLine: 1,
+          endLine: 2,
+          content: "line1\nline2",
+        } as T;
+      }
+      case "host.kernel.writeFile": {
+        this.writeCalls.push(params);
+        return {
+          ok: true,
+          path: String(params.path ?? ""),
+          bytesWritten: String(params.content ?? "").length,
+        } as T;
+      }
+      case "host.kernel.trashFiles": {
+        this.trashCalls.push(params);
+        const paths = Array.isArray(params.paths) ? params.paths : [];
+        return {
+          ok: true,
+          batchId: "trash-test-1",
+          movedCount: paths.length,
+          reclaimedGB: 4.2,
+          summary: `已将 ${paths.length} 项移入废纸篓（释放约 4.20 GB，7 天内可还原）`,
+        } as T;
+      }
+      case "host.kernel.killProcess": {
+        this.killCalls.push(params);
+        return {
+          ok: true,
+          pid: Number(params.pid ?? 0),
+          name: String(params.name ?? ""),
+          signal: String(params.signal ?? "SIGTERM"),
+          summary: `已终止进程 ${String(params.name ?? "")}`,
+        } as T;
+      }
       case "host.kernel.overview":
       case "host.systemOverview":
         return {
@@ -247,16 +262,44 @@ class FakeHostBridge implements HostBridge {
           cpuPct: 18,
           memPct: 55,
           enabledPlugins: 2,
+          topProcesses: [
+            {
+              id: "p1",
+              name: "vite",
+              pid: 48211,
+              cpuPct: 210,
+              memLabel: "1.9 GB",
+              sourceLabel: "Terminal",
+              severity: "high",
+            },
+          ],
         } as T;
       default:
         return {} as T;
     }
   }
 
-  notifyHost(_method: string, params?: unknown): void {
-    this.streamEvents.push(params);
+  notifyHost(method: string, params?: unknown): void {
+    if (method === "host.chatStream" && params) {
+      const payload = params as ChatStreamPayload;
+      this.streamEvents.push(payload);
+      for (const listener of this.streamListeners) {
+        listener(payload);
+      }
+    }
   }
 }
+
+const CORE_PLUGIN_TOOLS = new Set([
+  "plugin_draft_create",
+  "plugin_list",
+  "plugin_inspect",
+  "plugin_install",
+  "plugin_reload",
+  "plugin_configure",
+  "plugin_trigger",
+  "plugin_remove",
+]);
 
 describe("ValetDurableRuntime", () => {
   const tempDirs: string[] = [];
@@ -268,24 +311,25 @@ describe("ValetDurableRuntime", () => {
     }
   });
 
-  it("enforces protected directories & blocked apps in policy engine", async () => {
+  it("enforces protected directories, blocked apps, and read-only plugin scripts in policy engine", async () => {
     const dir = await mkdtemp(join(tmpdir(), "valet-policy-"));
     tempDirs.push(dir);
     const state = makeBaseState(dir);
 
     const protectedDecision = evaluateToolPolicy(
       {
-        toolName: "disk_move_to_trash",
-        pluginId: "disk-guard",
-        pluginName: "磁盘守卫",
-        actionId: "disk.move_to_trash",
-        eventCode: "disk.large_file",
+        toolName: "trash_files",
+        pluginId: "valet-core",
+        pluginName: "Valet Core",
+        actionId: "fs.trash",
+        eventCode: "fs.cleaned",
         safety: "reversible",
+        checklistKey: "deleteOrOverwrite",
         category: "files",
-        iconKind: "disk",
+        iconKind: "trash",
         reversible7d: true,
         approveLabel: "移入废纸篓",
-        dismissLabel: "保留",
+        dismissLabel: "拒绝",
       },
       { paths: ["/Users/testuser/Projects/my-repo"] },
       state,
@@ -295,12 +339,13 @@ describe("ValetDurableRuntime", () => {
 
     const blockedProcDecision = evaluateToolPolicy(
       {
-        toolName: "process_terminate",
-        pluginId: "process-sentinel",
-        pluginName: "进程哨兵",
-        actionId: "process.terminate",
-        eventCode: "process.cpu_spike",
+        toolName: "kill_process",
+        pluginId: "valet-core",
+        pluginName: "Valet Core",
+        actionId: "proc.kill",
+        eventCode: "process.terminated",
         safety: "confirm_always",
+        checklistKey: "runTerminalCommand",
         category: "process",
         iconKind: "pulse",
         warningTag: "不可撤销",
@@ -313,6 +358,295 @@ describe("ValetDurableRuntime", () => {
       true,
     );
     expect(blockedProcDecision.outcome).toBe("deny");
+
+    expect(
+      isReadOnlyBashCommand(
+        'bun "/Users/testuser/.valet/plugins/surge-doctor/scripts/import-logs.mjs" --minutes 360',
+      ),
+    ).toBe(true);
+    expect(isReadOnlyBashCommand("surge-cli flush dns")).toBe(false);
+
+    // Expanded macOS read-only inspection idioms & compound segments
+    expect(
+      isReadOnlyBashCommand(
+        'ls -d /Applications/Qoder.app 2>/dev/null && pgrep -ifl qoder || echo "not running"',
+      ),
+    ).toBe(true);
+    expect(
+      isReadOnlyBashCommand(
+        'ls -lh ~/Desktop/ | head -30; echo "---hidden:"; hdiutil info 2>/dev/null | grep "image-path" || true',
+      ),
+    ).toBe(true);
+    expect(
+      isReadOnlyBashCommand(
+        "memory_pressure | tail -3; sysctl hw.memsize hw.ncpu machdep.cpu.brand_string 2>/dev/null",
+      ),
+    ).toBe(true);
+    expect(
+      isReadOnlyBashCommand(
+        'f="/Users/testuser/Library/Application Support/Surge/Profiles/custom.conf"; sed -n "50,54p" "$f"',
+      ),
+    ).toBe(true);
+    expect(isReadOnlyBashCommand("(cd ~/Downloads && ls -la)")).toBe(true);
+    expect(isReadOnlyBashCommand("ls ~/Downloads 2> /dev/null >/dev/null")).toBe(true);
+    expect(isReadOnlyBashCommand("(rm -rf /tmp/foo && ls)")).toBe(false);
+    expect(isReadOnlyBashCommand("cat <(echo hi)")).toBe(false);
+
+    // Autonomy modes: always_ask vs auto_review vs full_access (hard redlines stay deny)
+    const mutatingBashMeta = {
+      toolName: "bash",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "shell.bash",
+      eventCode: "system.command",
+      safety: "reversible" as const,
+      checklistKey: "runTerminalCommand" as const,
+      category: "process" as const,
+      iconKind: "pulse" as const,
+      reversible7d: false,
+      approveLabel: "批准执行",
+      dismissLabel: "拒绝",
+    };
+    expect(
+      evaluateToolPolicy(
+        mutatingBashMeta,
+        { command: "brew cleanup" },
+        { ...state, preferences: { ...state.preferences, autonomyLevel: "always_ask" } },
+        false,
+      ).outcome,
+    ).toBe("ask");
+    expect(
+      evaluateToolPolicy(
+        mutatingBashMeta,
+        { command: "brew cleanup" },
+        state,
+        false,
+      ).outcome,
+    ).toBe("review");
+    expect(
+      evaluateToolPolicy(
+        mutatingBashMeta,
+        { command: "brew cleanup" },
+        { ...state, preferences: { ...state.preferences, autonomyLevel: "full_access" } },
+        false,
+      ).outcome,
+    ).toBe("allow");
+    expect(
+      evaluateToolPolicy(
+        mutatingBashMeta,
+        { command: "cat ~/.ssh/id_rsa" },
+        { ...state, preferences: { ...state.preferences, autonomyLevel: "full_access" } },
+        false,
+      ).outcome,
+    ).toBe("deny");
+    expect(normalizeJevEndpoint("https://openrouter.ai/api/v1")).toBe(
+      "https://openrouter.ai/api/v1/systemone",
+    );
+  });
+
+  it("runs Auto Review via Jev System One and falls back to configured small LLM cleanly", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-autoreview-"));
+    tempDirs.push(dir);
+    const bridge = new FakeHostBridge();
+
+    let nextJevHarmful = 0.05;
+    let nextLlmDecision = '{"decision":"allow","risk":"low","reason":"可安全清理"}';
+    let jevCalls = 0;
+    let llmCalls = 0;
+
+    const srv = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        const rawBody = Buffer.concat(chunks).toString("utf8");
+        const pathname = (req.url ?? "").split("?")[0];
+        if (pathname === "/v1/systemone") {
+          jevCalls += 1;
+          let model = "jev-latest";
+          try {
+            const parsed = JSON.parse(rawBody) as { model?: string };
+            if (parsed.model) model = parsed.model;
+          } catch {
+            // ignore
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              model,
+              answers: {
+                harmful: { type: "noul", noul: nextJevHarmful },
+                sensitive: { type: "noul", noul: 0.02 },
+                untrusted: { type: "noul", noul: 0.01 },
+                obscured: { type: "noul", noul: 0.03 },
+              },
+            }),
+          );
+          return;
+        }
+        if (pathname === "/v1/chat/completions") {
+          llmCalls += 1;
+          res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+          const ts = Math.floor(Date.now() / 1000);
+          const chunk1 = JSON.stringify({
+            id: "chatcmpl-review-test",
+            object: "chat.completion.chunk",
+            created: ts,
+            model: "small-reviewer",
+            choices: [
+              {
+                index: 0,
+                delta: { role: "assistant", content: nextLlmDecision },
+                finish_reason: null,
+              },
+            ],
+          });
+          const chunk2 = JSON.stringify({
+            id: "chatcmpl-review-test",
+            object: "chat.completion.chunk",
+            created: ts,
+            model: "small-reviewer",
+            choices: [
+              {
+                index: 0,
+                delta: {},
+                finish_reason: "stop",
+              },
+            ],
+          });
+          res.end(`data: ${chunk1}\n\ndata: ${chunk2}\n\ndata: [DONE]\n\n`);
+          return;
+        }
+        res.writeHead(404);
+        res.end("not found");
+      });
+    });
+    await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const srvPort = (srv.address() as AddressInfo).port;
+
+    try {
+      const state = makeBaseState(dir);
+      state.preferences.autonomyLevel = "auto_review";
+      state.preferences.autoReview = {
+        engine: "auto",
+        jevEndpoint: `http://127.0.0.1:${srvPort}/v1/systemone`,
+        jevApiKey: "ts-live-test-key",
+        jevModel: "jev-latest",
+        fallbackProviderId: "custom",
+        fallbackModel: "small-reviewer",
+      };
+      state.providers.push({
+        id: "custom",
+        name: "Custom Local",
+        apiKey: "sk-local-test-review",
+        baseUrl: `http://127.0.0.1:${srvPort}/v1`,
+        endpoint: `http://127.0.0.1:${srvPort}/v1`,
+        verified: true,
+        models: ["small-reviewer"],
+        connected: true,
+      });
+
+      const rt = new ValetDurableRuntime(bridge);
+      await rt.init({ dbPath: join(dir, "pi-ar.sqlite"), state });
+
+      // 1. Jev System One low-risk scores auto-approve mutating bash command
+      nextJevHarmful = 0.04;
+      rt.models.setLocalStewardScript([
+        () =>
+          fauxAssistantMessage(
+            [fauxToolCall("bash", { command: "brew cleanup --dry-run" })],
+            { stopReason: "toolUse" },
+          ),
+        () => fauxAssistantMessage("Jev Auto Review 已自动放行并完成检查。"),
+      ]);
+      const lowRes = await rt.sendChat({
+        chatId: "chat-jev-allow",
+        prompt: "检查 brew",
+        model: "claude-opus-4",
+      });
+      expect(jevCalls).toBe(1);
+      expect(bridge.bashCalls.length).toBe(1);
+      expect(lowRes.queuedInboxIds.length).toBe(0);
+
+      // 2. Jev System One high harmful score (> 0.35) escalates to human confirmation
+      nextJevHarmful = 0.88;
+      rt.models.setLocalStewardScript([
+        () =>
+          fauxAssistantMessage(
+            [fauxToolCall("bash", { command: "brew cleanup" })],
+            { stopReason: "toolUse" },
+          ),
+        () => fauxAssistantMessage("已拦截并等待确认。"),
+      ]);
+      const highRes = await rt.sendChat({
+        chatId: "chat-jev-ask",
+        prompt: "清理 brew",
+        model: "claude-opus-4",
+      });
+      expect(jevCalls).toBe(2);
+      expect(highRes.queuedInboxIds.length).toBe(1);
+      expect(bridge.queued[0]?.reasoning).toContain("harmful=0.88");
+
+      // 3. No Jev key configured -> falls back seamlessly to small LLM
+      await rt.syncState({
+        ...state,
+        preferences: {
+          ...state.preferences,
+          autoReview: {
+            ...state.preferences.autoReview!,
+            engine: "auto",
+            jevApiKey: "",
+          },
+        },
+      });
+      nextLlmDecision = '{"decision":"allow","risk":"low","reason":"低风险本地状态操作"}';
+      rt.models.setLocalStewardScript([
+        () =>
+          fauxAssistantMessage(
+            [fauxToolCall("bash", { command: "surge-cli reload" })],
+            { stopReason: "toolUse" },
+          ),
+        () => fauxAssistantMessage("小模型审查已放行并完成。"),
+      ]);
+      const llmAllowRes = await rt.sendChat({
+        chatId: "chat-llm-allow",
+        prompt: "重载 Surge",
+        model: "claude-opus-4",
+      });
+      expect(llmCalls).toBe(1);
+      expect(bridge.bashCalls.length).toBe(2);
+      expect(llmAllowRes.queuedInboxIds.length).toBe(0);
+
+      // 4. Small LLM says ask -> escalates to Inbox
+      nextLlmDecision = '{"decision":"ask","risk":"high","reason":"会删除应用配置"}';
+      rt.models.setLocalStewardScript([
+        () =>
+          fauxAssistantMessage(
+            [fauxToolCall("bash", { command: "rm -rf /tmp/valet-risky-dir" })],
+            { stopReason: "toolUse" },
+          ),
+        () => fauxAssistantMessage("需要确认删除。"),
+      ]);
+      const llmAskRes = await rt.sendChat({
+        chatId: "chat-llm-ask",
+        prompt: "删目录",
+        model: "claude-opus-4",
+      });
+      expect(llmCalls).toBe(2);
+      expect(llmAskRes.queuedInboxIds.length).toBe(1);
+      expect(bridge.queued[1]?.reasoning).toContain("会删除应用配置");
+
+      // 5. testConnection helper smoke check
+      const probeRes = await new AutoReviewEvaluator(rt.models).testConnection(
+        state.preferences.autoReview!,
+        state,
+      );
+      expect(probeRes.ok).toBe(true);
+      expect(probeRes.reply).toContain("Jev System One");
+
+      await rt.close();
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
   });
 
   it("blocks mutating tool via beforeTool hook -> queues Inbox approval -> executes on approval", async () => {
@@ -333,23 +667,30 @@ describe("ValetDurableRuntime", () => {
     });
 
     expect(bridge.queued.length).toBe(1);
-    expect(bridge.queued[0]!.toolName).toBe("disk_move_to_trash");
+    expect(bridge.queued[0]!.toolName).toBe("trash_files");
     expect(cleanRes.queuedInboxIds).toEqual(["inbox-test-1"]);
     expect(cleanRes.replyMessage.content).toContain("收件箱");
+    expect(cleanRes.replyMessage.steps?.length).toBe(2);
+    expect(cleanRes.replyMessage.steps?.[0]?.name).toBe("list_dir");
+    expect(cleanRes.replyMessage.steps?.[0]?.status).toBe("done");
+    expect(cleanRes.replyMessage.steps?.[1]?.name).toBe("trash_files");
+    expect(cleanRes.replyMessage.steps?.[1]?.status).toBe("done");
+    expect(cleanRes.replyMessage.steps?.[1]?.detail).toBe("已转入收件箱等待确认");
 
     // Now approve & execute via runtime.executeApprovedTool
     const execRes = await rt.executeApprovedTool({
       inboxId: "inbox-test-1",
-      toolName: "disk_move_to_trash",
+      toolName: "trash_files",
       toolArgs: bridge.queued[0]!.toolArgs,
     });
     expect(execRes.ok).toBe(true);
+    expect(bridge.trashCalls.length).toBe(1);
     expect(bridge.recorded.length).toBeGreaterThanOrEqual(1);
 
     await rt.close();
   });
 
-  it("persists durable threads across SQLite reopen and hot-reloads custom YAML plugin tools", async () => {
+  it("persists durable threads across SQLite reopen and hot-reloads Action-less YAML plugin skills", async () => {
     const dir = await mkdtemp(join(tmpdir(), "valet-reopen-"));
     tempDirs.push(dir);
     const dbPath = join(dir, "pi-agent.sqlite");
@@ -366,9 +707,10 @@ describe("ValetDurableRuntime", () => {
     });
     expect(draftRes.replyMessage.pluginDraft).toBeDefined();
     expect(draftRes.replyMessage.pluginDraft?.manifestYaml).toContain("fs.file_created");
+    expect(draftRes.replyMessage.pluginDraft?.manifestYaml).not.toContain("\nactions:");
     await rt1.close();
 
-    // Reopen a brand new Runtime instance against the same SQLite database + add a custom YAML plugin
+    // Reopen against same SQLite DB + add an Action-less custom YAML plugin
     const bridge2 = new FakeHostBridge();
     const rt2 = new ValetDurableRuntime(bridge2);
     const customPlugin: PluginState = {
@@ -382,62 +724,67 @@ describe("ValetDurableRuntime", () => {
       source: "local",
       enabled: true,
       installed: true,
+      localDir: join(dir, "plugins", "dmg-sweeper"),
+      bundledFiles: ["manifest.yaml", "SKILL.md"],
       events: [
         { id: "fs.file_created", description: "dmg created", policy: "auto", count24h: 0 },
       ],
-      actions: [{ id: "move_to_trash", safety: "reversible", safetyLabel: "可撤销" }],
-      config: {},
+      config: { values: {} },
       manifestYaml: `id: local.valet.dmg-sweeper
 name: dmg 清扫员
 triggers:
-  - event: fs.file_created
-actions:
-  - move_to_trash`,
+  - id: fs.file_created
+    sensor: fs_watch`,
+      skillMarkdown: "CUSTOM_DMG_SWEEPER_SKILL: 仅调用 trash_files 清理已安装应用对应的 .dmg。",
     };
     state.plugins.push(customPlugin);
     await rt2.init({ dbPath, state });
 
     const info = await rt2.inspect();
-    const toolNames = info.registeredTools as string[];
-    expect(toolNames).toContain("plugin_dmg_sweeper_move_to_trash");
+    expect(info.installedExtensions as string[]).toContain("plugin:dmg-sweeper");
+    // Universal core tools handle execution; no compiled plugin_* action tools
+    expect(
+      (info.registeredTools as string[]).some(
+        (t) => t.startsWith("plugin_") && !CORE_PLUGIN_TOOLS.has(t),
+      ),
+    ).toBe(false);
 
-    // Invoke custom YAML plugin tool via scripted model response & verify host bridge ran it
+    let sawSkillContext = false;
     rt2.models.setLocalStewardScript([
-      () =>
-        fauxAssistantMessage(
-          [
-            fauxToolCall("plugin_dmg_sweeper_move_to_trash", {
-              path: "/Users/testuser/Downloads/Valet.dmg",
-            }),
-          ],
-          { stopReason: "toolUse" },
-        ),
-      () => fauxAssistantMessage("已通过自定义 YAML 插件触发动作。"),
+      (ctx) => {
+        const serialized = JSON.stringify(ctx);
+        if (
+          serialized.includes("CUSTOM_DMG_SWEEPER_SKILL") &&
+          serialized.includes("VALET_PLUGIN_DIR")
+        ) {
+          sawSkillContext = true;
+        }
+        return fauxAssistantMessage("已通过自定义插件 Skill 与通用工具完成处理。");
+      },
     ]);
 
     const res2 = await rt2.sendChat({
-      chatId: "chat-plugin-1", // Reuses persisted conversation ID across reopen!
-      prompt: "帮我运行一下 dmg 清扫员",
+      chatId: "chat-plugin-1",
+      prompt: "帮我按 dmg 清扫员 Skill 处理一下",
       model: "claude-opus-4",
     });
-    expect(res2.replyMessage.content).toContain("自定义 YAML 插件");
-    expect(bridge2.pluginActions.length).toBe(1);
-    expect(bridge2.pluginActions[0]?.pluginId).toBe("dmg-sweeper");
+    expect(sawSkillContext).toBe(true);
+    expect(res2.replyMessage.content).toContain("自定义插件 Skill");
 
-    // Disable the custom plugin and hot-sync -> tool disappears immediately
+    // Disable the custom plugin and hot-sync -> extension unmounted immediately
     state.plugins = state.plugins.map((p) =>
       p.id === "dmg-sweeper" ? { ...p, enabled: false } : p,
     );
     await rt2.syncState(state);
     const infoAfterDisable = await rt2.inspect();
-    expect(infoAfterDisable.registeredTools as string[]).not.toContain(
-      "plugin_dmg_sweeper_move_to_trash",
+    expect(infoAfterDisable.installedExtensions as string[]).not.toContain(
+      "plugin:dmg-sweeper",
     );
 
     await rt2.close();
   });
 
-  it("unmounts core disk tools when disk-guard disabled, resolves gemini->google keys, and connects real stdio MCP server", async () => {
+  it("mounts universal core tools, resolves gemini->google keys, and connects real stdio MCP server", async () => {
     const dir = await mkdtemp(join(tmpdir(), "valet-mcp-"));
     tempDirs.push(dir);
     const dbPath = join(dir, "pi-agent.sqlite");
@@ -507,22 +854,20 @@ rl.on("line", (line) => {
     expect(resolvedGemini.usingLocalFallback).toBe(false);
     expect(resolvedGemini.ref.provider).toBe("google");
 
-    // 3. Disabling core `disk-guard` unmounts disk tools cleanly
+    // 3. Universal core tools remain available even when an individual plugin is disabled
     state.plugins = state.plugins.map((p) =>
       p.id === "disk-guard" ? { ...p, enabled: false } : p,
     );
     await rt.syncState(state);
     const afterDisable = await rt.inspect();
-    expect(afterDisable.registeredTools as string[]).not.toContain("disk_scan");
-    expect(afterDisable.registeredTools as string[]).not.toContain("disk_move_to_trash");
-
-    // Calling /clean while disk-guard is disabled gets polite explanation instead of phantom tool call
-    const disabledCleanRes = await rt.sendChat({
-      chatId: "chat-disabled-disk",
-      prompt: "/clean 清理大文件",
-      model: "claude-opus-4",
-    });
-    expect(disabledCleanRes.replyMessage.content).toContain("停用");
+    const registered = afterDisable.registeredTools as string[];
+    expect(registered).toContain("trash_files");
+    expect(registered).toContain("read_file");
+    expect(registered).toContain("list_dir");
+    expect(registered).toContain("write_file");
+    expect(registered).toContain("kill_process");
+    expect(registered).toContain("ask_user");
+    expect(afterDisable.installedExtensions as string[]).not.toContain("plugin:disk-guard");
 
     await rt.close();
   });
@@ -637,6 +982,7 @@ rl.on("line", (line) => {
       model: "claude-opus-4",
     });
     expect(chatRes.replyMessage.content).toBe("扫描完成，共发现 3 项可清理目标。");
+    expect(chatRes.replyMessage.steps).toBe(undefined);
     expect(chatRes.replyMessage.content).not.toContain("INTERNAL_TAG_THINKING");
     expect(chatRes.replyMessage.content).not.toContain("PRIVATE_MONOLOGUE");
 
@@ -748,6 +1094,464 @@ rl.on("line", (line) => {
     });
     expect(receivedImageBlock).toBe(true);
     expect(res2.replyMessage.content).toContain("屏幕截图");
+
+    await rt.close();
+  });
+
+  it("mounts SKILL.md on custom event dispatch and supports abort + followUp", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-skill-abort-"));
+    tempDirs.push(dir);
+    const bridge = new FakeHostBridge();
+    const state = makeBaseState(dir);
+    state.plugins.push({
+      id: "webhook-ci",
+      slug: "webhook-ci",
+      name: "CI 失败哨兵",
+      tagline: "接收 Webhook 并按 SKILL.md 分析失败日志",
+      description: "Webhook 插件",
+      version: "0.1.0",
+      bundleId: "local.valet.webhook-ci",
+      source: "local",
+      enabled: true,
+      installed: true,
+      events: [{ id: "deploy.failed", description: "Deploy failed", policy: "auto", count24h: 0 }],
+      config: { values: {} },
+      manifestYaml: `id: local.valet.webhook-ci\nname: CI 失败哨兵\nversion: 0.1.0\ntriggers:\n  - id: deploy.failed\n    sensor: webhook\n`,
+      skillMarkdown: "# CI Sentinel Skill\n收到 deploy.failed 时，优先定位第一个报错栈。",
+    });
+
+    const rt = new ValetDurableRuntime(bridge);
+    await rt.init({ dbPath: join(dir, "pi.sqlite"), state });
+
+    // 1. Custom plugin SKILL.md is mounted during event dispatch
+    let sawSkillTag = false;
+    rt.models.setLocalStewardScript([
+      (ctx) => {
+        const serialized = JSON.stringify(ctx);
+        if (serialized.includes("<plugin_skill") && serialized.includes("优先定位第一个报错栈")) {
+          sawSkillTag = true;
+        }
+        return fauxAssistantMessage("已按 CI 失败哨兵 Skill 完成定位。");
+      },
+    ]);
+
+    const evtRes = await rt.dispatchPluginEvent({
+      pluginId: "webhook-ci",
+      eventCode: "deploy.failed",
+      payload: { sensor: "webhook", service: "billing-api" },
+    });
+    expect(sawSkillTag).toBe(true);
+    expect(evtRes.handled).toBe(true);
+
+    // 2. abortChat aborts an in-flight turn cleanly, and followUp appends cleanly
+    let markToolEntered!: () => void;
+    const toolEntered = new Promise<void>((resolve) => {
+      markToolEntered = resolve;
+    });
+    const origCallHost = bridge.callHost.bind(bridge);
+    bridge.callHost = async <T = unknown>(
+      method: string,
+      params: Record<string, unknown> = {},
+    ): Promise<T> => {
+      if (method === "host.kernel.overview") {
+        markToolEntered();
+        await new Promise((r) => setTimeout(r, 350));
+      }
+      return origCallHost<T>(method, params);
+    };
+
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [fauxToolCall("system_overview", {})],
+          { stopReason: "toolUse" },
+        ),
+      () => fauxAssistantMessage("如果未被中止会返回这里。"),
+    ]);
+
+    const firstTurnPromise = rt.sendChat({
+      chatId: "chat-abort-followup",
+      prompt: "开始一个长任务",
+      model: "claude-opus-4",
+      requestId: "req-abort-1",
+    });
+
+    await toolEntered;
+    await rt.abortChat("chat-abort-followup");
+
+    const abortedRes = await firstTurnPromise;
+    expect(abortedRes.replyMessage.content).toContain("停止生成");
+
+    rt.models.setLocalStewardScript([
+      () => fauxAssistantMessage("已收到你的追加消息并继续处理。"),
+    ]);
+    const secondTurn = await rt.sendChat({
+      chatId: "chat-abort-followup",
+      prompt: "追加一条跟进指示",
+      model: "claude-opus-4",
+      requestId: "req-followup-2",
+    });
+    expect(secondTurn.replyMessage.content).toContain("追加消息");
+
+    // 3. whenBusy: "steer" injects mid-run steering and yields matching deterministic msg- ID
+    let markSteerToolEntered!: () => void;
+    const steerToolEntered = new Promise<void>((resolve) => {
+      markSteerToolEntered = resolve;
+    });
+    bridge.callHost = async <T = unknown>(
+      method: string,
+      params: Record<string, unknown> = {},
+    ): Promise<T> => {
+      if (method === "host.kernel.overview") {
+        markSteerToolEntered();
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return origCallHost<T>(method, params);
+    };
+
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [fauxToolCall("system_overview", {})],
+          { stopReason: "toolUse" },
+        ),
+      (ctx) => {
+        const sawSteer = ctx.messages.some(
+          (m) => m.role === "user" && JSON.stringify(m.content).includes("立即切换排查方向"),
+        );
+        return fauxAssistantMessage(
+          sawSteer ? "已按实时引导调整方向并完成总结。" : "未看到引导消息。",
+        );
+      },
+    ]);
+
+    const steerBasePromise = rt.sendChat({
+      chatId: "chat-steer-midrun",
+      prompt: "开始常规巡检",
+      model: "claude-opus-4",
+      requestId: "req-steer-base",
+    });
+    await steerToolEntered;
+    const steerInjectPromise = rt.sendChat({
+      chatId: "chat-steer-midrun",
+      prompt: "立即切换排查方向",
+      model: "claude-opus-4",
+      requestId: "req-steer-inject",
+      whenBusy: "steer",
+    });
+
+    const [baseRes, injectRes] = await Promise.all([steerBasePromise, steerInjectPromise]);
+    expect(injectRes.replyMessage.content).toContain("实时引导调整方向");
+    expect(baseRes.replyMessage.id).toBe(injectRes.replyMessage.id);
+    expect(baseRes.replyMessage.id.startsWith("msg-")).toBe(true);
+
+    await rt.close();
+  });
+
+  it("supports Action-less Skill plugins, background Inbox queueing, and interactive foreground Permission/Ask", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-perm-"));
+    tempDirs.push(dir);
+    const bridge = new FakeHostBridge();
+    const state = makeBaseState(dir);
+    state.plugins.push({
+      id: "surge-doctor",
+      slug: "surge-doctor",
+      name: "Surge 诊断",
+      tagline: "通过 script_poll 与 Skill 诊断 Surge",
+      description: "Action-less Surge 插件包",
+      version: "v1.0.0",
+      bundleId: "com.community.surge-doctor",
+      source: "community",
+      enabled: true,
+      installed: true,
+      localDir: join(dir, "plugins", "surge-doctor"),
+      bundledFiles: ["manifest.yaml", "SKILL.md", "scripts/poll-errors.mjs", "scripts/import-logs.mjs"],
+      events: [
+        { id: "surge.error_detected", description: "surge errors", policy: "auto", count24h: 0 },
+      ],
+      config: { values: { pollIntervalSec: 30, windowMinutes: 60 } },
+      manifestYaml: `id: com.community.surge-doctor
+name: Surge 诊断
+version: 1.0.0
+triggers:
+  - id: surge.error_detected
+    sensor: script_poll
+    script: scripts/poll-errors.mjs
+    interval_config_key: pollIntervalSec
+    interval_sec: 30
+    emit_on: json
+    policy: auto`,
+      skillMarkdown: "INITIAL_SURGE_SKILL_V1: 先调用 read-only 脚本导入日志，再用 bash 请求确认操作。",
+    });
+
+    const rt = new ValetDurableRuntime(bridge);
+    await rt.init({ dbPath: join(dir, "pi-perm.sqlite"), state });
+
+    // 0. Zero plugin_* static tools compiled
+    const info = await rt.inspect();
+    const tools = info.registeredTools as string[];
+    expect(tools.some((t) => t.startsWith("plugin_") && !CORE_PLUGIN_TOOLS.has(t))).toBe(false);
+    expect(tools).toContain("bash");
+    expect(tools).toContain("trash_files");
+    expect(tools).toContain("ask_user");
+
+    // 1. Background dispatch queues mutating bash into Inbox without blocking
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxThinking("后台事件检测到 DNS 异常，通过 bash 执行 surge-cli flush dns（触发收件箱审批）"),
+            fauxToolCall("bash", {
+              command: "surge-cli flush dns",
+              reason: "检测到 DNS 解析异常，清理 Surge DNS 缓存",
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      () => fauxAssistantMessage("已提交刷新 Surge DNS 缓存请求至收件箱。"),
+    ]);
+
+    const bgRes = await rt.dispatchPluginEvent({
+      pluginId: "surge-doctor",
+      eventCode: "surge.error_detected",
+      payload: { sensor: "script_poll" },
+    });
+    expect(bgRes.queuedInboxIds.length).toBe(1);
+    expect(bridge.bashCalls.length).toBe(0);
+
+    // Hot-reload skillMarkdown without changing manifestYaml
+    await rt.syncState({
+      ...state,
+      plugins: state.plugins.map((p) =>
+        p.id === "surge-doctor"
+          ? { ...p, skillMarkdown: "HOT_RELOADED_SURGE_SKILL_V2" }
+          : p,
+      ),
+    });
+
+    // 2. Interactive foreground Chat: allow_once executes bash, allow_session caches for turn 2, ask_user gets answer
+    const seenPermissions: NonNullable<ChatStreamPayload["pendingPermission"]>[] = [];
+    bridge.onChatStream((payload) => {
+      if (payload.pendingPermission) {
+        seenPermissions.push(payload.pendingPermission);
+        if (payload.pendingPermission.toolName === "bash") {
+          rt.resolvePermission({
+            chatId: payload.chatId,
+            requestId: payload.pendingPermission.requestId,
+            decision: "allow_session",
+          });
+        } else if (payload.pendingPermission.toolName === "ask_user") {
+          rt.resolvePermission({
+            chatId: payload.chatId,
+            requestId: payload.pendingPermission.requestId,
+            decision: "allow_once",
+            note: "顺带清理",
+          });
+        } else {
+          rt.resolvePermission({
+            chatId: payload.chatId,
+            requestId: payload.pendingPermission.requestId,
+            decision: "deny",
+            note: "保留文件",
+          });
+        }
+      }
+    });
+
+    let sawHotSkill = false;
+    rt.models.setLocalStewardScript([
+      (ctx) => {
+        if (JSON.stringify(ctx).includes("HOT_RELOADED_SURGE_SKILL_V2")) {
+          sawHotSkill = true;
+        }
+        return fauxAssistantMessage(
+          [
+            fauxToolCall("bash", {
+              command: "surge-cli flush dns",
+              reason: "测试本会话允许",
+            }),
+          ],
+          { stopReason: "toolUse" },
+        );
+      },
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("bash", {
+              command: "surge-cli reload",
+              reason: "同会话第二次变更命令应免弹窗直接放行",
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("ask_user", {
+              question: "是否需要继续执行清理？",
+              options: ["仅诊断", "顺带清理"],
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      (ctx) => {
+        const lastText = JSON.stringify(ctx.messages[ctx.messages.length - 1]);
+        return fauxAssistantMessage(`收到你的回复：${lastText.includes("顺带清理") ? "顺带清理" : "未知"}`);
+      },
+    ]);
+
+    const fgRes = await rt.sendChat({
+      chatId: "chat-interactive-fg",
+      prompt: "帮我处理 Surge 并问我偏好",
+      model: "claude-opus-4",
+      interactive: true,
+    });
+    expect(sawHotSkill).toBe(true);
+    expect(seenPermissions.filter((p) => p.toolName === "bash").length).toBe(1); // 2nd bash skipped prompt via allow_session
+    expect(seenPermissions.filter((p) => p.toolName === "ask_user").length).toBe(1);
+    expect(bridge.bashCalls.length).toBe(2);
+    expect(fgRes.replyMessage.content).toContain("顺带清理");
+
+    // 3. Deny on trash_files preserves files cleanly
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("trash_files", {
+              paths: ["/Users/testuser/Downloads/old.ipsw"],
+              reason: "请求移入废纸篓",
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      () => fauxAssistantMessage("已取消删除，保留文件。"),
+    ]);
+
+    const denyRes = await rt.sendChat({
+      chatId: "chat-interactive-fg",
+      prompt: "删掉 old.ipsw",
+      model: "claude-opus-4",
+      interactive: true,
+    });
+    expect(bridge.trashCalls.length).toBe(0);
+    expect(denyRes.replyMessage.content).toContain("保留");
+
+    await rt.close();
+  });
+
+  it("registers core bash tool: runs read-only commands directly, gates mutating commands via Inbox, and blocks forbidden commands", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-bash-"));
+    tempDirs.push(dir);
+    const bridge = new FakeHostBridge();
+    const state = makeBaseState(dir);
+
+    const rt = new ValetDurableRuntime(bridge);
+    await rt.init({ dbPath: join(dir, "pi-bash.sqlite"), state });
+
+    const info = await rt.inspect();
+    expect(info.registeredTools as string[]).toContain("bash");
+
+    // 1. Read-only diagnostic bash commands run directly without queuing Inbox approval
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("bash", { command: "ls -la ~/Downloads | head -n 5" }),
+            fauxToolCall("bash", { command: "git status" }),
+            fauxToolCall("bash", { command: "lsof -i :3000 2>/dev/null" }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      () => fauxAssistantMessage("已完成只读命令排查，端口 3000 状态已获取。"),
+    ]);
+
+    const readRes = await rt.sendChat({
+      chatId: "chat-bash-readonly",
+      prompt: "帮我检查 Downloads 列表和 3000 端口占用",
+      model: "claude-opus-4",
+    });
+    expect(readRes.replyMessage.content).toContain("只读命令排查");
+    expect(bridge.bashCalls.length).toBe(3);
+    expect(bridge.queued.length).toBe(0);
+    expect(readRes.replyMessage.steps?.[0]?.label).toContain("执行命令 · ls -la ~/Downloads");
+
+    // 2. Mutating bash commands queue an Inbox approval card and run when approved
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("bash", {
+              command: "brew cleanup",
+              cwd: "~",
+              reason: "清理过期 Homebrew 缓存配方",
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      () => fauxAssistantMessage("该变更命令已提交收件箱等待确认。"),
+    ]);
+
+    const mutateRes = await rt.sendChat({
+      chatId: "chat-bash-mutate",
+      prompt: "执行 brew cleanup",
+      model: "claude-opus-4",
+    });
+    expect(mutateRes.queuedInboxIds.length).toBe(1);
+    expect(bridge.queued.length).toBe(1);
+    expect(bridge.queued[0]?.toolName).toBe("bash");
+    expect(bridge.queued[0]?.title).toContain("执行终端命令：brew cleanup");
+    expect(bridge.bashCalls.length).toBe(3);
+
+    const execRes = await rt.executeApprovedTool({
+      inboxId: "inbox-bash-1",
+      toolName: "bash",
+      toolArgs: bridge.queued[0]!.toolArgs,
+    });
+    expect(execRes.ok).toBe(true);
+    expect(execRes.output).toContain("mock-bash-output");
+    expect(bridge.bashCalls.length).toBe(4);
+    expect(bridge.bashCalls[3]?.command).toBe("brew cleanup");
+
+    // 3. Forbidden commands targeting ~/.ssh or sudo are hard-denied before approval or execution
+    expect(
+      evaluateToolPolicy(
+        {
+          toolName: "bash",
+          pluginId: "valet-core",
+          pluginName: "Valet Core",
+          actionId: "shell.bash",
+          eventCode: "system.command",
+          safety: "reversible",
+          checklistKey: "runTerminalCommand",
+          category: "process",
+          iconKind: "pulse",
+          reversible7d: false,
+          approveLabel: "批准执行",
+          dismissLabel: "拒绝",
+        },
+        { command: "cat ~/.ssh/id_rsa" },
+        state,
+        false,
+      ).outcome,
+    ).toBe("deny");
+
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("bash", { command: "sudo rm -rf /tmp/x" }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      () => fauxAssistantMessage("该提权命令已被安全策略拦截。"),
+    ]);
+    await rt.sendChat({
+      chatId: "chat-bash-deny",
+      prompt: "用 sudo 删掉 /tmp/x",
+      model: "claude-opus-4",
+    });
+    expect(bridge.bashCalls.length).toBe(4);
+    expect(bridge.queued.length).toBe(1);
 
     await rt.close();
   });

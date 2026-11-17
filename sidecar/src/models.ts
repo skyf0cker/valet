@@ -25,7 +25,11 @@ import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import type { ModelRef } from "@earendil-works/pi-durable";
-import type { AgentProviderConfig, ValetSyncState } from "./protocol.ts";
+import type {
+  AgentProviderConfig,
+  AutoReviewConfig,
+  ValetSyncState,
+} from "./protocol.ts";
 
 class InMemoryCredentialStore implements CredentialStore {
   private readonly store = new Map<string, Credential>();
@@ -164,10 +168,11 @@ function parseTrailingJson(text: string): Record<string, unknown> | undefined {
 /**
  * Generates deterministic multi-turn tool-calling & synthesis turns for Valet's local
  * steward fallback provider when no live cloud API key is configured.
+ * Uses only Valet's universal core tools without plugin-specific branching.
  */
 function buildLocalStewardMessage(
   context: TranscriptContext,
-  availableTools: ReadonlySet<string>,
+  _availableTools: ReadonlySet<string>,
 ): AssistantMessage {
   const msgs = context.messages;
   let lastUserIdx = -1;
@@ -186,140 +191,126 @@ function buildLocalStewardMessage(
     (m): m is ToolResultMessage => m.role === "toolResult",
   );
 
-  // Event-driven trigger turns from Host / Plugin Simulator / Watchers
+  // Event-driven trigger turns from Host / Sensors / Webhooks / Crons
   if (prompt.startsWith("[EVENT_TRIGGER ")) {
     const pluginMatch = prompt.match(/plugin=([^\s\]]+)/);
     const eventMatch = prompt.match(/event=([^\s\]]+)/);
-    const pluginId = pluginMatch?.[1] ?? "";
-    const eventCode = eventMatch?.[1] ?? "";
+    const payloadMatch = prompt.match(/payload=(\{[\s\S]*?\})(?:\n|$)/);
+    const pluginId = pluginMatch?.[1] ?? "plugin";
+    const eventCode = eventMatch?.[1] ?? "custom.event";
+    let eventPayload: Record<string, unknown> | undefined;
+    if (payloadMatch?.[1]) {
+      try {
+        eventPayload = JSON.parse(payloadMatch[1]) as Record<string, unknown>;
+      } catch {
+        eventPayload = undefined;
+      }
+    }
 
     if (toolResults.length === 0) {
-      if (pluginId === "disk-guard" || eventCode.startsWith("disk.")) {
-        return fauxAssistantMessage(
-          [
-            fauxThinking("收到磁盘守卫事件，先执行只读磁盘扫描以确认安全候选路径。"),
-            fauxToolCall("disk_scan", {
-              scope: "all",
-              minSizeMB: 2048,
-              idleDays: 90,
-            }),
-          ],
-          { stopReason: "toolUse" },
-        );
-      }
-      if (pluginId === "process-sentinel" || eventCode.startsWith("process.")) {
-        return fauxAssistantMessage(
-          [
-            fauxThinking("收到进程哨兵事件，先采样高占用进程列表。"),
-            fauxToolCall("process_sample", { limit: 5 }),
-          ],
-          { stopReason: "toolUse" },
-        );
-      }
-      if (pluginId === "uninstall-scrubber" || eventCode.startsWith("app.")) {
-        return fauxAssistantMessage(
-          [
-            fauxThinking("收到卸载清道夫事件，扫描应用残留目录。"),
-            fauxToolCall("app_scan_remnants", {}),
-          ],
-          { stopReason: "toolUse" },
-        );
-      }
-      if (pluginId === "log-detective" || eventCode.startsWith("log.")) {
-        return fauxAssistantMessage(
-          [
-            fauxThinking("收到日志侦探事件，读取诊断崩溃日志摘要。"),
-            fauxToolCall("log_summarize_crashes", { minutes: 60 }),
-          ],
-          { stopReason: "toolUse" },
-        );
-      }
       return fauxAssistantMessage(
         [
-          fauxThinking("先读取当前系统概览以响应插件事件。"),
+          fauxThinking(`收到插件 ${pluginId} 事件 ${eventCode}，先采集系统实时概览与上下文。`),
           fauxToolCall("system_overview", {}),
         ],
         { stopReason: "toolUse" },
       );
     }
 
-    if (
-      toolResults.length === 1 &&
-      toolResults[0]?.toolName === "disk_scan" &&
-      !toolResults[0].isError
-    ) {
-      const scanJson = parseTrailingJson(extractToolText(toolResults[0]));
-      const candidates = Array.isArray(scanJson?.cleanablePaths)
-        ? (scanJson.cleanablePaths as string[]).slice(0, 4)
-        : [];
-      const totalGB = Number(scanJson?.estimatedReclaimableGB ?? 0);
-      if (candidates.length > 0) {
-        return fauxAssistantMessage(
-          [
-            fauxThinking("已扫描到安全候选路径，按策略提交移入废纸篓动作。"),
-            fauxToolCall("disk_move_to_trash", {
-              paths: candidates,
-              estimatedGB: totalGB,
-              reason: `响应事件 ${eventCode} 的安全清理候选`,
-            }),
-          ],
-          { stopReason: "toolUse" },
-        );
-      }
-    }
-
     const lastResult = toolResults[toolResults.length - 1];
     const lastText = lastResult ? extractToolText(lastResult) : "";
     if (lastText.includes("NEEDS_APPROVAL")) {
       return fauxAssistantMessage(
-        `已响应事件 \`${eventCode}\` 并完成只读扫描，涉及写操作的安全清单已提交至**收件箱**等待你批准。`,
+        `已响应事件 \`${eventCode}\`（${pluginId}），涉及敏感变更的操作已按策略送入**收件箱**等待你批准。`,
       );
     }
+
+    const payloadSummary =
+      typeof eventPayload?.summary === "string" && eventPayload.summary.trim()
+        ? `\n\n- 传感器摘要：${eventPayload.summary.trim()}`
+        : "";
+    const groupLines = Array.isArray(eventPayload?.groups)
+      ? (eventPayload.groups as Array<Record<string, unknown>>)
+          .slice(0, 5)
+          .map((g) => {
+            const label = String(g.categoryLabel ?? g.category ?? "异常项");
+            const count = Number(g.count ?? 1);
+            const sample = String(g.sampleMessage ?? "");
+            return `- **${label}**（${count} 次）：${sample}`;
+          })
+          .join("\n")
+      : "";
+
     return fauxAssistantMessage(
-      `已处理事件 \`${eventCode}\`：\n\n${lastText.split("\n")[0] ?? "完成检查"}。`,
+      `已捕获并处理插件 \`${pluginId}\` 的事件 \`${eventCode}\`。${payloadSummary}${groupLines ? `\n\n${groupLines}` : ""}\n\n如需进一步诊断或处理，可在对话中直接告知需求或按插件 Skill 指引继续排查。`,
     );
   }
 
   // Interactive User Chat Intents
+  const isSelfConfigIntent =
+    lower.startsWith("/self-config") ||
+    lower.includes("valet cli") ||
+    lower.includes("自配置");
+  const isPluginDevIntent =
+    lower.startsWith("/plugin-dev") || lower.startsWith("/plugin-install");
+  const isPluginIntent =
+    !isPluginDevIntent &&
+    !isSelfConfigIntent &&
+    (lower.startsWith("/plugin") ||
+      lower.includes("插件") ||
+      lower.includes("规则") ||
+      lower.includes(".dmg") ||
+      lower.includes("截图"));
   const isCleanIntent =
     lower.startsWith("/clean") ||
     lower.includes("大文件") ||
     lower.includes("清理") ||
     lower.includes("磁盘");
-  const isProcessIntent =
-    lower.startsWith("/ps") ||
-    lower.startsWith("/scan") ||
-    lower.includes("cpu") ||
-    lower.includes("进程") ||
-    lower.includes("卡") ||
-    lower.includes("慢");
-  const isPluginIntent =
-    lower.startsWith("/plugin") ||
-    lower.includes("插件") ||
-    lower.includes("规则") ||
-    lower.includes(".dmg") ||
-    lower.includes("截图");
-  const isOrphanIntent = lower.includes("卸载") || lower.includes("残留");
-  const isLogIntent =
-    lower.includes("日志") || lower.includes("崩溃") || lower.includes("crash");
   const isMemoryIntent = lower.startsWith("记住") || lower.includes("记住");
+  const isAskIntent =
+    lower.startsWith("/ask") ||
+    lower.includes("问我") ||
+    lower.includes("选一个");
 
-  // Turn 1: dispatch first diagnostic / steward tool call
   if (toolResults.length === 0) {
+    if (isSelfConfigIntent) {
+      return fauxAssistantMessage(
+        [
+          fauxThinking("先加载内置自配置技能手册 valet-self-config。"),
+          fauxToolCall("skill_load", { name: "valet-self-config" }),
+        ],
+        { stopReason: "toolUse" },
+      );
+    }
+
+    if (isPluginDevIntent) {
+      return fauxAssistantMessage(
+        [
+          fauxThinking("先加载内置插件开发技能手册 valet-plugin-dev。"),
+          fauxToolCall("skill_load", { name: "valet-plugin-dev" }),
+        ],
+        { stopReason: "toolUse" },
+      );
+    }
+
     if (isPluginIntent) {
       const isDmg = lower.includes(".dmg") || lower.includes("dmg");
       return fauxAssistantMessage(
         [
-          fauxThinking("分析用户自动化规则意图，起草可执行 YAML 插件 manifest。"),
+          fauxThinking("分析用户自动化规则意图，起草 Action-less 可插拔插件 YAML 与 SKILL.md。"),
           fauxToolCall("plugin_draft_create", {
             name: isDmg ? "下载 .dmg 清扫器" : "桌面截图归档器",
             slug: isDmg ? "dmg-cleaner" : "screenshot-archiver",
             eventCode: "fs.file_created",
+            sensor: "fs_watch",
             glob: isDmg ? "~/Downloads/*.dmg" : "~/Desktop/截屏*.png",
-            actionId: isDmg ? "move_to_trash" : "move_to",
+            actionSummary: isDmg ? "检查安装包并将过期 .dmg 移入废纸篓" : "整理桌面截图到 Pictures/Screenshots",
             ...(isDmg
               ? { condition: "app_installed_from(dmg)" }
               : { targetPath: "~/Pictures/Screenshots" }),
+            skillMarkdown: isDmg
+              ? "### 触发条件\n- `~/Downloads/*.dmg` 新增安装包。\n\n### 处理逻辑\n1. 检查 `/Applications` 对应应用是否已安装，或向用户确认。\n2. 使用 `trash_files` 将安装包移入系统废纸篓（7 天可还原）。"
+              : "### 触发条件\n- `~/Desktop` 新增屏幕截图。\n\n### 处理逻辑\n1. 使用 `list_dir` 确认目标路径，再用 `bash` 将截图移动到 `~/Pictures/Screenshots`。",
           }),
         ],
         { stopReason: "toolUse" },
@@ -327,64 +318,10 @@ function buildLocalStewardMessage(
     }
 
     if (isCleanIntent) {
-      if (!availableTools.has("disk_scan")) {
-        return fauxAssistantMessage(
-          "当前「磁盘守卫 (`disk-guard`)」插件处于停用状态，未挂载 `disk_scan` 传感器与清理工具。请前往 **插件** 页面启用「磁盘守卫」后重试。",
-        );
-      }
       return fauxAssistantMessage(
         [
-          fauxThinking("先通过 disk_scan 对用户缓存与超过 90 天未访问的大文件执行只读安全扫描（避开受保护目录）。"),
-          fauxToolCall("disk_scan", {
-            scope: "all",
-            minSizeMB: 2048,
-            idleDays: 90,
-          }),
-        ],
-        { stopReason: "toolUse" },
-      );
-    }
-
-    if (isProcessIntent) {
-      if (!availableTools.has("process_sample")) {
-        return fauxAssistantMessage(
-          "当前「进程哨兵 (`process-sentinel`)」插件已停用，未挂载 `process_sample` 工具。启用后即可采样实时进程。",
-        );
-      }
-      return fauxAssistantMessage(
-        [
-          fauxThinking("采样当前 macOS 高 CPU / 内存进程，定位异常占用源。"),
-          fauxToolCall("process_sample", { limit: 5 }),
-        ],
-        { stopReason: "toolUse" },
-      );
-    }
-
-    if (isOrphanIntent) {
-      if (!availableTools.has("app_scan_remnants")) {
-        return fauxAssistantMessage(
-          "当前「卸载清道夫 (`uninstall-scrubber`)」插件已停用，启用后即可扫描残留目录。",
-        );
-      }
-      return fauxAssistantMessage(
-        [
-          fauxThinking("扫描已移除应用在 ~/Library 留下的孤儿支持目录与缓存。"),
-          fauxToolCall("app_scan_remnants", {}),
-        ],
-        { stopReason: "toolUse" },
-      );
-    }
-
-    if (isLogIntent) {
-      if (!availableTools.has("log_summarize_crashes")) {
-        return fauxAssistantMessage(
-          "当前「日志侦探 (`log-detective`)」插件尚未启用，前往 **插件** 启用即可读取崩溃报告。",
-        );
-      }
-      return fauxAssistantMessage(
-        [
-          fauxThinking("读取 DiagnosticReports 下近期崩溃报告，汇总高频异常进程。"),
-          fauxToolCall("log_summarize_crashes", { minutes: 120 }),
+          fauxThinking("先通过 list_dir 只读查看 ~/Downloads 中的候选文件，避开受保护目录。"),
+          fauxToolCall("list_dir", { path: "~/Downloads", maxEntries: 30 }),
         ],
         { stopReason: "toolUse" },
       );
@@ -403,6 +340,19 @@ function buildLocalStewardMessage(
       );
     }
 
+    if (isAskIntent) {
+      return fauxAssistantMessage(
+        [
+          fauxThinking("通过 ask_user 向用户确认处理偏好。"),
+          fauxToolCall("ask_user", {
+            question: "希望我先执行只读诊断扫描，还是直接列出清理候选方案？",
+            options: ["先只读排查", "列出候选方案"],
+          }),
+        ],
+        { stopReason: "toolUse" },
+      );
+    }
+
     return fauxAssistantMessage(
       [
         fauxThinking("先读取当前实时系统指标与在岗插件状态，准备管家回复。"),
@@ -412,26 +362,58 @@ function buildLocalStewardMessage(
     );
   }
 
-  // Turn 2 for /clean: propose moving scanned candidates to Trash -> intercepted by Safety Hook!
+  // Turn 2 for /self-config or /plugin-dev
+  if (
+    isSelfConfigIntent &&
+    toolResults.length === 1 &&
+    toolResults[0]?.toolName === "skill_load"
+  ) {
+    return fauxAssistantMessage(
+      [
+        fauxThinking("已读取 valet-self-config 手册，通过只读命令 valet status --json 检查运行态。"),
+        fauxToolCall("bash", { command: "valet status --json" }),
+      ],
+      { stopReason: "toolUse" },
+    );
+  }
+
+  if (
+    isPluginDevIntent &&
+    toolResults.length === 1 &&
+    toolResults[0]?.toolName === "skill_load"
+  ) {
+    return fauxAssistantMessage(
+      [
+        fauxThinking("已读取 valet-plugin-dev 手册，列举当前已安装插件状态。"),
+        fauxToolCall("plugin_list", {}),
+      ],
+      { stopReason: "toolUse" },
+    );
+  }
+
+  // Turn 2 for /clean: inspect list_dir output -> propose moving real file candidates via trash_files
   if (
     isCleanIntent &&
     toolResults.length === 1 &&
-    toolResults[0]?.toolName === "disk_scan"
+    toolResults[0]?.toolName === "list_dir" &&
+    !toolResults[0].isError
   ) {
-    const scanData = parseTrailingJson(extractToolText(toolResults[0]));
-    const candidates = Array.isArray(scanData?.cleanablePaths)
-      ? (scanData.cleanablePaths as string[]).slice(0, 4)
+    const dirData = parseTrailingJson(extractToolText(toolResults[0]));
+    const entries = Array.isArray(dirData?.entries)
+      ? (dirData.entries as Array<{ path?: string; isDir?: boolean; sizeBytes?: number }>)
       : [];
-    const totalGB = Number(scanData?.estimatedReclaimableGB ?? 0);
+    const candidatePaths = entries
+      .filter((e) => typeof e.path === "string" && e.path && !e.isDir)
+      .slice(0, 4)
+      .map((e) => e.path as string);
 
-    if (candidates.length > 0) {
+    if (candidatePaths.length > 0) {
       return fauxAssistantMessage(
         [
-          fauxThinking("扫描发现可安全释放候选文件，调用 disk_move_to_trash 提交安全审核链路。"),
-          fauxToolCall("disk_move_to_trash", {
-            paths: candidates,
-            estimatedGB: totalGB,
-            reason: `扫描到 ${candidates.length} 项安全可清理缓存/闲置文件（预计释放 ${totalGB} GB），移入废纸篓且 7 天内可还原。`,
+          fauxThinking("在 ~/Downloads 检测到待清理文件，调用 trash_files 提交安全移入废纸篓审批。"),
+          fauxToolCall("trash_files", {
+            paths: candidatePaths,
+            reason: `在 ~/Downloads 找到 ${candidatePaths.length} 个文件候选，请求移入废纸篓（7 天可还原）。`,
           }),
         ],
         { stopReason: "toolUse" },
@@ -446,52 +428,7 @@ function buildLocalStewardMessage(
 
   if (latest?.toolName === "plugin_draft_create") {
     return fauxAssistantMessage(
-      `已按你的描述通过 \`plugin_draft_create\` 起草了可热加载的本地 YAML 插件规则，点击右侧**安装**即可写入 Valet 并同步加载到 Agent 插件注册表。`,
-    );
-  }
-
-  if (latest?.toolName === "process_sample") {
-    const rows = Array.isArray(parsed?.rows)
-      ? (parsed.rows as Array<{ name: string; cpuPct: number; memLabel: string }>)
-      : [];
-    const top = rows[0];
-    const summary = top
-      ? `已完成实时进程采样：当前最高占用进程为 \`${top.name}\`（CPU **${top.cpuPct}%** · 内存 ${top.memLabel}），系统整体 CPU ${String(parsed?.cpuPct ?? "--")}%、内存 ${String(parsed?.memPct ?? "--")}%。你可以直接点击下方表格操作，或让我将特定规则加入自动策略。`
-      : "已完成当前系统进程采样，未发现明显失控的高 CPU 进程。";
-    return fauxAssistantMessage(summary);
-  }
-
-  if (isCleanIntent) {
-    const scanRes = parseTrailingJson(extractToolText(toolResults[0]!));
-    const totalGB = Number(scanRes?.estimatedReclaimableGB ?? 0);
-    const itemsCount = Array.isArray(scanRes?.items) ? scanRes.items.length : 0;
-    if (rawText.includes("NEEDS_APPROVAL")) {
-      return fauxAssistantMessage(
-        `已完成安全只读磁盘扫描：共发现 **${itemsCount} 项**可清理目标（预计可释放 **${totalGB} GB**，已严格避开受保护目录）。按照安全策略，已将确认清单推送到**收件箱**与**时间线**，确认后才会移入废纸篓（7 天内可一键还原）。`,
-      );
-    }
-    return fauxAssistantMessage(
-      itemsCount > 0
-        ? `已扫描发现 **${itemsCount} 项**可清理目标（预计 **${totalGB} GB**），并已按当前自动策略安全移入废纸篓。`
-        : "刚刚按阈值扫描了常用缓存与下载目录，已避开受保护路径，暂未发现超阈值可清理目标。",
-    );
-  }
-
-  if (latest?.toolName === "app_scan_remnants") {
-    const remnants = Array.isArray(parsed?.remnants) ? parsed.remnants.length : 0;
-    return fauxAssistantMessage(
-      remnants > 0
-        ? `卸载残留扫描完成，共发现 ${remnants} 项疑似孤儿应用残留目录；涉及关键登录配置已自动排除默认勾选。`
-        : "已扫描 `~/Library/Caches` 与 `Application Support`，暂未检测到明显孤儿应用残留。",
-    );
-  }
-
-  if (latest?.toolName === "log_summarize_crashes") {
-    const count = Number(parsed?.count ?? 0);
-    return fauxAssistantMessage(
-      count > 0
-        ? `已读取 \`~/Library/Logs/DiagnosticReports\`，近期发现 **${count} 份**诊断/崩溃报告：${String(parsed?.summary ?? "")}`
-        : "已检查 `~/Library/Logs/DiagnosticReports`，近期未发现新的系统或应用崩溃日志。",
+      `已按你的描述通过 \`plugin_draft_create\` 起草了纯 Skill 架构插件（仅声明传感器触发器与 \`SKILL.md\`），点击右侧**安装**即可启用。`,
     );
   }
 
@@ -499,14 +436,64 @@ function buildLocalStewardMessage(
     return fauxAssistantMessage(rawText || "已记住该偏好设置。");
   }
 
-  // General system overview answer
+  if (latest?.toolName === "ask_user") {
+    return fauxAssistantMessage(`已收到你的选择：${rawText}`);
+  }
+
+  if (isSelfConfigIntent) {
+    return fauxAssistantMessage(
+      `已加载 \`valet-self-config\` 技能手册并检查当前 \`valet status --json\` 状态：\n\n\`\`\`json\n${rawText.slice(0, 800)}\n\`\`\``,
+    );
+  }
+
+  if (isPluginDevIntent) {
+    return fauxAssistantMessage(
+      `已加载 \`valet-plugin-dev\` 技能手册并查询插件列表：可使用 \`plugin_install\`、\`plugin_reload\` 与 \`plugin_trigger\` 完成 Action-less 插件编写与闭环热加载。`,
+    );
+  }
+
+  if (isCleanIntent) {
+    if (rawText.includes("NEEDS_APPROVAL")) {
+      return fauxAssistantMessage(
+        `已完成安全只读目录扫描，涉及文件移动的清理清单已按策略推送至**收件箱**与**时间线**等待确认（7 天可还原）。`,
+      );
+    }
+    if (rawText.includes("USER_DENIED")) {
+      return fauxAssistantMessage(
+        `已尊重你的决定，取消清理上述文件，未对磁盘作任何修改。`,
+      );
+    }
+    if (latest?.toolName === "trash_files" && !latest.isError) {
+      return fauxAssistantMessage(`已按你的批准完成清理：${rawText}`);
+    }
+    return fauxAssistantMessage(
+      "已检查 `~/Downloads`，当前没有发现需要立即清理的文件，亦未触碰任何受保护目录。",
+    );
+  }
+
+  const topProcs = Array.isArray(parsed?.topProcesses)
+    ? (parsed.topProcesses as Array<{ name: string; cpuPct: number; memLabel?: string }>)
+    : [];
+  if (
+    topProcs.length > 0 &&
+    (lower.startsWith("/ps") ||
+      lower.startsWith("/scan") ||
+      lower.includes("cpu") ||
+      lower.includes("进程"))
+  ) {
+    const top = topProcs[0]!;
+    return fauxAssistantMessage(
+      `已完成实时进程采样：当前最高占用进程为 \`${top.name}\`（CPU **${top.cpuPct}%** · 内存 ${top.memLabel ?? "--"}），系统整体 CPU ${String(parsed?.cpuPct ?? "--")}%、内存 ${String(parsed?.memPct ?? "--")}%。你可以直接点击下方表格操作，或告诉我下一步需要处理的目标进程。`,
+    );
+  }
+
   const diskPct = parsed?.diskPct ?? "--";
   const diskFreeGB = parsed?.diskFreeGB ?? "--";
   const cpuPct = parsed?.cpuPct ?? "--";
   const memPct = parsed?.memPct ?? "--";
   const enabledCount = parsed?.enabledPlugins ?? "--";
   return fauxAssistantMessage(
-    `当前 Mac 状态概览：磁盘已用 **${diskPct}%**（可用 **${diskFreeGB} GB**），CPU **${cpuPct}%**，内存 **${memPct}%**，共有 **${enabledCount}** 个插件在岗运行。\n\n你可以直接让我诊断问题，或输入 \`/ps\`（采样进程）、\`/clean\`（扫描清理）、\`/plugin\`（起草自动化插件）。`,
+    `当前 Mac 状态概览：磁盘已用 **${diskPct}%**（可用 **${diskFreeGB} GB**），CPU **${cpuPct}%**，内存 **${memPct}%**，共有 **${enabledCount}** 个插件在岗运行。\n\n你可以直接用自然语言让我排查日志、分析进程、清理指定目录，或输入 \`/plugin\` 创建可插拔插件。`,
   );
 }
 
@@ -1128,6 +1115,124 @@ export class ValetModelManager {
         ok: false,
         latencyMs: Math.max(1, Date.now() - start),
         reply: `请求失败：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * Resolves whether a live non-mock small LLM is available for Auto Review fallback
+   * and executes a single structured review prompt without using `valet-local`.
+   */
+  async completeReviewPrompt(
+    state: ValetSyncState,
+    systemPrompt: string,
+    userPrompt: string,
+    overrideCfg?: Partial<AutoReviewConfig>,
+  ): Promise<{
+    ok: boolean;
+    modelLabel: string;
+    text: string;
+    latencyMs: number;
+    error?: string;
+  }> {
+    const ar = overrideCfg ?? state.preferences.autoReview;
+    const requestedProviderId =
+      ar?.fallbackProviderId && ar.fallbackProviderId !== "active"
+        ? ar.fallbackProviderId.trim()
+        : "";
+    const targetProvider =
+      (requestedProviderId
+        ? this.providerConfigs.find((p) => p.id === requestedProviderId) ??
+          state.providers.find((p) => p.id === requestedProviderId)
+        : undefined) ??
+      this.providerConfigs.find((p) => p.id === state.preferences.activeProviderId) ??
+      state.providers.find((p) => p.id === state.preferences.activeProviderId);
+
+    if (!targetProvider || isMockOrEmptyKey(targetProvider)) {
+      return {
+        ok: false,
+        modelLabel: "unconfigured",
+        text: "",
+        latencyMs: 0,
+        error: "未配置有效的审查小模型 API Key 或本地 Endpoint",
+      };
+    }
+
+    const piId = toPiProviderId(targetProvider.id);
+    const catalog = this.models
+      .getModels(piId)
+      .filter((m) => !m.id.startsWith("~"));
+    if (catalog.length === 0) {
+      return {
+        ok: false,
+        modelLabel: `${piId}/none`,
+        text: "",
+        latencyMs: 0,
+        error: `服务商 ${targetProvider.name} 暂无可用模型`,
+      };
+    }
+
+    const rawFallback = ar?.fallbackModel?.trim() ?? "";
+    const requestedModelId =
+      !rawFallback || rawFallback === "同快速模型"
+        ? state.preferences.models.fast || state.preferences.models.primary
+        : rawFallback;
+    const stripped = requestedModelId.replace(/^[^/]+\//, "");
+    const matched =
+      catalog.find((m) => m.id === requestedModelId) ??
+      catalog.find((m) => m.id === stripped) ??
+      catalog.find((m) => m.id.startsWith(stripped) || m.id.includes(stripped));
+    const model =
+      matched ??
+      (requestedModelId
+        ? { ...catalog[0]!, id: requestedModelId, name: requestedModelId }
+        : catalog[0]!);
+
+    const start = Date.now();
+    try {
+      const msg = await this.models.completeSimple(
+        model,
+        {
+          systemPrompt,
+          messages: [
+            {
+              role: "user",
+              content: userPrompt,
+              timestamp: Date.now(),
+            },
+          ],
+        },
+        { maxTokens: 512, signal: AbortSignal.timeout(10_000) },
+      );
+      const latencyMs = Math.max(1, Date.now() - start);
+      if (msg.stopReason === "error" || msg.errorMessage) {
+        return {
+          ok: false,
+          modelLabel: `${model.provider}/${model.id}`,
+          text: "",
+          latencyMs,
+          error: msg.errorMessage || "审查模型返回错误",
+        };
+      }
+      const replyText = msg.content
+        .filter((b): b is { type: "text"; text: string } => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "")
+        .trim();
+      return {
+        ok: true,
+        modelLabel: `${model.provider}/${model.id}`,
+        text: replyText,
+        latencyMs,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        modelLabel: `${model.provider}/${model.id}`,
+        text: "",
+        latencyMs: Math.max(1, Date.now() - start),
+        error: err instanceof Error ? err.message : String(err),
       };
     }
   }

@@ -5,23 +5,32 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"valet/internal/types"
 )
 
 // TriggerSpec describes a normalized declarative sensor trigger in a plugin manifest.
 type TriggerSpec struct {
-	ID           string   `json:"id"`
-	Description  string   `json:"description,omitempty"`
-	Policy       string   `json:"policy,omitempty"` // "auto" | "ask" | "record"
-	Sensor       string   `json:"sensor"`           // "metric_threshold" | "fs_watch" | "cron" | "manual"
-	WatchDirs    []string `json:"watchDirs,omitempty"`
-	Ops          []string `json:"ops,omitempty"` // "create" | "write" | "remove" | "rename"
-	Glob         string   `json:"glob,omitempty"`
-	Metric       string   `json:"metric,omitempty"`   // "disk.used_pct" | "proc.max_cpu" | "logs.crash_count"
-	Operator     string   `json:"operator,omitempty"` // "gt" | "gte" | "lt"
-	Threshold    float64  `json:"threshold,omitempty"`
-	IntervalSec  int      `json:"intervalSec,omitempty"`
-	SustainedSec int      `json:"sustainedSec,omitempty"`
-	Schedule     string   `json:"schedule,omitempty"`
+	ID                string   `json:"id"`
+	Description       string   `json:"description,omitempty"`
+	Policy            string   `json:"policy,omitempty"` // "auto" | "ask" | "record"
+	Sensor            string   `json:"sensor"`           // "fs_watch" | "script_poll" | "command_poll" | "http_poll" | "webhook" | "cron" | "manual"
+	WatchDirs         []string `json:"watchDirs,omitempty"`
+	Ops               []string `json:"ops,omitempty"` // "create" | "write" | "remove" | "rename"
+	Glob              string   `json:"glob,omitempty"`
+	Script            string   `json:"script,omitempty"`
+	IntervalConfigKey string   `json:"intervalConfigKey,omitempty"`
+	Metric            string   `json:"metric,omitempty"`
+	Operator          string   `json:"operator,omitempty"`
+	Threshold         float64  `json:"threshold,omitempty"`
+	IntervalSec       int      `json:"intervalSec,omitempty"`
+	SustainedSec      int      `json:"sustainedSec,omitempty"`
+	Schedule          string   `json:"schedule,omitempty"`
+	URL               string   `json:"url,omitempty"`
+	Method            string   `json:"method,omitempty"`
+	Command           string   `json:"command,omitempty"`
+	EmitOn            string   `json:"emitOn,omitempty"` // "json" | "change" | "non_empty" | "exit_zero" | "always"
+	MatchContains     string   `json:"matchContains,omitempty"`
 }
 
 // ActionSpec describes a normalized declarative tool/action in a plugin manifest.
@@ -35,33 +44,64 @@ type ActionSpec struct {
 	ChecklistKey string `json:"checklistKey,omitempty"`
 	UICard       string `json:"uiCard,omitempty"`
 	Target       string `json:"target,omitempty"`
+	Command      string `json:"command,omitempty"`
+	URL          string `json:"url,omitempty"`
 	Description  string `json:"description,omitempty"`
 }
 
-// ParsedManifest captures normalized plugin metadata, triggers/sensors, and actions/drivers.
+// ParsedManifest captures normalized plugin metadata, config schema, triggers/sensors, and skill rules.
 type ParsedManifest struct {
-	ID           string        `json:"id"`
-	Name         string        `json:"name"`
-	Version      string        `json:"version"`
-	Permissions  []string      `json:"permissions,omitempty"`
-	Instructions string        `json:"instructions,omitempty"`
-	Events       []string      `json:"events"`
-	Actions      []string      `json:"actions"`
-	TriggerSpecs []TriggerSpec `json:"triggerSpecs"`
-	ActionSpecs  []ActionSpec  `json:"actionSpecs"`
+	ID                      string                    `json:"id"`
+	Slug                    string                    `json:"slug,omitempty"`
+	BundleID                string                    `json:"bundleId,omitempty"`
+	Name                    string                    `json:"name"`
+	Tagline                 string                    `json:"tagline,omitempty"`
+	Description             string                    `json:"description,omitempty"`
+	Version                 string                    `json:"version"`
+	Source                  string                    `json:"source,omitempty"`
+	IconKind                string                    `json:"iconKind,omitempty"`
+	IconLabel               string                    `json:"iconLabel,omitempty"`
+	DefaultInstalled        *bool                     `json:"defaultInstalled,omitempty"`
+	RequiredPermission      string                    `json:"requiredPermission,omitempty"`
+	RequiredPermissionLabel string                    `json:"requiredPermissionLabel,omitempty"`
+	Permissions             []string                  `json:"permissions,omitempty"`
+	Instructions            string                    `json:"instructions,omitempty"`
+	Skill                   string                    `json:"skill,omitempty"`
+	ConfigSchema            []types.PluginConfigField `json:"configSchema,omitempty"`
+	Events                  []string                  `json:"events"`
+	Actions                 []string                  `json:"actions,omitempty"`
+	TriggerSpecs            []TriggerSpec             `json:"triggerSpecs"`
+	ActionSpecs             []ActionSpec              `json:"actionSpecs,omitempty"`
 }
 
-// ParseManifestYAML extracts normalized triggers/sensors, actions/drivers, and metadata
-// from both rich declarative manifests and shorthand YAML rules without external dependencies.
+// ParseManifestYAML extracts normalized triggers/sensors, config_schema, skill rules, and metadata
+// from declarative plugin manifests without external dependencies.
 func ParseManifestYAML(raw string) (ParsedManifest, error) {
 	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
 	var out ParsedManifest
 
 	section := ""
 	subList := ""
+	skillIndent := -1
+	var skillLines []string
 	var curTrigger *TriggerSpec
 	var curAction *ActionSpec
+	var curConfigField *types.PluginConfigField
 	shorthandActionSub := false
+
+	flushSkill := func() {
+		if len(skillLines) > 0 {
+			joined := strings.TrimSpace(strings.Join(skillLines, "\n"))
+			if out.Skill == "" {
+				out.Skill = joined
+			}
+			if out.Instructions == "" {
+				out.Instructions = joined
+			}
+			skillLines = nil
+		}
+		skillIndent = -1
+	}
 
 	flushTrigger := func() {
 		if curTrigger == nil {
@@ -72,6 +112,22 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 			out.TriggerSpecs = append(out.TriggerSpecs, *curTrigger)
 		}
 		curTrigger = nil
+	}
+
+	flushConfigField := func() {
+		if curConfigField == nil {
+			return
+		}
+		if curConfigField.Key != "" {
+			if curConfigField.Type == "" {
+				curConfigField.Type = "text"
+			}
+			if curConfigField.Label == "" {
+				curConfigField.Label = curConfigField.Key
+			}
+			out.ConfigSchema = append(out.ConfigSchema, *curConfigField)
+		}
+		curConfigField = nil
 	}
 
 	flushAction := func() {
@@ -88,13 +144,36 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
+		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+
+		if section == "skill" || section == "instructions" {
+			if trimmed == "" {
+				if len(skillLines) > 0 {
+					skillLines = append(skillLines, "")
+				}
+				continue
+			}
+			if indent > 0 {
+				if skillIndent < 0 {
+					skillIndent = indent
+				}
+				cut := indent
+				if cut > skillIndent {
+					cut = skillIndent
+				}
+				skillLines = append(skillLines, line[cut:])
+				continue
+			}
+			flushSkill()
+		}
+
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		indent := len(line) - len(strings.TrimLeft(line, " \t"))
 
 		if indent == 0 {
 			flushTrigger()
+			flushConfigField()
 			flushAction()
 			subList = ""
 			key, val, ok := strings.Cut(trimmed, ":")
@@ -107,11 +186,42 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 			case "id":
 				out.ID = val
 				section = ""
+			case "slug":
+				out.Slug = val
+				section = ""
+			case "bundle_id", "bundleId":
+				out.BundleID = val
+				section = ""
 			case "name":
 				out.Name = val
 				section = ""
+			case "tagline":
+				out.Tagline = val
+				section = ""
+			case "description":
+				out.Description = val
+				section = ""
 			case "version":
 				out.Version = val
+				section = ""
+			case "source", "category_tag":
+				out.Source = val
+				section = ""
+			case "icon", "icon_kind", "iconKind":
+				out.IconKind = val
+				section = ""
+			case "icon_label", "iconLabel":
+				out.IconLabel = val
+				section = ""
+			case "default_installed", "defaultInstalled":
+				b := strings.EqualFold(val, "true")
+				out.DefaultInstalled = &b
+				section = ""
+			case "required_permission", "requiredPermission":
+				out.RequiredPermission = val
+				section = ""
+			case "required_permission_label", "requiredPermissionLabel":
+				out.RequiredPermissionLabel = val
 				section = ""
 			case "permissions":
 				if strings.HasPrefix(val, "[") {
@@ -120,12 +230,21 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 				} else {
 					section = "permissions"
 				}
-			case "instructions":
-				if val != "|" && val != ">" && val != "" {
-					out.Instructions = val
+			case "config_schema", "configSchema":
+				section = "config_schema"
+			case "skill", "instructions":
+				if val != "|" && val != ">" && val != "|-" && val != ">-" && val != "" {
+					if key == "skill" || out.Skill == "" {
+						out.Skill = val
+					}
+					if key == "instructions" || out.Instructions == "" {
+						out.Instructions = val
+					}
 					section = ""
 				} else {
-					section = "instructions"
+					section = key
+					skillIndent = -1
+					skillLines = nil
 				}
 			case "events", "triggers":
 				section = "events"
@@ -134,14 +253,6 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 			default:
 				section = key
 			}
-			continue
-		}
-
-		if section == "instructions" {
-			if out.Instructions != "" {
-				out.Instructions += "\n"
-			}
-			out.Instructions += trimmed
 			continue
 		}
 
@@ -156,6 +267,16 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 		if strings.HasPrefix(trimmed, "-") {
 			item := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
 			switch section {
+			case "config_schema":
+				flushConfigField()
+				f := types.PluginConfigField{}
+				if k, v, ok := strings.Cut(item, ":"); ok {
+					applyConfigFieldKV(&f, strings.TrimSpace(k), stripYAMLQuotes(v))
+				} else {
+					f.Key = stripYAMLQuotes(item)
+				}
+				curConfigField = &f
+
 			case "events":
 				if indent >= 6 && curTrigger != nil && !strings.Contains(item, ":") {
 					val := stripYAMLQuotes(item)
@@ -181,7 +302,6 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 				curTrigger = &t
 
 			case "actions":
-				// Ignore nested parameter list items when inside shorthand or parameters block
 				if indent >= 6 && curAction != nil {
 					if k, v, ok := strings.Cut(item, ":"); ok {
 						applyActionKV(curAction, strings.TrimSpace(k), stripYAMLQuotes(v))
@@ -197,7 +317,6 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 					if k == "id" {
 						a.ID = v
 					} else {
-						// Shorthand map style: `- move_to_trash:`
 						a.ID = k
 						if v != "" {
 							a.Target = v
@@ -212,7 +331,7 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 			continue
 		}
 
-		// Indented key: value lines inside an event/trigger or action item
+		// Indented key: value lines inside an event/trigger, config_schema field, or action item
 		k, rawVal, ok := strings.Cut(trimmed, ":")
 		if !ok {
 			continue
@@ -221,6 +340,12 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 		v := stripYAMLQuotes(rawVal)
 
 		switch section {
+		case "config_schema":
+			if curConfigField == nil {
+				curConfigField = &types.PluginConfigField{}
+			}
+			applyConfigFieldKV(curConfigField, k, v)
+
 		case "events":
 			if curTrigger == nil {
 				curTrigger = &TriggerSpec{}
@@ -259,7 +384,9 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 		_ = subList
 	}
 
+	flushSkill()
 	flushTrigger()
+	flushConfigField()
 	flushAction()
 
 	// Populate flat Event/Action ID slices for UI compatibility
@@ -278,22 +405,16 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 		}
 	}
 
-	if out.Name == "" && out.ID == "" && len(out.Events) == 0 && len(out.Actions) == 0 {
-		return out, fmt.Errorf("无效插件 manifest：缺少 name / id / events / actions 声明")
+	if out.Name == "" && out.ID == "" && len(out.Events) == 0 && out.Skill == "" {
+		return out, fmt.Errorf("无效插件 manifest：缺少 name / id / triggers / skill 声明")
 	}
-	if len(out.Events) == 0 {
+	if len(out.Events) == 0 && len(out.TriggerSpecs) == 0 && out.Name == "" && out.ID == "" {
 		out.Events = []string{"custom.event_triggered"}
 		out.TriggerSpecs = append(out.TriggerSpecs, TriggerSpec{
 			ID:     "custom.event_triggered",
 			Sensor: "manual",
 			Policy: "ask",
 		})
-	}
-	if len(out.Actions) == 0 {
-		defaultAction := ActionSpec{ID: "custom.run_action"}
-		finalizeActionSpec(&defaultAction, out.ID)
-		out.Actions = []string{defaultAction.ID}
-		out.ActionSpecs = append(out.ActionSpecs, defaultAction)
 	}
 	if out.Version == "" {
 		out.Version = "0.1.0"
@@ -335,10 +456,14 @@ func applyTriggerKV(t *TriggerSpec, k, v string) {
 		t.Description = v
 	case "policy":
 		t.Policy = v
-	case "sensor":
+	case "sensor", "source":
 		t.Sensor = v
 	case "glob":
 		t.Glob = v
+	case "script":
+		t.Script = v
+	case "interval_config_key", "intervalConfigKey":
+		t.IntervalConfigKey = v
 	case "metric":
 		t.Metric = v
 	case "operator":
@@ -357,9 +482,52 @@ func applyTriggerKV(t *TriggerSpec, k, v string) {
 		}
 	case "schedule":
 		t.Schedule = v
+	case "url":
+		t.URL = v
+	case "method":
+		t.Method = strings.ToUpper(v)
+	case "command":
+		t.Command = v
+	case "emit_on", "emitOn":
+		t.EmitOn = v
+	case "match_contains", "matchContains":
+		t.MatchContains = v
 	case "watch_dir", "watchDir":
 		if v != "" {
 			t.WatchDirs = append(t.WatchDirs, v)
+		}
+	}
+}
+
+func applyConfigFieldKV(f *types.PluginConfigField, k, v string) {
+	switch k {
+	case "key":
+		f.Key = v
+	case "label":
+		f.Label = v
+	case "type":
+		f.Type = strings.ToLower(strings.TrimSpace(v))
+	case "description":
+		f.Description = v
+	case "min":
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			f.Min = n
+		}
+	case "max":
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			f.Max = n
+		}
+	case "default":
+		if strings.EqualFold(v, "true") {
+			f.Default = true
+		} else if strings.EqualFold(v, "false") {
+			f.Default = false
+		} else if n, err := strconv.Atoi(v); err == nil {
+			f.Default = n
+		} else if n, err := strconv.ParseFloat(v, 64); err == nil {
+			f.Default = n
+		} else {
+			f.Default = v
 		}
 	}
 }
@@ -384,12 +552,25 @@ func applyActionKV(a *ActionSpec, k, v string) {
 		a.UICard = v
 	case "target":
 		a.Target = v
+	case "command":
+		a.Command = v
+	case "url":
+		a.URL = v
 	case "description":
 		a.Description = v
 	}
 }
 
 func finalizeTriggerSpec(t *TriggerSpec) {
+	if t.Script != "" && t.Sensor == "" {
+		t.Sensor = "script_poll"
+	}
+	if t.Command != "" && t.Sensor == "" {
+		t.Sensor = "command_poll"
+	}
+	if t.URL != "" && t.Sensor == "" {
+		t.Sensor = "http_poll"
+	}
 	if t.Glob != "" {
 		if t.Sensor == "" {
 			t.Sensor = "fs_watch"
@@ -407,33 +588,77 @@ func finalizeTriggerSpec(t *TriggerSpec) {
 	if t.Schedule != "" && t.Sensor == "" {
 		t.Sensor = "cron"
 	}
-	if t.Metric != "" && t.Sensor == "" {
-		t.Sensor = "metric_threshold"
+	if (t.Sensor == "script_poll" || t.Sensor == "command_poll" || t.Sensor == "http_poll") && t.IntervalSec <= 0 {
+		t.IntervalSec = 60
 	}
-	if t.ID == "app.uninstalled" && t.Sensor == "" {
-		t.Sensor = "fs_watch"
-		if len(t.WatchDirs) == 0 {
-			t.WatchDirs = []string{"/Applications", "~/Applications"}
-		}
-		if len(t.Ops) == 0 {
-			t.Ops = []string{"remove"}
-		}
-		if t.Glob == "" {
-			t.Glob = "*.app"
-		}
-	}
-	if t.ID == "log.crash_loop" && t.Sensor == "" {
-		t.Sensor = "metric_threshold"
-		t.Metric = "logs.crash_count"
-		if t.IntervalSec <= 0 {
-			t.IntervalSec = 30
-		}
+	if t.Sensor == "script_poll" && t.EmitOn == "" {
+		t.EmitOn = "json"
+	} else if (t.Sensor == "command_poll" || t.Sensor == "http_poll") && t.EmitOn == "" {
+		t.EmitOn = "change"
 	}
 	if t.Sensor == "" {
 		t.Sensor = "manual"
 	}
 	if t.Policy == "" {
 		t.Policy = "ask"
+	}
+}
+
+// DescribeTriggerSource formats a concise human-readable summary of a trigger's event source.
+func DescribeTriggerSource(t TriggerSpec) string {
+	switch t.Sensor {
+	case "fs_watch":
+		if t.Glob != "" {
+			return "fs_watch · " + t.Glob
+		}
+		if len(t.WatchDirs) > 0 {
+			return "fs_watch · " + strings.Join(t.WatchDirs, ", ")
+		}
+		return "fs_watch"
+	case "script_poll":
+		interval := t.IntervalSec
+		if interval <= 0 {
+			interval = 60
+		}
+		if strings.TrimSpace(t.Script) != "" {
+			return fmt.Sprintf("script_poll · %s (%ds)", strings.TrimSpace(t.Script), interval)
+		}
+		return fmt.Sprintf("script_poll (%ds)", interval)
+	case "command_poll":
+		interval := t.IntervalSec
+		if interval <= 0 {
+			interval = 60
+		}
+		cmd := strings.TrimSpace(t.Command)
+		if len(cmd) > 36 {
+			cmd = cmd[:35] + "…"
+		}
+		if cmd == "" {
+			return fmt.Sprintf("command_poll (%ds)", interval)
+		}
+		return fmt.Sprintf("command_poll · %s (%ds)", cmd, interval)
+	case "http_poll":
+		interval := t.IntervalSec
+		if interval <= 0 {
+			interval = 60
+		}
+		u := strings.TrimSpace(t.URL)
+		if len(u) > 42 {
+			u = u[:41] + "…"
+		}
+		if u == "" {
+			return fmt.Sprintf("http_poll (%ds)", interval)
+		}
+		return fmt.Sprintf("http_poll · %s (%ds)", u, interval)
+	case "webhook":
+		return "webhook · POST /events/<plugin>/" + t.ID
+	case "cron":
+		if strings.TrimSpace(t.Schedule) != "" {
+			return "cron · " + strings.TrimSpace(t.Schedule)
+		}
+		return "cron · 定时表达式"
+	default:
+		return "manual · 主动调用 / 对话触发"
 	}
 }
 
@@ -459,6 +684,14 @@ func finalizeActionSpec(a *ActionSpec, pluginID string) {
 			a.Driver = "proc.signal"
 		case "log.summarize":
 			a.Driver = "log.summarize_crashes"
+		case "surge.import_logs":
+			a.Driver = "surge.import_logs"
+		case "surge.inspect_status":
+			a.Driver = "surge.inspect_status"
+		case "surge.flush_dns":
+			a.Driver = "surge.flush_dns"
+		case "surge.reload_profile":
+			a.Driver = "surge.reload_profile"
 		case "battery.report":
 			a.Driver = "macos.battery_status"
 		case "net.flush_dns":
@@ -481,9 +714,9 @@ func finalizeActionSpec(a *ActionSpec, pluginID string) {
 	}
 	if a.Safety == "" {
 		switch a.Driver {
-		case "fs.scan_cleanable", "fs.scan_orphans", "proc.sample", "log.summarize_crashes", "macos.battery_status", "macos.network_status", "macos.calendar_upcoming", "net.http_json":
+		case "fs.scan_cleanable", "fs.scan_orphans", "fs.read_text", "proc.sample", "log.summarize_crashes", "surge.import_logs", "surge.inspect_status", "macos.battery_status", "macos.network_status", "macos.calendar_upcoming", "net.http_json":
 			a.Safety = "readonly"
-		case "fs.empty_trash", "proc.signal", "launchd.unload":
+		case "fs.empty_trash", "proc.signal", "launchd.unload", "shell.exec", "surge.flush_dns", "surge.reload_profile":
 			a.Safety = "confirm_always"
 		default:
 			a.Safety = "reversible"
@@ -491,7 +724,7 @@ func finalizeActionSpec(a *ActionSpec, pluginID string) {
 	}
 	if a.Category == "" {
 		switch a.Driver {
-		case "proc.sample", "proc.signal", "log.summarize_crashes":
+		case "proc.sample", "proc.signal", "log.summarize_crashes", "shell.exec", "surge.import_logs", "surge.inspect_status", "surge.flush_dns", "surge.reload_profile":
 			a.Category = "process"
 		case "macos.calendar_upcoming", "macos.focus_mode", "net.http_json", "plugin.noop":
 			if strings.Contains(id, "comment") || strings.Contains(id, "reply") || strings.Contains(id, "rerun") {
@@ -523,6 +756,14 @@ func finalizeActionSpec(a *ActionSpec, pluginID string) {
 			a.ToolName = "process_terminate"
 		case "log.summarize":
 			a.ToolName = "log_summarize_crashes"
+		case "surge.import_logs":
+			a.ToolName = "surge_import_logs"
+		case "surge.inspect_status":
+			a.ToolName = "surge_inspect_status"
+		case "surge.flush_dns":
+			a.ToolName = "surge_flush_dns"
+		case "surge.reload_profile":
+			a.ToolName = "surge_reload_profile"
 		default:
 			prefix := strings.TrimPrefix(pluginID, "local.valet.")
 			prefix = sanitizeIdent(prefix)

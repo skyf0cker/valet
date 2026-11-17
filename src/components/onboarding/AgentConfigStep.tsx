@@ -7,15 +7,15 @@ import { SegmentedControl } from "../ui/SegmentedControl";
 import { SelectMenu } from "../ui/SelectMenu";
 
 const AUTONOMY_OPTIONS: Array<{ value: AutonomyLevel; label: string }> = [
-  { value: "always_ask", label: "每步询问" },
-  { value: "sensitive_only", label: "敏感操作询问" },
-  { value: "autonomous", label: "完全自主" },
+  { value: "always_ask", label: "每个都询问" },
+  { value: "auto_review", label: "Auto Review" },
+  { value: "full_access", label: "Full Access" },
 ];
 
 const AUTONOMY_HINT: Record<AutonomyLevel, string> = {
-  always_ask: "Valet 每执行一个动作前都会弹窗等待你确认。",
-  sensitive_only: "删除文件、发送消息、付款等操作会先弹窗确认。",
-  autonomous: "已授权插件策略内的低风险操作自动执行，高危动作仍受保护。",
+  always_ask: "Valet 每执行一个非只读动作前都会弹窗等待你确认。",
+  auto_review: "默认开启 Auto Review：只读操作直通，其余由 Jev System One 或审查小模型自动评估放行或询问。",
+  full_access: "安全红线内自动执行并记录时间线，高危越界目录与禁用应用仍受保护。",
 };
 
 export const AgentConfigStep: React.FC = () => {
@@ -197,6 +197,9 @@ export const AgentConfigStep: React.FC = () => {
                   updateProvider(activeProvider.id, { endpoint: e.target.value, verified: false })
                 }
                 placeholder="http://localhost:11434"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
                 className="min-w-0 flex-1 bg-transparent font-mono text-[13px] text-[var(--ink-strong)] outline-none"
               />
             ) : (
@@ -214,6 +217,9 @@ export const AgentConfigStep: React.FC = () => {
                     })
                   }
                   placeholder={`输入 ${activeProvider.name} API Key`}
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                   className="min-w-0 flex-1 bg-transparent font-mono text-[13px] tracking-[0.02em] text-[var(--ink-strong)] outline-none"
                 />
                 <button
@@ -273,6 +279,9 @@ export const AgentConfigStep: React.FC = () => {
                     updateProvider(activeProvider.id, { baseUrl: e.target.value })
                   }
                   placeholder="https://api.example.com/v1"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                   className="h-[30px] rounded-[6px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2 font-mono text-[11px] text-[var(--ink-strong)] outline-none"
                 />
               </label>
@@ -288,6 +297,9 @@ export const AgentConfigStep: React.FC = () => {
                       updateProvider(activeProvider.id, { proxyUrl: e.target.value })
                     }
                     placeholder="http://127.0.0.1:7890"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
                     className="h-[30px] rounded-[6px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2 font-mono text-[11px] text-[var(--ink-strong)] outline-none"
                   />
                 </label>
@@ -302,6 +314,9 @@ export const AgentConfigStep: React.FC = () => {
                       updateProvider(activeProvider.id, { orgId: e.target.value })
                     }
                     placeholder="可选"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
                     className="h-[30px] rounded-[6px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2 font-mono text-[11px] text-[var(--ink-strong)] outline-none"
                   />
                 </label>

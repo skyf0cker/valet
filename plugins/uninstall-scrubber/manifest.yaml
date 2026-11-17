@@ -1,0 +1,20 @@
+id: uninstall-scrubber
+bundle_id: com.valet.uninstall-scrubber
+name: 卸载清道夫
+tagline: 当应用被移出 /Applications 时，查找并安全回收其孤儿残留目录
+description: 监听 /Applications/*.app 删除事件，自动核实应用是否已卸载，协助排查 Application Support、Caches、Preferences 与 LaunchAgents 残留。
+version: 1.1.0
+source: core
+icon: trash
+default_installed: true
+required_permission: full_disk
+required_permission_label: 完全磁盘访问
+permissions: [full_disk]
+triggers:
+  - id: app.uninstalled
+    description: 检测到应用程序从 /Applications 移除
+    sensor: fs_watch
+    watch_dirs: [/Applications]
+    ops: [remove]
+    glob: "*.app"
+    policy: ask
