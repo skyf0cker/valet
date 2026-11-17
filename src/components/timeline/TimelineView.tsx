@@ -39,22 +39,31 @@ export const TimelineView: React.FC = () => {
 
   const counts = useMemo(() => {
     const base = state.timelineEvents;
+    const earlierOffset = state.earlierCountLabel ? 9 : 0;
     return {
-      all: base.length + 9,
+      all: base.length + earlierOffset,
       rawAll: base.length,
       running: base.filter((e) => e.status === "running").length,
       pending_confirm: base.filter((e) => e.status === "pending_confirm").length,
       completed: base.filter((e) => e.status === "completed").length,
       failed: base.filter((e) => e.status === "failed").length,
     };
-  }, [state.timelineEvents]);
+  }, [state.timelineEvents, state.earlierCountLabel]);
 
-  const autoCompletedCount = counts.completed + 9;
+  const autoCompletedCount = counts.completed + (state.earlierCountLabel ? 9 : 0);
 
   const interceptedCount = useMemo(
-    () => state.timelineEvents.filter((e) => e.intercepted).length + 1,
-    [state.timelineEvents]
+    () => state.timelineEvents.filter((e) => e.intercepted).length + (state.earlierCountLabel ? 1 : 0),
+    [state.timelineEvents, state.earlierCountLabel]
   );
+
+  const todayHeaderLabel = useMemo(() => {
+    const d = new Date();
+    const weekday = d.toLocaleDateString("en-US", { weekday: "short" });
+    const day = String(d.getDate()).padStart(2, "0");
+    const month = d.toLocaleDateString("en-US", { month: "short" });
+    return `${weekday} · ${day} ${month} ${d.getFullYear()}`;
+  }, []);
 
   const pluginFilterOptions = useMemo(() => {
     const installed = state.plugins.filter((p) => p.installed);
@@ -162,7 +171,7 @@ export const TimelineView: React.FC = () => {
         >
           <div className="flex flex-col gap-1.5 lg:gap-2.5">
             <div className="font-mono text-[10px] font-medium uppercase tracking-[0.16em] text-[var(--ink-muted)] lg:text-[11px]">
-              Mon · 16 Nov 2026
+              {todayHeaderLabel}
             </div>
             <h1
               className={`font-[family-name:var(--font-serif-zh)] font-medium tracking-[-0.01em] text-[var(--ink-strong)] ${
@@ -294,38 +303,42 @@ export const TimelineView: React.FC = () => {
           )}
 
           {/* EARLIER separator */}
-          <div className="flex items-center gap-3.5 pt-[22px]">
-            <span className="w-[44px] shrink-0 font-mono text-[10px] font-medium uppercase tracking-[0.16em] text-[var(--ink-subtle)] lg:w-[64px]">
-              Earlier
-            </span>
-            <div className="h-[1px] flex-1 bg-[var(--border-light)]" />
-            <button
-              type="button"
-              onClick={() => setShowEarlier((s) => !s)}
-              className="cursor-pointer text-[11.5px] text-[var(--ink-muted)] hover:text-[var(--ink-strong)] lg:text-[12px]"
-            >
-              {showEarlier ? "收起昨天动作 ↑" : state.earlierCountLabel}
-            </button>
-          </div>
+          {Boolean(state.earlierCountLabel) && (
+            <>
+              <div className="flex items-center gap-3.5 pt-[22px]">
+                <span className="w-[44px] shrink-0 font-mono text-[10px] font-medium uppercase tracking-[0.16em] text-[var(--ink-subtle)] lg:w-[64px]">
+                  Earlier
+                </span>
+                <div className="h-[1px] flex-1 bg-[var(--border-light)]" />
+                <button
+                  type="button"
+                  onClick={() => setShowEarlier((s) => !s)}
+                  className="cursor-pointer text-[11.5px] text-[var(--ink-muted)] hover:text-[var(--ink-strong)] lg:text-[12px]"
+                >
+                  {showEarlier ? "收起昨天动作 ↑" : state.earlierCountLabel}
+                </button>
+              </div>
 
-          {showEarlier && (
-            <div className="pt-2">
-              {filteredEarlier.map((evt, idx) => (
-                <TimelineRow
-                  key={evt.id}
-                  event={evt}
-                  index={idx}
-                  compact={sidebarCollapsed}
-                  isFirst={idx === 0}
-                  isLast={idx === filteredEarlier.length - 1}
-                  isSelected={state.selectedTimelineEventId === evt.id}
-                  onOpenDetail={() => selectTimelineEvent(evt.id)}
-                  onExecutePending={() => executeTimelineEventActions(evt.id)}
-                  onFixAuth={(pid) => fixPluginAuth(pid)}
-                  onRestore={() => restoreTimelineEvent(evt.id)}
-                />
-              ))}
-            </div>
+              {showEarlier && (
+                <div className="pt-2">
+                  {filteredEarlier.map((evt, idx) => (
+                    <TimelineRow
+                      key={evt.id}
+                      event={evt}
+                      index={idx}
+                      compact={sidebarCollapsed}
+                      isFirst={idx === 0}
+                      isLast={idx === filteredEarlier.length - 1}
+                      isSelected={state.selectedTimelineEventId === evt.id}
+                      onOpenDetail={() => selectTimelineEvent(evt.id)}
+                      onExecutePending={() => executeTimelineEventActions(evt.id)}
+                      onFixAuth={(pid) => fixPluginAuth(pid)}
+                      onRestore={() => restoreTimelineEvent(evt.id)}
+                    />
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>

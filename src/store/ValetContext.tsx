@@ -66,9 +66,55 @@ export interface ArrivalNotice {
   eventCode: string;
 }
 
+function createCleanSlateShell(): ValetSnapshot {
+  const base = createInitialSnapshot();
+  return {
+    ...base,
+    schemaVersion: 2,
+    inboxItems: [],
+    inboxProcessedHistoryCount: 0,
+    timelineEvents: [],
+    earlierCountLabel: "",
+    automations: [],
+    mcpServers: [],
+    memories: [],
+    activeChatId: "chat-default",
+    chatThreads: [
+      {
+        id: "chat-default",
+        title: "新对话",
+        model: base.preferences.models.primary,
+        updatedAt: "刚刚",
+        timelineActionCount: 0,
+        linkedEventIds: [],
+        messages: [],
+      },
+    ],
+    providers: base.providers.map((p) => ({
+      ...p,
+      apiKey: "",
+      apiKeyMasked: "",
+      verified: false,
+      connected: false,
+      latencyMs: undefined,
+    })),
+    preferences: {
+      ...base.preferences,
+      dailySpendCurrent: 0,
+    },
+    scan: {
+      status: "idle",
+      progressPct: 0,
+      elapsedSec: 0,
+      reclaimableGB: 0,
+      tasks: [],
+    },
+  };
+}
+
 function loadInitialState(): ValetSnapshot {
   if (isMyGo()) {
-    return createInitialSnapshot();
+    return createCleanSlateShell();
   }
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -187,11 +233,13 @@ export interface ValetContextValue {
   // Permissions
   setPermissionGranted: (id: PermissionId, granted: boolean) => void;
   toggleMockAppPermission: (permissionId: PermissionId, appId: string) => void;
+  refreshPermissions: () => void;
 
   // Plugins
   togglePluginEnabled: (pluginId: string) => void;
   installMarketplacePlugin: (pluginId: string) => void;
   installCustomPlugin: (params: { name: string; tagline: string; yaml: string }) => void;
+  updatePluginManifest: (pluginId: string, yaml: string) => void;
   fixPluginAuth: (pluginId: string) => void;
   updatePluginEventPolicy: (pluginId: string, eventId: string, policy: EventPolicyMode) => void;
   updatePluginConfig: (pluginId: string, patch: Partial<PluginConfig>) => void;
@@ -235,9 +283,12 @@ export interface ValetContextValue {
   resetThresholdsToDefault: () => void;
   toggleAutomation: (id: string) => void;
   addAutomationRule: (rule: Omit<AutomationRule, "id">) => void;
+  runAutomationNow: (id: string) => void;
+  deleteAutomationRule: (id: string) => void;
   toggleMcpServer: (id: string) => void;
   reconnectMcpServer: (id: string) => void;
   addMcpServer: (server: Omit<McpServerItem, "id">) => void;
+  deleteMcpServer: (id: string) => void;
   deleteMemory: (id: string) => void;
   clearMemories: () => void;
   resetAllData: () => void;
@@ -972,6 +1023,38 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }));
       triggerNod();
       pushToast(`已安装本地插件「${newPlugin.name}」`, "success");
+    },
+    [pushToast, triggerNod]
+  );
+
+  const updatePluginManifest = useCallback(
+    (pluginId: string, yaml: string) => {
+      if (isMyGo()) {
+        void Valet.updatePluginManifest(pluginId, yaml)
+          .then((snap) => {
+            setState((prev) => mergeBackendSnapshot(prev, snap));
+            triggerNod();
+            pushToast("已保存插件 Manifest 并热重载", "success");
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+        return;
+      }
+      setState((prev) => ({
+        ...prev,
+        plugins: prev.plugins.map((pl) =>
+          pl.id === pluginId
+            ? {
+                ...pl,
+                manifestYaml: yaml,
+                statusSubtitle: "刚刚热重载 · Manifest 已生效",
+              }
+            : pl
+        ),
+      }));
+      triggerNod();
+      pushToast("已保存插件 Manifest 并热重载", "success");
     },
     [pushToast, triggerNod]
   );
@@ -1904,6 +1987,76 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     [pushToast, syncFromBackend]
   );
 
+  const runAutomationNow = useCallback(
+    (id: string) => {
+      if (isMyGo()) {
+        pushToast("正在执行自动化规则…", "default");
+        void Valet.runAutomationNow(id)
+          .then((snap) => {
+            setState((prev) => mergeBackendSnapshot(prev, snap));
+            triggerNod();
+            pushToast("自动化规则执行完成，详情已写入对话", "success");
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+        return;
+      }
+      const nowHHMM = new Date().toTimeString().slice(0, 5);
+      setState((prev) => ({
+        ...prev,
+        automations: prev.automations.map((a) =>
+          a.id === id ? { ...a, lastRunAt: nowHHMM } : a
+        ),
+      }));
+      pushToast("已触发执行规则（本地演示模式）", "success");
+    },
+    [pushToast, triggerNod]
+  );
+
+  const deleteAutomationRule = useCallback(
+    (id: string) => {
+      setState((prev) => ({
+        ...prev,
+        automations: prev.automations.filter((a) => a.id !== id),
+      }));
+      pushToast("已删除自动化规则", "warning");
+      if (isMyGo()) {
+        syncFromBackend(Valet.deleteAutomationRule(id));
+      }
+    },
+    [pushToast, syncFromBackend]
+  );
+
+  const deleteMcpServer = useCallback(
+    (id: string) => {
+      setState((prev) => ({
+        ...prev,
+        mcpServers: prev.mcpServers.filter((s) => s.id !== id),
+      }));
+      pushToast("已移除 MCP 服务器", "warning");
+      if (isMyGo()) {
+        syncFromBackend(Valet.deleteMcpServer(id));
+      }
+    },
+    [pushToast, syncFromBackend]
+  );
+
+  const refreshPermissions = useCallback(() => {
+    if (isMyGo()) {
+      void Valet.checkPermissions()
+        .then((snap) => {
+          setState((prev) => mergeBackendSnapshot(prev, snap));
+          pushToast("已重新检测 macOS 系统权限状态", "success");
+        })
+        .catch((err: unknown) => {
+          pushToast(err instanceof Error ? err.message : String(err), "danger");
+        });
+      return;
+    }
+    pushToast("已刷新本地权限检查", "success");
+  }, [pushToast]);
+
   const toggleMcpServer = useCallback(
     (id: string) => {
       setState((prev) => ({
@@ -1974,12 +2127,12 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const resetAllData = useCallback(() => {
     if (isMyGo()) {
       syncFromBackend(Valet.resetAllData(), true);
-      pushToast("已重置全部本地演示数据", "warning");
+      pushToast("已重置全部本地数据", "warning");
       return;
     }
     localStorage.removeItem(STORAGE_KEY);
     setState(createInitialSnapshot());
-    pushToast("已重置全部本地演示数据", "warning");
+    pushToast("已重置全部本地数据", "warning");
   }, [pushToast, syncFromBackend]);
 
   const value = useMemo<ValetContextValue>(
@@ -2015,9 +2168,11 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       restoreApprovedInboxItem,
       setPermissionGranted,
       toggleMockAppPermission,
+      refreshPermissions,
       togglePluginEnabled,
       installMarketplacePlugin,
       installCustomPlugin,
+      updatePluginManifest,
       fixPluginAuth,
       updatePluginEventPolicy,
       updatePluginConfig,
@@ -2043,9 +2198,12 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       resetThresholdsToDefault,
       toggleAutomation,
       addAutomationRule,
+      runAutomationNow,
+      deleteAutomationRule,
       toggleMcpServer,
       reconnectMcpServer,
       addMcpServer,
+      deleteMcpServer,
       deleteMemory,
       clearMemories,
       resetAllData,
@@ -2062,6 +2220,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       commandPaletteOpen,
       completeOnboarding,
       createNewChat,
+      deleteAutomationRule,
+      deleteMcpServer,
       deleteMemory,
       dismissInboxItem,
       dismissToast,
@@ -2079,11 +2239,13 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       performProcessAction,
       pushToast,
       reconnectMcpServer,
+      refreshPermissions,
       resetAllData,
       resetOnboarding,
       resetThresholdsToDefault,
       restoreApprovedInboxItem,
       restoreTimelineEvent,
+      runAutomationNow,
       runFirstScan,
       selectChatThread,
       selectInboxItem,
@@ -2113,6 +2275,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       updateModels,
       updatePluginConfig,
       updatePluginEventPolicy,
+      updatePluginManifest,
       updatePreferences,
       updateProvider,
     ]

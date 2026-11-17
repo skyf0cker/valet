@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from "react";
+import { valetService } from "../../services/valetService";
 import { useValet } from "../../store/ValetContext";
 import type {
   AppearanceMode,
@@ -151,16 +152,21 @@ export const SettingsView: React.FC = () => {
     setAutonomyLevel,
     toggleAutomation,
     addAutomationRule,
+    runAutomationNow,
+    deleteAutomationRule,
     toggleMcpServer,
     reconnectMcpServer,
     addMcpServer,
+    deleteMcpServer,
     deleteMemory,
     clearMemories,
     setPermissionGranted,
+    refreshPermissions,
     resetOnboarding,
     resetAllData,
     togglePauseValet,
     selectProvider,
+    updateProvider,
     pushToast,
   } = useValet();
 
@@ -175,10 +181,21 @@ export const SettingsView: React.FC = () => {
   // Rule creation fields
   const [ruleWhen, setRuleWhen] = useState("每天 09:30");
   const [ruleTitle, setRuleTitle] = useState("检查昨日未处理的崩溃日志");
+  const [ruleCronExpr, setRuleCronExpr] = useState("30 9 * * *");
+  const [rulePrompt, setRulePrompt] = useState("检查过去 24 小时的诊断崩溃日志与磁盘空间，总结异常项。");
 
   // MCP creation fields
-  const [mcpName, setMcpName] = useState("Linear");
-  const [mcpTransport, setMcpTransport] = useState("http · 18 tools");
+  const [mcpName, setMcpName] = useState("Filesystem");
+  const [mcpTransportType, setMcpTransportType] = useState<"stdio" | "http">("stdio");
+  const [mcpCommand, setMcpCommand] = useState("npx");
+  const [mcpArgsText, setMcpArgsText] = useState("-y @modelcontextprotocol/server-filesystem ~/Downloads");
+  const [mcpUrl, setMcpUrl] = useState("http://localhost:3100/mcp");
+
+  // Inline provider credential state
+  const [showProviderKey, setShowProviderKey] = useState(false);
+  const [verifyingProvider, setVerifyingProvider] = useState(false);
+  const [testingProviderMsg, setTestingProviderMsg] = useState(false);
+  const [providerTestReply, setProviderTestReply] = useState<string | null>(null);
 
   const { preferences } = state;
   const activeSectionId = state.activeSettingsSection;
@@ -540,34 +557,58 @@ export const SettingsView: React.FC = () => {
                 }
               />
               <SettingsSectionCard noHeader>
-                {state.automations.map((rule, idx) => (
-                  <div
-                    key={rule.id}
-                    className={`flex items-center gap-3 px-4 py-3 ${
-                      idx > 0 ? "border-t border-[var(--border-light)]" : ""
-                    }`}
-                  >
-                    <div className="w-[52px] shrink-0 font-mono text-[11px] leading-[15px] text-[var(--ink-strong)]">
-                      <div>{rule.scheduleTop}</div>
-                      <div>{rule.scheduleBottom}</div>
-                    </div>
-                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                      <span className="truncate text-[13px] font-medium text-[var(--ink-strong)]">
-                        {rule.title}
-                      </span>
-                      {rule.subtitle && (
-                        <span className="truncate text-[11px] text-[var(--ink-subtle)]">
-                          {rule.subtitle}
-                        </span>
-                      )}
-                    </div>
-                    <Switch
-                      checked={rule.enabled}
-                      onChange={() => toggleAutomation(rule.id)}
-                      ariaLabel={`切换自动化 ${rule.title}`}
-                    />
+                {state.automations.length === 0 ? (
+                  <div className="px-4 py-6 text-center text-[12px] text-[var(--ink-muted)]">
+                    暂无定时或事件自动化规则，点击右上角「+ 新建规则」创建一个真实定时任务
                   </div>
-                ))}
+                ) : (
+                  state.automations.map((rule, idx) => (
+                    <div
+                      key={rule.id}
+                      className={`flex items-center gap-3 px-4 py-3 ${
+                        idx > 0 ? "border-t border-[var(--border-light)]" : ""
+                      }`}
+                    >
+                      <div className="w-[62px] shrink-0 font-mono text-[11px] leading-[15px] text-[var(--ink-strong)]">
+                        <div>{rule.scheduleTop}</div>
+                        <div>{rule.scheduleBottom}</div>
+                      </div>
+                      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                        <span className="truncate text-[13px] font-medium text-[var(--ink-strong)]">
+                          {rule.title}
+                        </span>
+                        <span className="truncate text-[11px] text-[var(--ink-subtle)]">
+                          {[
+                            rule.cronExpr ? `cron: ${rule.cronExpr}` : "",
+                            rule.subtitle ?? "",
+                            rule.lastRunAt ? `上次运行 ${rule.lastRunAt}` : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => runAutomationNow(rule.id)}
+                        className="inline-flex h-6 shrink-0 cursor-pointer items-center rounded-[6px] border border-[var(--border-control)] px-2 text-[11px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                      >
+                        立即运行
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteAutomationRule(rule.id)}
+                        className="inline-flex h-6 shrink-0 cursor-pointer items-center rounded-[6px] px-2 text-[11px] text-[var(--ink-muted)] hover:bg-[var(--danger-bg)] hover:text-[var(--danger)]"
+                      >
+                        删除
+                      </button>
+                      <Switch
+                        checked={rule.enabled}
+                        onChange={() => toggleAutomation(rule.id)}
+                        ariaLabel={`切换自动化 ${rule.title}`}
+                      />
+                    </div>
+                  ))
+                )}
               </SettingsSectionCard>
             </div>
           </div>
@@ -670,41 +711,54 @@ export const SettingsView: React.FC = () => {
                 }
               />
               <SettingsSectionCard noHeader>
-                {state.mcpServers.map((srv, idx) => (
-                  <div
-                    key={srv.id}
-                    className={`flex items-center gap-2.5 px-4 py-[11px] ${
-                      idx > 0 ? "border-t border-[var(--border-light)]" : ""
-                    }`}
-                  >
-                    <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[6px] bg-[var(--bg-muted)] font-mono text-[10px] text-[var(--ink-strong)]">
-                      {srv.abbr}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="text-[13px] font-medium text-[var(--ink-strong)]">
-                        {srv.name}
-                      </div>
-                      {srv.authExpired ? (
-                        <button
-                          type="button"
-                          onClick={() => reconnectMcpServer(srv.id)}
-                          className="cursor-pointer font-mono text-[10px] text-[var(--danger)] hover:underline"
-                        >
-                          认证已过期 · 重新连接
-                        </button>
-                      ) : (
-                        <div className="font-mono text-[10px] text-[var(--ink-subtle)]">
-                          {srv.transportLabel}
-                        </div>
-                      )}
-                    </div>
-                    <Switch
-                      checked={srv.enabled}
-                      onChange={() => toggleMcpServer(srv.id)}
-                      ariaLabel={`切换 ${srv.name}`}
-                    />
+                {state.mcpServers.length === 0 ? (
+                  <div className="px-4 py-6 text-center text-[12px] text-[var(--ink-muted)]">
+                    暂未接入任何外部 MCP 服务器，点击右上角「+ 添加服务器」连接 stdio / HTTP MCP 工具
                   </div>
-                ))}
+                ) : (
+                  state.mcpServers.map((srv, idx) => (
+                    <div
+                      key={srv.id}
+                      className={`flex items-center gap-2.5 px-4 py-[11px] ${
+                        idx > 0 ? "border-t border-[var(--border-light)]" : ""
+                      }`}
+                    >
+                      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[6px] bg-[var(--bg-muted)] font-mono text-[10px] text-[var(--ink-strong)]">
+                        {srv.abbr}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[13px] font-medium text-[var(--ink-strong)]">
+                          {srv.name}
+                        </div>
+                        {srv.authExpired || srv.statusError ? (
+                          <button
+                            type="button"
+                            onClick={() => reconnectMcpServer(srv.id)}
+                            className="cursor-pointer font-mono text-[10px] text-[var(--danger)] hover:underline"
+                          >
+                            {srv.statusError ? `${srv.statusError} · 重试握手` : "连接异常 · 重新握手"}
+                          </button>
+                        ) : (
+                          <div className="font-mono text-[10px] text-[var(--ink-subtle)]">
+                            {srv.transportLabel}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => deleteMcpServer(srv.id)}
+                        className="inline-flex h-6 shrink-0 cursor-pointer items-center rounded-[6px] px-2 text-[11px] text-[var(--ink-muted)] hover:bg-[var(--danger-bg)] hover:text-[var(--danger)]"
+                      >
+                        删除
+                      </button>
+                      <Switch
+                        checked={srv.enabled}
+                        onChange={() => toggleMcpServer(srv.id)}
+                        ariaLabel={`切换 ${srv.name}`}
+                      />
+                    </div>
+                  ))
+                )}
               </SettingsSectionCard>
             </div>
           </div>
@@ -760,15 +814,19 @@ export const SettingsView: React.FC = () => {
       case "models":
         return (
           <SettingsSectionCard noHeader>
-            {state.providers.slice(0, 2).map((prov, idx) => {
+            {state.providers.map((prov, idx) => {
               const active = prov.id === preferences.activeProviderId;
+              const configured = Boolean(prov.apiKey?.trim()) || prov.verified;
               return (
                 <div
                   key={prov.id}
-                  onClick={() => selectProvider(prov.id)}
+                  onClick={() => {
+                    selectProvider(prov.id);
+                    setProviderTestReply(null);
+                  }}
                   className={`flex cursor-pointer items-center gap-2.5 px-4 py-[11px] hover:bg-[var(--bg-card-hover)] ${
                     idx > 0 ? "border-t border-[var(--border-light)]" : ""
-                  }`}
+                  } ${active ? "bg-[var(--bg-subtle)]" : ""}`}
                 >
                   <div
                     className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-[6px] font-[family-name:var(--font-serif-en)] text-[15px] italic ${
@@ -783,16 +841,18 @@ export const SettingsView: React.FC = () => {
                     <div className="text-[13px] font-medium text-[var(--ink-strong)]">
                       {prov.name}
                     </div>
-                    <div className="font-mono text-[10px] text-[var(--ink-subtle)]">
-                      {prov.apiKeyMasked || prov.endpoint || prov.baseUrl}
+                    <div className="truncate font-mono text-[10px] text-[var(--ink-subtle)]">
+                      {prov.apiKeyMasked || prov.baseUrl || prov.endpoint || prov.subtitle}
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5 text-[11px]">
                     <span
                       className={`h-1.5 w-1.5 rounded-full ${
-                        prov.verified || active
+                        prov.verified
                           ? "bg-[var(--ink-primary)]"
-                          : "border border-[var(--ink-faint)]"
+                          : configured
+                            ? "bg-[var(--amber-icon)]"
+                            : "border border-[var(--ink-faint)]"
                       }`}
                     />
                     <span
@@ -802,22 +862,169 @@ export const SettingsView: React.FC = () => {
                           : "text-[var(--ink-subtle)]"
                       }
                     >
-                      {prov.verified || active ? "已连接" : "未启动"}
+                      {prov.verified
+                        ? `已验证${prov.latencyMs ? ` · ${prov.latencyMs}ms` : ""}`
+                        : configured
+                          ? "已配置 · 待验证"
+                          : "待配置"}
                     </span>
                   </div>
                 </div>
               );
             })}
 
-            <div className="border-t border-[var(--border-light)] px-4 py-2.5">
-              <button
-                type="button"
-                onClick={() => setProviderModalOpen(true)}
-                className="cursor-pointer text-[12px] font-medium text-[var(--ink-strong)] hover:underline"
-              >
-                + 切换或添加服务商
-              </button>
-            </div>
+            {activeProvider && (
+              <div className="flex flex-col gap-3 border-t border-[var(--border-light)] bg-[var(--bg-subtle)] px-4 py-3.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[12px] font-semibold text-[var(--ink-strong)]">
+                    {activeProvider.name} · 凭据与端点配置
+                  </span>
+                  {activeProvider.id !== "ollama" && (
+                    <button
+                      type="button"
+                      onClick={() => setShowProviderKey((v) => !v)}
+                      className="cursor-pointer text-[11px] text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
+                    >
+                      {showProviderKey ? "隐藏 Key" : "显示 Key"}
+                    </button>
+                  )}
+                </div>
+
+                {activeProvider.id !== "ollama" && (
+                  <label className="flex flex-col gap-1">
+                    <span className="text-[11px] text-[var(--ink-muted)]">API Key（写入 macOS 钥匙串）</span>
+                    <input
+                      type={showProviderKey ? "text" : "password"}
+                      value={activeProvider.apiKey}
+                      onChange={(e) =>
+                        updateProvider(activeProvider.id, {
+                          apiKey: e.target.value,
+                          verified: false,
+                        })
+                      }
+                      placeholder={
+                        activeProvider.id === "anthropic"
+                          ? "sk-ant-..."
+                          : activeProvider.id === "openai"
+                            ? "sk-..."
+                            : "输入服务商 API Key"
+                      }
+                      className="h-[32px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                    />
+                  </label>
+                )}
+
+                <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                  <label className="flex flex-col gap-1">
+                    <span className="text-[11px] text-[var(--ink-muted)]">
+                      {activeProvider.id === "ollama" ? "本地节点 Endpoint" : "Base URL（可选覆写）"}
+                    </span>
+                    <input
+                      type="text"
+                      value={activeProvider.baseUrl || activeProvider.endpoint}
+                      onChange={(e) =>
+                        updateProvider(activeProvider.id, {
+                          baseUrl: e.target.value,
+                          endpoint: e.target.value,
+                        })
+                      }
+                      placeholder={
+                        activeProvider.id === "ollama"
+                          ? "http://localhost:11434"
+                          : "使用默认官方端点"
+                      }
+                      className="h-[30px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[11px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                    />
+                  </label>
+
+                  <label className="flex flex-col gap-1">
+                    <span className="text-[11px] text-[var(--ink-muted)]">Proxy / Org ID</span>
+                    <input
+                      type="text"
+                      value={activeProvider.proxyUrl}
+                      onChange={(e) =>
+                        updateProvider(activeProvider.id, { proxyUrl: e.target.value })
+                      }
+                      placeholder="http://127.0.0.1:7890"
+                      className="h-[30px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[11px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                    />
+                  </label>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                  <button
+                    type="button"
+                    disabled={verifyingProvider}
+                    onClick={async () => {
+                      setVerifyingProvider(true);
+                      const res = await valetService.verifyProvider(activeProvider);
+                      setVerifyingProvider(false);
+                      const discovered =
+                        res.models && res.models.length > 0
+                          ? res.models
+                          : activeProvider.models;
+                      updateProvider(activeProvider.id, {
+                        verified: res.ok,
+                        connected: res.ok,
+                        latencyMs: res.latencyMs,
+                        availableModelCount: res.modelCount || discovered.length,
+                        models: discovered,
+                      });
+                      if (res.ok && discovered.length > 0) {
+                        const nextPrimary = discovered.includes(preferences.models.primary)
+                          ? preferences.models.primary
+                          : discovered[0]!;
+                        const nextFast = discovered.includes(preferences.models.fast)
+                          ? preferences.models.fast
+                          : discovered[discovered.length - 1] ?? nextPrimary;
+                        if (
+                          nextPrimary !== preferences.models.primary ||
+                          nextFast !== preferences.models.fast
+                        ) {
+                          updateModels({ primary: nextPrimary, fast: nextFast });
+                        }
+                      }
+                      pushToast(res.message, res.ok ? "success" : "warning");
+                    }}
+                    className="inline-flex h-7 cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] px-3 text-[11px] font-semibold text-[var(--ink-on-primary)] disabled:opacity-60"
+                  >
+                    {verifyingProvider ? "验证中…" : "验证连接并刷新模型"}
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={testingProviderMsg}
+                    onClick={async () => {
+                      setTestingProviderMsg(true);
+                      setProviderTestReply(null);
+                      try {
+                        const res = await valetService.sendTestAgentMessage(
+                          activeProvider,
+                          preferences.models.primary
+                        );
+                        setProviderTestReply(res.reply);
+                        pushToast(res.reply, res.ok ? "success" : "warning");
+                      } catch (err) {
+                        const msg = err instanceof Error ? err.message : String(err);
+                        setProviderTestReply(`测试失败：${msg}`);
+                        pushToast(msg, "danger");
+                      } finally {
+                        setTestingProviderMsg(false);
+                      }
+                    }}
+                    className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 text-[11px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-card-hover)] disabled:opacity-60"
+                  >
+                    {testingProviderMsg ? "请求中…" : "发送测试消息"}
+                  </button>
+                </div>
+
+                {providerTestReply && (
+                  <div className="rounded-[7px] border border-[var(--border-light)] bg-[var(--bg-canvas)] px-3 py-2 font-mono text-[11px] text-[var(--ink-secondary)]">
+                    {providerTestReply}
+                  </div>
+                )}
+              </div>
+            )}
 
             <SettingRow label="主模型" tinted>
               <SelectMenu
@@ -1031,19 +1238,34 @@ export const SettingsView: React.FC = () => {
       case "permissions":
         return (
           <SettingsSectionCard noHeader>
-            <div className="flex items-center justify-between px-4 py-3">
+            <div className="flex items-center justify-between gap-2 px-4 py-3">
               <span className="font-mono text-[12px] text-[var(--ink-muted)]">
                 {grantedPermCount} / {totalPermCount} 已授权 · 实时检测
               </span>
-              <button
-                type="button"
-                onClick={() =>
-                  pushToast("已模拟触发打开系统设置 › 隐私与安全性")
-                }
-                className="cursor-pointer text-[12px] font-medium text-[var(--ink-strong)] hover:underline"
-              >
-                打开系统设置 ↗
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={refreshPermissions}
+                  className="cursor-pointer text-[12px] font-medium text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
+                >
+                  重新检测
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void valetService.openSystemSettings("full_disk").then((res) => {
+                      pushToast(
+                        res.opened
+                          ? "已打开系统设置 › 隐私与安全性"
+                          : "当前环境无法唤起系统设置"
+                      );
+                    });
+                  }}
+                  className="cursor-pointer text-[12px] font-medium text-[var(--ink-strong)] hover:underline"
+                >
+                  打开系统设置 ↗
+                </button>
+              </div>
             </div>
             <div className="grid grid-cols-1 border-t border-[var(--border-light)] sm:grid-cols-2">
               {state.permissions.map((perm, idx) => {
@@ -1257,21 +1479,16 @@ export const SettingsView: React.FC = () => {
                   本地占用
                 </span>
                 <span className="font-mono text-[12px] text-[var(--ink-strong)]">
-                  1.8 GB
+                  {state.storageStats?.totalLabel ?? "0 KB"}
                 </span>
               </div>
-              <div className="flex h-1.5 overflow-hidden rounded-[3px] bg-[var(--bg-track)]">
-                <div className="h-full bg-[var(--ink-primary)]" style={{ width: "44%" }} />
-                <div className="h-full bg-[var(--ink-muted)]" style={{ width: "18%" }} />
-                <div className="h-full bg-[var(--border-strong)]" style={{ width: "6%" }} />
+              <div className="flex flex-wrap gap-3.5 text-[11px] text-[var(--ink-muted)]">
+                <span>■ SQLite {state.storageStats?.databaseLabel ?? "0 KB"}</span>
+                <span>■ 状态 {state.storageStats?.stateLabel ?? "0 KB"}</span>
+                <span>■ 保险箱 {state.storageStats?.vaultLabel ?? "0 KB"}</span>
               </div>
-              <div className="flex gap-3.5 text-[11px] text-[var(--ink-muted)]">
-                <span>■ 回放 1.1G</span>
-                <span>■ 日志 0.5G</span>
-                <span>■ 记忆 0.2G</span>
-              </div>
-              <div className="font-mono text-[10px] text-[var(--ink-subtle)]">
-                ~/Library/Application Support/Valet
+              <div className="truncate font-mono text-[10px] text-[var(--ink-subtle)]">
+                {state.storageStats?.dataDir || "~/Library/Application Support/Valet"}
               </div>
             </div>
 
@@ -1653,7 +1870,7 @@ export const SettingsView: React.FC = () => {
         <div className="flex flex-col gap-3">
           <label className="flex flex-col gap-1">
             <span className="text-[12px] font-medium text-[var(--ink-strong)]">
-              触发时机
+              触发时机（展示标签）
             </span>
             <input
               type="text"
@@ -1664,13 +1881,36 @@ export const SettingsView: React.FC = () => {
           </label>
           <label className="flex flex-col gap-1">
             <span className="text-[12px] font-medium text-[var(--ink-strong)]">
-              任务内容
+              Cron 表达式（分 时 日 月 周）
+            </span>
+            <input
+              type="text"
+              value={ruleCronExpr}
+              onChange={(e) => setRuleCronExpr(e.target.value)}
+              placeholder="30 9 * * *"
+              className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-[12px] font-medium text-[var(--ink-strong)]">
+              任务标题
             </span>
             <input
               type="text"
               value={ruleTitle}
               onChange={(e) => setRuleTitle(e.target.value)}
               className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 text-[13px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-[12px] font-medium text-[var(--ink-strong)]">
+              执行指令（交给 Pi Agent 执行）
+            </span>
+            <textarea
+              value={rulePrompt}
+              onChange={(e) => setRulePrompt(e.target.value)}
+              rows={3}
+              className="rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] p-2.5 text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
             />
           </label>
         </div>
@@ -1690,6 +1930,8 @@ export const SettingsView: React.FC = () => {
                 scheduleTop: parts[0] ?? "定时",
                 scheduleBottom: parts[1] ?? "执行",
                 title: ruleTitle.trim() || "新自动化任务",
+                cronExpr: ruleCronExpr.trim() || "0 9 * * *",
+                prompt: rulePrompt.trim(),
                 enabled: true,
                 triggerType: "cron",
               });
@@ -1759,17 +2001,60 @@ export const SettingsView: React.FC = () => {
               className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 text-[13px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
             />
           </label>
-          <label className="flex flex-col gap-1">
+          <div className="flex flex-col gap-1">
             <span className="text-[12px] font-medium text-[var(--ink-strong)]">
-              传输方式
+              传输类型
             </span>
-            <input
-              type="text"
-              value={mcpTransport}
-              onChange={(e) => setMcpTransport(e.target.value)}
-              className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+            <SegmentedControl<"stdio" | "http">
+              value={mcpTransportType}
+              onChange={(v) => setMcpTransportType(v)}
+              options={[
+                { value: "stdio", label: "stdio 本地命令" },
+                { value: "http", label: "HTTP / JSON-RPC" },
+              ]}
             />
-          </label>
+          </div>
+          {mcpTransportType === "stdio" ? (
+            <>
+              <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium text-[var(--ink-strong)]">
+                  可执行命令
+                </span>
+                <input
+                  type="text"
+                  value={mcpCommand}
+                  onChange={(e) => setMcpCommand(e.target.value)}
+                  placeholder="npx"
+                  className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium text-[var(--ink-strong)]">
+                  参数（空格分隔）
+                </span>
+                <input
+                  type="text"
+                  value={mcpArgsText}
+                  onChange={(e) => setMcpArgsText(e.target.value)}
+                  placeholder="-y @modelcontextprotocol/server-filesystem ~/Downloads"
+                  className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                />
+              </label>
+            </>
+          ) : (
+            <label className="flex flex-col gap-1">
+              <span className="text-[12px] font-medium text-[var(--ink-strong)]">
+                Endpoint URL
+              </span>
+              <input
+                type="text"
+                value={mcpUrl}
+                onChange={(e) => setMcpUrl(e.target.value)}
+                placeholder="http://localhost:3100/mcp"
+                className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+              />
+            </label>
+          )}
         </div>
         <div className="mt-5 flex justify-end gap-2">
           <button
@@ -1782,18 +2067,29 @@ export const SettingsView: React.FC = () => {
           <button
             type="button"
             onClick={() => {
+              const args = mcpArgsText
+                .trim()
+                .split(/\s+/)
+                .filter(Boolean);
               addMcpServer({
                 abbr: mcpName.trim().slice(0, 2).toLowerCase() || "mc",
                 name: mcpName.trim() || "Custom MCP",
-                transportLabel: mcpTransport.trim() || "stdio · 6 tools",
-                toolCount: 8,
+                transport: mcpTransportType,
+                command: mcpTransportType === "stdio" ? mcpCommand.trim() : undefined,
+                args: mcpTransportType === "stdio" ? args : undefined,
+                url: mcpTransportType === "http" ? mcpUrl.trim() : undefined,
+                transportLabel:
+                  mcpTransportType === "stdio"
+                    ? `stdio · ${mcpCommand.trim() || "cmd"}`
+                    : `http · ${mcpUrl.trim()}`,
+                toolCount: 0,
                 enabled: true,
               });
               setMcpModalOpen(false);
             }}
             className="h-[32px] cursor-pointer rounded-[8px] bg-[var(--ink-primary)] px-3.5 text-[12px] font-semibold text-[var(--ink-on-primary)]"
           >
-            接入
+            接入并探测工具
           </button>
         </div>
       </Modal>

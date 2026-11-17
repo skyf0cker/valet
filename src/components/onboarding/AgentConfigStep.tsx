@@ -51,12 +51,28 @@ export const AgentConfigStep: React.FC = () => {
     setVerifying(true);
     const res = await valetService.verifyProvider(activeProvider);
     setVerifying(false);
+    const discovered = res.models && res.models.length > 0 ? res.models : activeProvider.models;
     updateProvider(activeProvider.id, {
       verified: res.ok,
       connected: res.ok,
       latencyMs: res.latencyMs,
-      availableModelCount: res.modelCount,
+      availableModelCount: res.modelCount || discovered.length,
+      models: discovered,
     });
+    if (res.ok && discovered.length > 0) {
+      const nextPrimary = discovered.includes(state.preferences.models.primary)
+        ? state.preferences.models.primary
+        : discovered[0]!;
+      const nextFast = discovered.includes(state.preferences.models.fast)
+        ? state.preferences.models.fast
+        : discovered[discovered.length - 1] ?? nextPrimary;
+      if (
+        nextPrimary !== state.preferences.models.primary ||
+        nextFast !== state.preferences.models.fast
+      ) {
+        updateModels({ primary: nextPrimary, fast: nextFast });
+      }
+    }
     pushToast(res.message, res.ok ? "success" : "warning");
   };
 

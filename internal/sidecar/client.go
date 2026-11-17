@@ -346,43 +346,37 @@ func (c *Client) Close() error {
 
 func resolveSidecarCommand(resourcesDir, explicitRoot string) (string, []string, string, error) {
 	platDir := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
-	var binDirs []string
 	if resourcesDir != "" {
-		binDirs = append(binDirs,
+		resDirs := []string{
 			filepath.Join(resourcesDir, "bin"),
 			filepath.Join(resourcesDir, platDir, "bin"),
-		)
+		}
+		for _, binDir := range resDirs {
+			if bin, args, dir, ok := lookupBinDir(binDir, resourcesDir); ok {
+				return bin, args, dir, nil
+			}
+		}
 	}
 
 	repoRoot := findRepoRoot(explicitRoot)
-	if repoRoot != "" {
-		binDirs = append(binDirs,
-			filepath.Join(repoRoot, "resources", platDir, "bin"),
-			filepath.Join(repoRoot, "resources", "bin"),
-		)
-	}
-
-	for _, binDir := range binDirs {
-		bunRunner := filepath.Join(binDir, "valet-bun")
-		agentScript := filepath.Join(binDir, "valet-agent.js")
-		bunInfo, bunErr := os.Stat(bunRunner)
-		scriptInfo, scriptErr := os.Stat(agentScript)
-		if bunErr == nil && !bunInfo.IsDir() && scriptErr == nil && !scriptInfo.IsDir() {
-			return bunRunner, []string{agentScript}, binDir, nil
-		}
-
-		compiled := filepath.Join(binDir, "valet-agent")
-		if info, err := os.Stat(compiled); err == nil && !info.IsDir() {
-			return compiled, nil, repoRoot, nil
-		}
-	}
-
 	if repoRoot != "" {
 		entry := filepath.Join(repoRoot, "sidecar", "src", "main.ts")
 		if _, err := os.Stat(entry); err == nil {
 			if bunBin := findBun(); bunBin != "" {
 				return bunBin, []string{"run", entry}, repoRoot, nil
 			}
+		}
+
+		for _, binDir := range []string{
+			filepath.Join(repoRoot, "resources", platDir, "bin"),
+			filepath.Join(repoRoot, "resources", "bin"),
+		} {
+			if bin, args, dir, ok := lookupBinDir(binDir, repoRoot); ok {
+				return bin, args, dir, nil
+			}
+		}
+
+		if _, err := os.Stat(entry); err == nil {
 			if nodeBin, err := exec.LookPath("node"); err == nil {
 				return nodeBin, []string{"--experimental-strip-types", entry}, repoRoot, nil
 			}
@@ -390,6 +384,22 @@ func resolveSidecarCommand(resourcesDir, explicitRoot string) (string, []string,
 	}
 
 	return "", nil, "", errors.New("could not locate valet-agent sidecar binary or Bun/Node runner")
+}
+
+func lookupBinDir(binDir, compiledDir string) (string, []string, string, bool) {
+	bunRunner := filepath.Join(binDir, "valet-bun")
+	agentScript := filepath.Join(binDir, "valet-agent.js")
+	bunInfo, bunErr := os.Stat(bunRunner)
+	scriptInfo, scriptErr := os.Stat(agentScript)
+	if bunErr == nil && !bunInfo.IsDir() && scriptErr == nil && !scriptInfo.IsDir() {
+		return bunRunner, []string{agentScript}, binDir, true
+	}
+
+	compiled := filepath.Join(binDir, "valet-agent")
+	if info, err := os.Stat(compiled); err == nil && !info.IsDir() {
+		return compiled, nil, compiledDir, true
+	}
+	return "", nil, "", false
 }
 
 func findRepoRoot(explicit string) string {

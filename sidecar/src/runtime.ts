@@ -24,9 +24,9 @@ import {
   ToolPolicyRegistry,
   createSafetyExtension,
 } from "./approval.ts";
-import { createBuiltinPluginExtensions } from "./extensions/builtin-plugins.ts";
+import { compilePluginExtension } from "./extensions/plugin-compiler.ts";
 import { createStewardCoreExtension } from "./extensions/steward-core.ts";
-import { compileYamlPluginExtension } from "./extensions/yaml-plugin.ts";
+import { McpClientManager } from "./mcp.ts";
 import { ValetModelManager } from "./models.ts";
 import type {
   ChatMessage,
@@ -36,9 +36,12 @@ import type {
   ExecuteApprovedToolRequest,
   HostBridge,
   PluginDraftSpec,
+  ProbeMcpRequest,
+  ProbeMcpResponse,
   ProcessSampleRow,
   SendChatRequest,
   SendChatResponse,
+  TestProviderRequest,
   ValetSyncState,
 } from "./protocol.ts";
 import { openUniversalSqliteStorage } from "./sqlite.ts";
@@ -124,13 +127,13 @@ export class ValetDurableRuntime {
   private storageClose: (() => Promise<void>) | null = null;
   readonly policyRegistry = new ToolPolicyRegistry();
   readonly models = new ValetModelManager();
+  readonly mcp = new McpClientManager();
   readonly registry = createRegistry();
   private readonly approvedConversations = new Set<ConversationId>();
   private readonly installedPluginExts = new Map<
     string,
     { signature: string; ext: Extension }
   >();
-  private builtinExts: Record<string, Extension> = {};
   private state: ValetSyncState = emptySyncState();
   private activeConversationHandles = new Map<string, Conversation>();
   private turnSideEffects = new Map<
@@ -138,7 +141,11 @@ export class ValetDurableRuntime {
     { inboxIds: string[]; timelineIds: string[] }
   >();
 
-  constructor(private readonly bridge: HostBridge) {}
+  constructor(private readonly bridge: HostBridge) {
+    this.models.setAvailableToolProvider(
+      () => new Set(this.registry.snapshot().tools().map((t) => t.tool.name)),
+    );
+  }
 
   getState(): ValetSyncState {
     return this.state;
@@ -189,15 +196,17 @@ export class ValetDurableRuntime {
       policyRegistry: this.policyRegistry,
       tracker,
     });
-    this.builtinExts = createBuiltinPluginExtensions({
-      bridge: this.bridge,
-      policyRegistry: this.policyRegistry,
-    });
 
     this.registry.install(safetyExt);
     this.registry.install(coreExt);
 
     this.syncPluginExtensions(params.state.plugins);
+    await this.mcp.syncServers(
+      params.state.mcpServers ?? [],
+      this.policyRegistry,
+      (ext) => this.registry.install(ext),
+      (ext) => this.registry.uninstall(ext),
+    );
 
     const storage = await openUniversalSqliteStorage(
       params.dbPath || join(params.state.dataDir, "pi-agent.sqlite"),
@@ -239,18 +248,24 @@ export class ValetDurableRuntime {
       if (!plugin.installed || !plugin.enabled) continue;
       activeIds.add(plugin.id);
 
-      const sig = `${plugin.version}|${plugin.manifestYaml}`;
+      const sig = JSON.stringify({
+        v: plugin.version,
+        y: plugin.manifestYaml,
+        e: plugin.events.map((ev) => `${ev.id}:${ev.policy}`),
+        a: plugin.actions.map((ac) => `${ac.id}:${ac.safety}`),
+      });
       const existing = this.installedPluginExts.get(plugin.id);
       if (existing && existing.signature === sig) continue;
 
-      const builtin = this.builtinExts[plugin.id];
-      const ext =
-        builtin ??
-        compileYamlPluginExtension({
-          plugin,
-          bridge: this.bridge,
-          policyRegistry: this.policyRegistry,
-        });
+      if (existing) {
+        this.registry.uninstall(existing.ext);
+      }
+
+      const ext = compilePluginExtension({
+        plugin,
+        bridge: this.bridge,
+        policyRegistry: this.policyRegistry,
+      });
       this.registry.install(ext);
       this.installedPluginExts.set(plugin.id, { signature: sig, ext });
     }
@@ -258,9 +273,7 @@ export class ValetDurableRuntime {
     for (const [pluginId, entry] of [...this.installedPluginExts.entries()]) {
       if (!activeIds.has(pluginId)) {
         this.registry.uninstall(entry.ext);
-        if (!this.builtinExts[pluginId]) {
-          this.policyRegistry.unregisterByPlugin(pluginId);
-        }
+        this.policyRegistry.unregisterByPlugin(pluginId);
         this.installedPluginExts.delete(pluginId);
       }
     }
@@ -270,7 +283,25 @@ export class ValetDurableRuntime {
     this.state = nextState;
     this.models.syncProviders(nextState.providers);
     this.syncPluginExtensions(nextState.plugins);
+    await this.mcp.syncServers(
+      nextState.mcpServers ?? [],
+      this.policyRegistry,
+      (ext) => this.registry.install(ext),
+      (ext) => this.registry.uninstall(ext),
+    );
     return { ok: true };
+  }
+
+  async testProvider(req: TestProviderRequest): Promise<{
+    ok: boolean;
+    reply: string;
+    latencyMs: number;
+  }> {
+    return this.models.testProvider(req.provider, req.model);
+  }
+
+  async probeMcpServer(req: ProbeMcpRequest): Promise<ProbeMcpResponse> {
+    return this.mcp.probeServer(req.server);
   }
 
   private requireHarness(): Harness {
@@ -317,7 +348,10 @@ export class ValetDurableRuntime {
     const harness = this.requireHarness();
     const conv = await this.ensureConversation(req.chatId);
 
-    const { ref } = this.models.resolveModelRef(req.model, this.state);
+    const { ref, usingLocalFallback } = this.models.resolveModelRef(
+      req.model,
+      this.state,
+    );
     const mentionPlugin = req.mentionPluginId
       ? this.state.plugins.find((p) => p.id === req.mentionPluginId)
       : undefined;
@@ -479,7 +513,7 @@ export class ValetDurableRuntime {
       this.bridge.notifyHost("host.chatStream", donePayload);
 
       const metaParts = [
-        ref.provider === "valet-local" ? req.model : ref.modelId,
+        usingLocalFallback ? "本地管家引擎" : `${ref.provider} · ${ref.modelId}`,
       ];
       if (mentionPlugin) metaParts.push(`@${mentionPlugin.name}`);
 
@@ -697,6 +731,7 @@ export class ValetDurableRuntime {
   }
 
   async close(): Promise<void> {
+    await this.mcp.closeAll();
     if (this.harness) {
       await this.harness.close(BACKGROUND_CONTEXT);
       this.harness = null;

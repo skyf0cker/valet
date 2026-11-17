@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { useValet } from "../../store/ValetContext";
 import type { EventPolicyMode, PluginState } from "../../types/valet";
 import { SidebarToggleButton } from "../Sidebar";
@@ -19,10 +19,20 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
     togglePluginEnabled,
     updatePluginEventPolicy,
     updatePluginConfig,
+    updatePluginManifest,
+    simulatePluginEvent,
     setActiveView,
     setTimelinePluginFilter,
     fixPluginAuth,
   } = useValet();
+
+  const [editingManifest, setEditingManifest] = useState(false);
+  const [draftYaml, setDraftYaml] = useState(plugin.manifestYaml);
+
+  useEffect(() => {
+    setDraftYaml(plugin.manifestYaml);
+    setEditingManifest(false);
+  }, [plugin.id, plugin.manifestYaml]);
 
   const sourceLabel =
     plugin.source === "core"
@@ -172,6 +182,13 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
                   <span className="w-9 shrink-0 text-right font-mono text-[12px] text-[var(--ink-strong)]">
                     {ev.count24h}
                   </span>
+                  <button
+                    type="button"
+                    onClick={() => simulatePluginEvent(plugin.id, ev.id)}
+                    className="inline-flex h-[24px] shrink-0 cursor-pointer items-center rounded-[6px] border border-[var(--border-control)] px-2 text-[11px] font-medium text-[var(--ink-muted)] hover:border-[var(--border-strong)] hover:text-[var(--ink-strong)]"
+                  >
+                    测试触发
+                  </button>
                 </div>
               );
             })}
@@ -272,6 +289,68 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
               ))}
             </section>
           </div>
+
+          {/* Unified Declarative Manifest (YAML) */}
+          <section className="flex flex-col gap-2.5 border-t border-[var(--border-subtle)] pt-5 pb-8">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-baseline gap-2.5">
+                <h2 className="font-[family-name:var(--font-serif-zh)] text-[18px] font-semibold leading-[22px] text-[var(--ink-strong)]">
+                  声明式 Manifest (YAML)
+                </h2>
+                <span className="text-[12px] text-[var(--ink-muted)]">
+                  内核与社区插件统一经由传感器与驱动编排生效
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                {editingManifest ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDraftYaml(plugin.manifestYaml);
+                        setEditingManifest(false);
+                      }}
+                      className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-2.5 text-[11px] font-medium text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        updatePluginManifest(plugin.id, draftYaml);
+                        setEditingManifest(false);
+                      }}
+                      className="inline-flex h-7 cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] px-3 text-[11px] font-semibold text-[var(--ink-on-primary)]"
+                    >
+                      保存并热重载
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setEditingManifest(true)}
+                    className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-2.5 text-[11px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                  >
+                    编辑 Manifest
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {editingManifest ? (
+              <textarea
+                value={draftYaml}
+                onChange={(e) => setDraftYaml(e.target.value)}
+                rows={12}
+                spellCheck={false}
+                className="w-full rounded-[10px] border border-[var(--border-control)] bg-[var(--bg-subtle)] p-3.5 font-mono text-[12px] leading-[18px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+              />
+            ) : (
+              <pre className="max-h-[260px] overflow-auto rounded-[10px] border border-[var(--border-light)] bg-[var(--bg-subtle)] p-3.5 font-mono text-[11.5px] leading-[18px] text-[var(--ink-secondary)]">
+                {plugin.manifestYaml || "# 该插件尚未提供 Manifest YAML"}
+              </pre>
+            )}
+          </section>
         </div>
       </div>
     </div>

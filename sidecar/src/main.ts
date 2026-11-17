@@ -4,7 +4,9 @@ import type {
   DispatchPluginEventRequest,
   ExecuteApprovedToolRequest,
   HostBridge,
+  ProbeMcpRequest,
   SendChatRequest,
+  TestProviderRequest,
   ValetSyncState,
 } from "./protocol.ts";
 import { ValetDurableRuntime } from "./runtime.ts";
@@ -144,6 +146,12 @@ class StdioJsonRpcServer implements HostBridge {
         );
       case "agent.inspect":
         return this.runtime.inspect();
+      case "agent.testProvider":
+        return this.runtime.testProvider(
+          params as unknown as TestProviderRequest,
+        );
+      case "mcp.probe":
+        return this.runtime.probeMcpServer(params as unknown as ProbeMcpRequest);
       case "agent.shutdown":
         await this.runtime.close();
         setTimeout(() => process.exit(0), 15);

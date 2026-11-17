@@ -37,7 +37,22 @@ function makeBaseState(dataDir: string): ValetSyncState {
         { id: "disk.move_to_trash", safety: "reversible", safetyLabel: "可撤销" },
       ],
       config: {},
-      manifestYaml: "id: com.valet.disk-guard\nname: 磁盘守卫",
+      manifestYaml: `id: com.valet.disk-guard
+name: 磁盘守卫
+version: 1.2.0
+actions:
+  - id: disk.scan
+    tool: disk_scan
+    driver: fs.scan_cleanable
+    safety: readonly
+    category: files
+  - id: disk.move_to_trash
+    tool: disk_move_to_trash
+    driver: fs.trash
+    event: disk.large_file
+    safety: reversible
+    category: files
+    checklist: deleteOrOverwrite`,
     },
     {
       id: "process-sentinel",
@@ -58,7 +73,22 @@ function makeBaseState(dataDir: string): ValetSyncState {
         { id: "process.terminate", safety: "confirm_always", safetyLabel: "每次确认" },
       ],
       config: {},
-      manifestYaml: "id: com.valet.process-sentinel\nname: 进程哨兵",
+      manifestYaml: `id: com.valet.process-sentinel
+name: 进程哨兵
+version: 1.0.4
+actions:
+  - id: process.sample
+    tool: process_sample
+    driver: proc.sample
+    safety: readonly
+    category: process
+    ui_card: process_table
+  - id: process.terminate
+    tool: process_terminate
+    driver: proc.signal
+    safety: confirm_always
+    category: process
+    checklist: runTerminalCommand`,
     },
   ];
 
@@ -140,34 +170,63 @@ class FakeHostBridge implements HostBridge {
     params: Record<string, unknown> = {},
   ): Promise<T> {
     switch (method) {
-      case "host.scanDisk":
-        return {
-          cleanablePaths: ["/Users/testuser/Downloads/old.ipsw"],
-          estimatedReclaimableGB: 4.2,
-          items: [{ path: "/Users/testuser/Downloads/old.ipsw", sizeGB: 4.2 }],
-        } as T;
-      case "host.trashItems":
-        return {
-          movedCount: Array.isArray(params.paths) ? params.paths.length : 0,
-          reclaimedGB: Number(params.estimatedGB ?? 4.2),
-          trashBatchId: "trash-test-1",
-        } as T;
-      case "host.sampleProcesses":
-        return {
-          cpuPct: 48,
-          memPct: 62,
-          rows: [
-            {
-              id: "p1",
-              name: "vite",
-              pid: 48211,
-              cpuPct: 210,
-              memLabel: "1.9 GB",
-              sourceLabel: "Terminal",
-              severity: "high",
+      case "host.plugin.invoke": {
+        const pluginId = String(params.pluginId ?? "");
+        const actionId = String(params.actionId ?? "");
+        const driver = String(params.driver ?? "");
+        const args = (params.args ?? {}) as Record<string, unknown>;
+        this.pluginActions.push(params);
+
+        if (driver === "fs.scan_cleanable") {
+          return {
+            ok: true,
+            driver,
+            summary: "扫描完成",
+            data: {
+              cleanablePaths: ["/Users/testuser/Downloads/old.ipsw"],
+              estimatedReclaimableGB: 4.2,
+              items: [{ path: "/Users/testuser/Downloads/old.ipsw", sizeGB: 4.2 }],
             },
-          ],
+          } as T;
+        }
+        if (driver === "fs.trash") {
+          const paths = Array.isArray(args.paths) ? args.paths : [];
+          return {
+            ok: true,
+            driver,
+            summary: "已移入废纸篓",
+            movedCount: paths.length,
+            reclaimedGB: Number(args.estimatedGB ?? 4.2),
+            trashBatchId: "trash-test-1",
+            data: { movedCount: paths.length, reclaimedGB: Number(args.estimatedGB ?? 4.2) },
+          } as T;
+        }
+        if (driver === "proc.sample") {
+          return {
+            ok: true,
+            driver,
+            summary: "采样完成",
+            rows: [
+              {
+                id: "p1",
+                name: "vite",
+                pid: 48211,
+                cpuPct: 210,
+                memLabel: "1.9 GB",
+                sourceLabel: "Terminal",
+                severity: "high",
+              },
+            ],
+            data: { cpuPct: 48, memPct: 62 },
+          } as T;
+        }
+        return {
+          ok: true,
+          driver,
+          summary: `${pluginId}.${actionId} executed`,
+          data: { ok: true, actionId },
         } as T;
+      }
       case "host.queueApproval": {
         this.queued.push(params as unknown as QueueApprovalParams);
         return {
@@ -179,10 +238,7 @@ class FakeHostBridge implements HostBridge {
         this.recorded.push(params);
         return { timelineEventId: `evt-rec-${this.recorded.length}` } as T;
       }
-      case "host.executePluginAction": {
-        this.pluginActions.push(params);
-        return { ok: true, actionId: params.actionId } as T;
-      }
+      case "host.kernel.overview":
       case "host.systemOverview":
         return {
           diskPct: 82,
@@ -378,5 +434,95 @@ actions:
     );
 
     await rt2.close();
+  });
+
+  it("unmounts core disk tools when disk-guard disabled, resolves gemini->google keys, and connects real stdio MCP server", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-mcp-"));
+    tempDirs.push(dir);
+    const dbPath = join(dir, "pi-agent.sqlite");
+    const mcpScript = join(dir, "echo-mcp.mjs");
+    const { writeFile } = await import("node:fs/promises");
+
+    await writeFile(
+      mcpScript,
+      `
+import { createInterface } from "node:readline";
+const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  const req = JSON.parse(line);
+  if (req.id === undefined) return;
+  if (req.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { protocolVersion: "2024-11-05", serverInfo: { name: "echo-mcp", version: "1.0.0" }, capabilities: {} } }) + "\\n");
+  } else if (req.method === "tools/list") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { tools: [{ name: "echo_ping", description: "Return pong", inputSchema: { type: "object", properties: { msg: { type: "string" } } } }] } }) + "\\n");
+  } else if (req.method === "tools/call") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { content: [{ type: "text", text: "pong:" + (req.params?.arguments?.msg ?? "") }] } }) + "\\n");
+  }
+});
+`,
+      "utf8",
+    );
+
+    const bridge = new FakeHostBridge();
+    const state = makeBaseState(dir);
+    state.providers.push({
+      id: "gemini",
+      name: "Google Gemini",
+      apiKey: "AIzaSyLiveRealKeyExample12345",
+      baseUrl: "https://generativelanguage.googleapis.com",
+      endpoint: "",
+      verified: true,
+      models: ["gemini-2.5-pro", "gemini-2.5-flash"],
+      connected: true,
+    });
+    state.mcpServers = [
+      {
+        id: "echo",
+        abbr: "ec",
+        name: "EchoMCP",
+        transport: "stdio",
+        command: process.execPath,
+        args: ["run", mcpScript],
+        transportLabel: "stdio",
+        toolCount: 0,
+        enabled: true,
+      },
+    ];
+
+    const rt = new ValetDurableRuntime(bridge);
+    await rt.init({ dbPath, state });
+
+    // 1. Verify MCP tool was discovered and mounted in Pi Durable registry
+    const info = await rt.inspect();
+    expect(info.registeredTools as string[]).toContain("mcp_echo_echo_ping");
+
+    // 2. Verify Gemini resolves to Pi AI "google" provider with non-mock key
+    const geminiState = {
+      ...state,
+      preferences: { ...state.preferences, activeProviderId: "gemini" as const },
+    };
+    const resolvedGemini = rt.models.resolveModelRef("gemini-2.5-pro", geminiState);
+    expect(resolvedGemini.usingLocalFallback).toBe(false);
+    expect(resolvedGemini.ref.provider).toBe("google");
+
+    // 3. Disabling core `disk-guard` unmounts disk tools cleanly
+    state.plugins = state.plugins.map((p) =>
+      p.id === "disk-guard" ? { ...p, enabled: false } : p,
+    );
+    await rt.syncState(state);
+    const afterDisable = await rt.inspect();
+    expect(afterDisable.registeredTools as string[]).not.toContain("disk_scan");
+    expect(afterDisable.registeredTools as string[]).not.toContain("disk_move_to_trash");
+
+    // Calling /clean while disk-guard is disabled gets polite explanation instead of phantom tool call
+    const disabledCleanRes = await rt.sendChat({
+      chatId: "chat-disabled-disk",
+      prompt: "/clean 清理大文件",
+      model: "claude-opus-4",
+    });
+    expect(disabledCleanRes.replyMessage.content).toContain("停用");
+
+    await rt.close();
   });
 });

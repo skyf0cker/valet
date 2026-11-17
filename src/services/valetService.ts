@@ -14,6 +14,7 @@ export interface ProviderVerifyResult {
   ok: boolean;
   latencyMs: number;
   modelCount: number;
+  models?: string[];
   message: string;
 }
 
@@ -422,7 +423,7 @@ class MyGoValetService implements ValetService {
     attachments: ChatAttachment[];
   }): Promise<SimulatedChatOutcome> {
     const res = await Valet.sendChatMessage({
-      chatId: params.chatId ?? "chat-lag",
+      chatId: params.chatId ?? "chat-default",
       prompt: params.prompt,
       model: params.model,
       mentionPluginId: params.mentionPlugin?.id,

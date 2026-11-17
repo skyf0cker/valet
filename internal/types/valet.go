@@ -320,17 +320,25 @@ type AutomationRule struct {
 	Subtitle       string `json:"subtitle,omitempty"`
 	Enabled        bool   `json:"enabled"`
 	TriggerType    string `json:"triggerType"` // "cron" | "event"
+	CronExpr       string `json:"cronExpr,omitempty"`
+	Prompt         string `json:"prompt,omitempty"`
+	LastRunAt      string `json:"lastRunAt,omitempty"`
 }
 
 // McpServerItem configures an external MCP server.
 type McpServerItem struct {
-	ID             string `json:"id"`
-	Abbr           string `json:"abbr"`
-	Name           string `json:"name"`
-	TransportLabel string `json:"transportLabel"`
-	ToolCount      int    `json:"toolCount"`
-	Enabled        bool   `json:"enabled"`
-	AuthExpired    bool   `json:"authExpired,omitempty"`
+	ID             string   `json:"id"`
+	Abbr           string   `json:"abbr"`
+	Name           string   `json:"name"`
+	TransportLabel string   `json:"transportLabel"`
+	ToolCount      int      `json:"toolCount"`
+	Enabled        bool     `json:"enabled"`
+	AuthExpired    bool     `json:"authExpired,omitempty"`
+	Transport      string   `json:"transport,omitempty"` // "stdio" | "http"
+	Command        string   `json:"command,omitempty"`
+	Args           []string `json:"args,omitempty"`
+	URL            string   `json:"url,omitempty"`
+	StatusError    string   `json:"statusError,omitempty"`
 }
 
 // MemoryEntry holds a persisted user preference item.
@@ -419,8 +427,19 @@ type ScanState struct {
 	Tasks         []ScanTaskItem `json:"tasks"`
 }
 
+// StorageStats reports real local storage footprint inside Valet's DataDir.
+type StorageStats struct {
+	TotalLabel    string `json:"totalLabel"`
+	TotalBytes    int64  `json:"totalBytes"`
+	DatabaseLabel string `json:"databaseLabel"`
+	StateLabel    string `json:"stateLabel"`
+	VaultLabel    string `json:"vaultLabel"`
+	DataDir       string `json:"dataDir"`
+}
+
 // ValetSnapshot is the full persisted & synced application state shared with the UI.
 type ValetSnapshot struct {
+	SchemaVersion              int                   `json:"schemaVersion"`
 	OnboardingCompleted        bool                  `json:"onboardingCompleted"`
 	OnboardingStep             int                   `json:"onboardingStep"`
 	ActiveView                 string                `json:"activeView"`
@@ -446,16 +465,18 @@ type ValetSnapshot struct {
 	Preferences                ValetPreferences      `json:"preferences"`
 	SystemMetrics              SystemMetrics         `json:"systemMetrics"`
 	Scan                       ScanState             `json:"scan"`
+	StorageStats               *StorageStats         `json:"storageStats,omitempty"`
 }
 
 // --- RPC & Streaming Payloads ---
 
 // ProviderVerifyResult returns connectivity test results for an Agent provider.
 type ProviderVerifyResult struct {
-	OK         bool   `json:"ok"`
-	LatencyMs  int    `json:"latencyMs"`
-	ModelCount int    `json:"modelCount"`
-	Message    string `json:"message"`
+	OK         bool     `json:"ok"`
+	LatencyMs  int      `json:"latencyMs"`
+	ModelCount int      `json:"modelCount"`
+	Models     []string `json:"models,omitempty"`
+	Message    string   `json:"message"`
 }
 
 // TestMessageResult returns the output of a provider test ping.

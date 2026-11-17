@@ -14,7 +14,28 @@ type SyncState struct {
 	Preferences types.ValetPreferences      `json:"preferences"`
 	Providers   []types.AgentProviderConfig `json:"providers"`
 	Plugins     []types.PluginState         `json:"plugins"`
+	McpServers  []types.McpServerItem       `json:"mcpServers"`
 	Memories    []types.MemoryEntry         `json:"memories"`
+}
+
+// TestProviderRequest asks the sidecar to run a live single-turn completion check.
+type TestProviderRequest struct {
+	Provider types.AgentProviderConfig `json:"provider"`
+	Model    string                    `json:"model"`
+}
+
+// ProbeMcpRequest tests an MCP server handshake and returns discovered tools.
+type ProbeMcpRequest struct {
+	Server types.McpServerItem `json:"server"`
+}
+
+// ProbeMcpResponse summarizes MCP server discovery results.
+type ProbeMcpResponse struct {
+	OK             bool     `json:"ok"`
+	ToolCount      int      `json:"toolCount"`
+	TransportLabel string   `json:"transportLabel"`
+	Tools          []string `json:"tools,omitempty"`
+	Error          string   `json:"error,omitempty"`
 }
 
 // InitParams initializes the sidecar harness with SQLite path and host state.

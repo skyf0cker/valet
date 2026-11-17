@@ -58,12 +58,20 @@ class InMemoryCredentialStore implements CredentialStore {
   }
 }
 
+function toPiProviderId(providerId: string): string {
+  if (providerId === "gemini") return "google";
+  return providerId;
+}
+
 function isMockOrEmptyKey(cfg: AgentProviderConfig): boolean {
-  if (cfg.id === "ollama") return !cfg.connected;
+  if (cfg.id === "ollama") return !(cfg.connected || cfg.verified);
+  if (cfg.id === "custom") {
+    return !Boolean(cfg.baseUrl?.trim() || cfg.endpoint?.trim());
+  }
   const k = cfg.apiKey.trim();
   if (!k) return true;
   if (k.includes("-mock-")) return true;
-  return !cfg.connected;
+  return false;
 }
 
 function extractUserText(content: UserMessage["content"]): string {
@@ -97,6 +105,7 @@ function parseTrailingJson(text: string): Record<string, unknown> | undefined {
  */
 function buildLocalStewardMessage(
   context: TranscriptContext,
+  availableTools: ReadonlySet<string>,
 ): AssistantMessage {
   const msgs = context.messages;
   let lastUserIdx = -1;
@@ -256,6 +265,11 @@ function buildLocalStewardMessage(
     }
 
     if (isCleanIntent) {
+      if (!availableTools.has("disk_scan")) {
+        return fauxAssistantMessage(
+          "当前「磁盘守卫 (`disk-guard`)」插件处于停用状态，未挂载 `disk_scan` 传感器与清理工具。请前往 **插件** 页面启用「磁盘守卫」后重试。",
+        );
+      }
       return fauxAssistantMessage(
         [
           fauxThinking("先通过 disk_scan 对用户缓存与超过 90 天未访问的大文件执行只读安全扫描（避开受保护目录）。"),
@@ -270,6 +284,11 @@ function buildLocalStewardMessage(
     }
 
     if (isProcessIntent) {
+      if (!availableTools.has("process_sample")) {
+        return fauxAssistantMessage(
+          "当前「进程哨兵 (`process-sentinel`)」插件已停用，未挂载 `process_sample` 工具。启用后即可采样实时进程。",
+        );
+      }
       return fauxAssistantMessage(
         [
           fauxThinking("采样当前 macOS 高 CPU / 内存进程，定位异常占用源。"),
@@ -280,6 +299,11 @@ function buildLocalStewardMessage(
     }
 
     if (isOrphanIntent) {
+      if (!availableTools.has("app_scan_remnants")) {
+        return fauxAssistantMessage(
+          "当前「卸载清道夫 (`uninstall-scrubber`)」插件已停用，启用后即可扫描残留目录。",
+        );
+      }
       return fauxAssistantMessage(
         [
           fauxThinking("扫描已移除应用在 ~/Library 留下的孤儿支持目录与缓存。"),
@@ -290,6 +314,11 @@ function buildLocalStewardMessage(
     }
 
     if (isLogIntent) {
+      if (!availableTools.has("log_summarize_crashes")) {
+        return fauxAssistantMessage(
+          "当前「日志侦探 (`log-detective`)」插件尚未启用，前往 **插件** 启用即可读取崩溃报告。",
+        );
+      }
       return fauxAssistantMessage(
         [
           fauxThinking("读取 DiagnosticReports 下近期崩溃报告，汇总高频异常进程。"),
@@ -429,6 +458,11 @@ export class ValetModelManager {
   private readonly fauxCore: ReturnType<typeof createFauxCore>;
   private readonly localProvider: Provider;
   private providerConfigs: AgentProviderConfig[] = [];
+  private getAvailableToolNames: () => ReadonlySet<string> = () => new Set();
+
+  setAvailableToolProvider(fn: () => ReadonlySet<string>): void {
+    this.getAvailableToolNames = fn;
+  }
 
   constructor() {
     this.models = createModels({
@@ -460,7 +494,7 @@ export class ValetModelManager {
         stream: (m, ctx, opts) => {
           if (core.getPendingResponseCount() === 0) {
             core.appendResponses([
-              async (c) => buildLocalStewardMessage(c),
+              async (c) => buildLocalStewardMessage(c, this.getAvailableToolNames()),
             ]);
           }
           return core.stream(m, ctx, opts);
@@ -468,7 +502,7 @@ export class ValetModelManager {
         streamSimple: (m, ctx, opts) => {
           if (core.getPendingResponseCount() === 0) {
             core.appendResponses([
-              async (c) => buildLocalStewardMessage(c),
+              async (c) => buildLocalStewardMessage(c, this.getAvailableToolNames()),
             ]);
           }
           return core.streamSimple(m, ctx, opts);
@@ -492,26 +526,57 @@ export class ValetModelManager {
 
   syncProviders(configs: AgentProviderConfig[]): void {
     this.providerConfigs = configs;
+    const baseFactories: Record<string, () => Provider> = {
+      anthropic: () => anthropicProvider() as Provider,
+      openai: () => openaiProvider() as Provider,
+      google: () => googleProvider() as Provider,
+      openrouter: () => openrouterProvider() as Provider,
+    };
+
     for (const cfg of configs) {
+      const piId = toPiProviderId(cfg.id);
       if (cfg.apiKey && !cfg.apiKey.includes("-mock-")) {
-        this.credStore.setApiKeyDirect(cfg.id, cfg.apiKey);
+        this.credStore.setApiKeyDirect(piId, cfg.apiKey.trim());
+      }
+
+      if (baseFactories[piId]) {
+        const base = baseFactories[piId]!();
+        const customBase = cfg.baseUrl?.trim().replace(/\/+$/, "");
+        const customHeaders =
+          cfg.orgId?.trim() && piId === "openai"
+            ? { ...(base.headers ?? {}), "OpenAI-Organization": cfg.orgId.trim() }
+            : base.headers;
+
+        if ((customBase && customBase !== base.baseUrl) || cfg.orgId?.trim()) {
+          this.models.setProvider({
+            ...base,
+            baseUrl: customBase || base.baseUrl,
+            headers: customHeaders,
+          });
+        } else {
+          this.models.setProvider(base);
+        }
+        continue;
       }
 
       if (cfg.id === "ollama" || cfg.id === "custom") {
         const rawBase =
           cfg.id === "ollama"
-            ? cfg.baseUrl || "http://localhost:11434"
+            ? cfg.baseUrl || cfg.endpoint || "http://localhost:11434"
             : cfg.baseUrl || cfg.endpoint || "http://localhost:1234";
-        const normalizedBase = rawBase.replace(/\/+$/, "").endsWith("/v1")
-          ? rawBase.replace(/\/+$/, "")
-          : `${rawBase.replace(/\/+$/, "")}/v1`;
+        const withScheme =
+          rawBase.startsWith("http://") || rawBase.startsWith("https://")
+            ? rawBase
+            : `http://${rawBase}`;
+        const trimmed = withScheme.replace(/\/+$/, "");
+        const normalizedBase = trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
         const dynamicModels: Model<"openai-completions">[] = (
           cfg.models.length > 0 ? cfg.models : ["custom-reasoning"]
         ).map((id) => ({
           id,
           name: id,
           api: "openai-completions",
-          provider: cfg.id,
+          provider: piId,
           baseUrl: normalizedBase,
           reasoning: true,
           input: ["text"],
@@ -521,13 +586,13 @@ export class ValetModelManager {
         }));
 
         this.credStore.setApiKeyDirect(
-          cfg.id,
+          piId,
           cfg.apiKey?.trim() || (cfg.id === "ollama" ? "ollama" : "custom"),
         );
 
         this.models.setProvider(
           createProvider<"openai-completions">({
-            id: cfg.id,
+            id: piId,
             name: cfg.name,
             baseUrl: normalizedBase,
             auth: {
@@ -570,7 +635,8 @@ export class ValetModelManager {
       };
     }
 
-    const catalog = this.models.getModels(activeProvider.id);
+    const piId = toPiProviderId(activeProvider.id);
+    const catalog = this.models.getModels(piId);
     if (catalog.length === 0) {
       return {
         ref: { provider: "valet-local", modelId: "valet-steward-local" },
@@ -581,7 +647,7 @@ export class ValetModelManager {
     const exact = catalog.find((m) => m.id === requestedModelId);
     if (exact) {
       return {
-        ref: { provider: activeProvider.id, modelId: exact.id },
+        ref: { provider: piId, modelId: exact.id },
         usingLocalFallback: false,
       };
     }
@@ -595,14 +661,94 @@ export class ValetModelManager {
     );
     if (prefixMatch) {
       return {
-        ref: { provider: activeProvider.id, modelId: prefixMatch.id },
+        ref: { provider: piId, modelId: prefixMatch.id },
         usingLocalFallback: false,
       };
     }
 
     return {
-      ref: { provider: activeProvider.id, modelId: catalog[0]!.id },
+      ref: { provider: piId, modelId: catalog[0]!.id },
       usingLocalFallback: false,
     };
+  }
+
+  /** Executes a live 1-turn completion test against a configured provider & model. */
+  async testProvider(
+    provider: AgentProviderConfig,
+    requestedModel: string,
+  ): Promise<{ ok: boolean; reply: string; latencyMs: number }> {
+    const candidate: AgentProviderConfig = {
+      ...provider,
+      connected: true,
+      verified: true,
+    };
+    if (isMockOrEmptyKey(candidate)) {
+      return {
+        ok: false,
+        latencyMs: 0,
+        reply: "请先输入有效的 API Key 或 Ollama / 自定义 Endpoint 后再测试真模型对话。",
+      };
+    }
+
+    this.syncProviders([
+      ...this.providerConfigs.filter((p) => p.id !== candidate.id),
+      candidate,
+    ]);
+
+    const piId = toPiProviderId(candidate.id);
+    const catalog = this.models.getModels(piId);
+    const model =
+      catalog.find((m) => m.id === requestedModel) ??
+      catalog.find((m) => m.id.includes(requestedModel)) ??
+      catalog[0];
+
+    if (!model) {
+      return {
+        ok: false,
+        latencyMs: 0,
+        reply: `未在服务商 ${provider.name} 中找到可用模型 ${requestedModel}`,
+      };
+    }
+
+    const start = Date.now();
+    try {
+      const msg = await this.models.completeSimple(
+        model,
+        {
+          messages: [
+            {
+              role: "user",
+              content: "请用简短中文回复一句话确认连通性，并说明当前模型 ID。",
+              timestamp: Date.now(),
+            },
+          ],
+        },
+        { maxTokens: 120, signal: AbortSignal.timeout(15_000) },
+      );
+      const replyText = msg.content
+        .filter((b): b is { type: "text"; text: string } => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+      const latencyMs = Math.max(1, Date.now() - start);
+      if (msg.stopReason === "error" || msg.errorMessage) {
+        return {
+          ok: false,
+          latencyMs,
+          reply: `调用失败：${msg.errorMessage || "未知上游错误"}`,
+        };
+      }
+      return {
+        ok: true,
+        latencyMs,
+        reply: replyText || `已收到 ${model.provider}/${model.id} 响应（${latencyMs}ms）。`,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        latencyMs: Math.max(1, Date.now() - start),
+        reply: `请求失败：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
   }
 }

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,7 +24,7 @@ import (
 	"valet/internal/types"
 )
 
-// StartOptions configures backend directories, emitters, and runtime flags.
+// StartOptions configures backend directories, native callbacks, and runtime flags.
 type StartOptions struct {
 	DataDir      string
 	HomeDir      string
@@ -30,6 +32,10 @@ type StartOptions struct {
 	RepoRoot     string
 	DesktopReady bool
 	UseVaultOnly bool // true in tests to avoid touching user's real Finder Trash
+	WatchDir     plugins.WatchDirFunc
+	OnNotify     func(kind, title, subtitle, body string)
+	OnSyncTray   func(show bool, paused bool)
+	OnSyncLogin  func(launchAtLogin bool)
 	OnChatStream func(types.ChatStreamPayload)
 	OnMetrics    func(types.SystemMetrics)
 	OnState      func(types.StateChangeNotice)
@@ -44,7 +50,7 @@ type Service struct {
 	opts         StartOptions
 	store        *store.Store
 	client       *sidecar.Client
-	throttle     *plugins.ThrottleTracker
+	engine       *plugins.Engine
 	stopMetrics  chan struct{}
 	trashMover   sys.TrashMover
 	createdInbox map[string]types.InboxApprovalItem
@@ -54,7 +60,6 @@ type Service struct {
 // NewService constructs a zero-I/O Service safe to pass to mygo.Bind before App.Run / MYGO_GENERATE.
 func NewService() *Service {
 	return &Service{
-		throttle:     plugins.NewThrottleTracker(),
 		createdInbox: make(map[string]types.InboxApprovalItem),
 		createdEvent: make(map[string]types.TimelineEvent),
 	}
@@ -65,7 +70,7 @@ func StartService(s *Service, opts StartOptions) error {
 	return s.start(opts)
 }
 
-// CloseService shuts down background tickers and the Pi Durable sidecar cleanly.
+// CloseService shuts down background tickers, plugin sensors, and the Pi Durable sidecar cleanly.
 func CloseService(s *Service) error {
 	return s.close()
 }
@@ -95,7 +100,7 @@ func (s *Service) start(opts StartOptions) error {
 		}
 	}
 
-	st, err := store.Open(opts.DataDir, opts.HomeDir)
+	st, err := store.OpenWithOptions(opts.DataDir, opts.HomeDir, opts.DesktopReady)
 	if err != nil {
 		s.mu.Unlock()
 		return err
@@ -108,6 +113,14 @@ func (s *Service) start(opts StartOptions) error {
 		}
 	}
 
+	eng := plugins.NewEngine(plugins.EngineConfig{
+		HomeDir:    opts.HomeDir,
+		DataDir:    opts.DataDir,
+		WatchDir:   opts.WatchDir,
+		TrashMover: mover,
+		OnTrigger:  s.handlePluginEngineTrigger,
+	})
+
 	client := sidecar.NewClient(
 		opts.ResourcesDir,
 		opts.RepoRoot,
@@ -118,25 +131,39 @@ func (s *Service) start(opts StartOptions) error {
 	s.opts = opts
 	s.store = st
 	s.client = client
+	s.engine = eng
 	s.trashMover = mover
 	s.stopMetrics = make(chan struct{})
 	s.started = true
 	s.mu.Unlock()
 
-	// Refresh host disk metrics immediately
+	// Hydrate secrets from OS Keychain and probe live privacy permissions when in desktop app
+	if opts.DesktopReady {
+		s.hydrateSecretsFromKeychain()
+	}
+	s.refreshPermissionsOnStartup()
 	s.refreshHostMetrics()
+
+	snap := st.Snapshot()
+	if opts.OnSyncTray != nil {
+		opts.OnSyncTray(snap.Preferences.ShowMenuBarIcon, snap.IsPaused)
+	}
+	if opts.OnSyncLogin != nil {
+		opts.OnSyncLogin(snap.Preferences.LaunchAtLogin)
+	}
 
 	// Launch and initialize Pi Durable sidecar
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	initParams := sidecar.InitParams{
 		DBPath: filepath.Join(opts.DataDir, "pi-agent.sqlite"),
-		State:  s.buildSyncState(st.Snapshot()),
+		State:  s.buildSyncState(snap),
 	}
 	if err := client.Call(ctx, "agent.init", initParams, nil); err != nil {
-		// Sidecar failure should be logged; retry occurs lazily on next call
 		fmt.Fprintf(os.Stderr, "[valet] initial sidecar init error: %v\n", err)
 	}
+
+	eng.Sync(snap)
 
 	if opts.OnMetrics != nil {
 		go s.metricsLoop()
@@ -153,10 +180,14 @@ func (s *Service) close() error {
 	s.closed = true
 	stopCh := s.stopMetrics
 	client := s.client
+	eng := s.engine
 	s.mu.Unlock()
 
 	if stopCh != nil {
 		close(stopCh)
+	}
+	if eng != nil {
+		eng.Close()
 	}
 	if client != nil {
 		return client.Close()
@@ -215,8 +246,93 @@ func (s *Service) buildSyncState(snap types.ValetSnapshot) sidecar.SyncState {
 		Preferences: snap.Preferences,
 		Providers:   snap.Providers,
 		Plugins:     snap.Plugins,
+		McpServers:  snap.McpServers,
 		Memories:    snap.Memories,
 	}
+}
+
+func (s *Service) syncRuntime(snap types.ValetSnapshot) {
+	if s.engine != nil {
+		s.engine.Sync(snap)
+	}
+	s.syncSidecar(snap)
+}
+
+func (s *Service) hydrateSecretsFromKeychain() {
+	snap := s.store.Snapshot()
+	updated := false
+	for _, p := range snap.Providers {
+		if raw, err := mygo.Secrets.Get("provider.apikey." + p.ID); err == nil {
+			val := strings.TrimSpace(string(raw))
+			if val != "" && val != p.APIKey {
+				updated = true
+			}
+		}
+	}
+	if !updated {
+		return
+	}
+	s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Providers {
+			if raw, err := mygo.Secrets.Get("provider.apikey." + st.Providers[i].ID); err == nil {
+				val := strings.TrimSpace(string(raw))
+				if val != "" {
+					st.Providers[i].APIKey = val
+					st.Providers[i].APIKeyMasked = maskSecretKey(val)
+				}
+			}
+		}
+	})
+}
+
+func (s *Service) refreshPermissionsOnStartup() {
+	s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Permissions {
+			granted := sys.CheckPermissionStatus(st.Permissions[i].ID, st.Permissions[i].Granted, s.opts.DesktopReady)
+			st.Permissions[i].Granted = granted
+			for j := range st.Permissions[i].MockApps {
+				if st.Permissions[i].MockApps[j].IsValet {
+					st.Permissions[i].MockApps[j].Enabled = granted
+				}
+			}
+		}
+	})
+}
+
+func (s *Service) handlePluginEngineTrigger(d plugins.TriggerDispatch) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		switch d.Kind {
+		case "plugin":
+			_, _ = s.dispatchPluginEventInternal(ctx, d.PluginID, d.EventCode, d.Payload, false)
+		case "automation":
+			if d.AutomationID != "" {
+				_, _ = s.RunAutomationNow(ctx, d.AutomationID)
+			}
+		}
+	}()
+}
+
+func (s *Service) recordPluginTriggerStat(pluginID, eventCode string, subtitle string) {
+	s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Plugins {
+			if st.Plugins[i].ID != pluginID {
+				continue
+			}
+			if len(st.Plugins[i].Triggers24h) > 0 {
+				st.Plugins[i].Triggers24h[len(st.Plugins[i].Triggers24h)-1] += 2
+			}
+			for j := range st.Plugins[i].Events {
+				if st.Plugins[i].Events[j].ID == eventCode {
+					st.Plugins[i].Events[j].Count24h++
+				}
+			}
+			if subtitle != "" {
+				st.Plugins[i].StatusSubtitle = subtitle
+			}
+		}
+	})
 }
 
 func (s *Service) syncSidecar(snap types.ValetSnapshot) {
@@ -259,7 +375,30 @@ func (s *Service) handleSidecarNotify(method string, params json.RawMessage) {
 func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, raw json.RawMessage) (any, error) {
 	snap := s.store.Snapshot()
 	switch method {
-	case "host.systemOverview":
+	case "host.plugin.invoke":
+		var req struct {
+			PluginID  string         `json:"pluginId"`
+			ActionID  string         `json:"actionId"`
+			Driver    string         `json:"driver"`
+			EventCode string         `json:"eventCode"`
+			Args      map[string]any `json:"args"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		res, err := s.engine.Invoke(ctx, snap, req.PluginID, req.ActionID, req.Driver, req.Args)
+		if err != nil {
+			return nil, err
+		}
+		if req.EventCode != "" {
+			s.recordPluginTriggerStat(req.PluginID, req.EventCode, res.Summary)
+		}
+		if res.Driver == "fs.trash" && res.MovedCount > 0 {
+			s.refreshHostMetrics()
+		}
+		return res, nil
+
+	case "host.kernel.overview", "host.systemOverview":
 		proc := sys.SampleProcesses(ctx, 5)
 		enabledCount := 0
 		for _, p := range snap.Plugins {
@@ -277,80 +416,7 @@ func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, r
 			"topProcesses":   proc.Rows,
 		}, nil
 
-	case "host.scanDisk":
-		var req struct {
-			MinSizeMB int `json:"minSizeMB"`
-			IdleDays  int `json:"idleDays"`
-		}
-		_ = json.Unmarshal(raw, &req)
-		return sys.ScanDisk(
-			s.opts.HomeDir,
-			snap.Preferences.CleanupPolicy.ProtectedDirs,
-			req.MinSizeMB,
-			req.IdleDays,
-		), nil
-
-	case "host.trashItems":
-		var req struct {
-			Paths       []string `json:"paths"`
-			EstimatedGB float64  `json:"estimatedGB"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		batchID, moved, reclaimed, err := sys.MoveItemsToTrash(
-			s.opts.HomeDir,
-			s.opts.DataDir,
-			snap.Preferences.CleanupPolicy.ProtectedDirs,
-			req.Paths,
-			req.EstimatedGB,
-			s.trashMover,
-		)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{
-			"trashBatchId": batchID,
-			"movedCount":   moved,
-			"reclaimedGB":  reclaimed,
-		}, nil
-
-	case "host.sampleProcesses":
-		var req struct {
-			Limit int `json:"limit"`
-		}
-		_ = json.Unmarshal(raw, &req)
-		return sys.SampleProcesses(ctx, req.Limit), nil
-
-	case "host.terminateProcess":
-		var req struct {
-			PID    int    `json:"pid"`
-			Name   string `json:"name"`
-			Signal string `json:"signal"`
-		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		if err := sys.TerminateProcess(req.PID, req.Name, req.Signal, snap.Preferences.BlockedApps); err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "pid": req.PID}, nil
-
-	case "host.scanOrphanRemnants":
-		var req struct {
-			BundleID string `json:"bundleId"`
-		}
-		_ = json.Unmarshal(raw, &req)
-		return map[string]any{"remnants": sys.ScanOrphanRemnants(s.opts.HomeDir, req.BundleID)}, nil
-
-	case "host.summarizeLogs":
-		var req struct {
-			Minutes int `json:"minutes"`
-		}
-		_ = json.Unmarshal(raw, &req)
-		return sys.SummarizeDiagnosticLogs(s.opts.HomeDir, req.Minutes), nil
-
-	case "host.saveMemory":
+	case "host.kernel.saveMemory", "host.saveMemory":
 		var req struct {
 			Content string `json:"content"`
 			Source  string `json:"source"`
@@ -368,59 +434,37 @@ func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, r
 		next := s.store.Update(func(st *types.ValetSnapshot) {
 			st.Memories = append([]types.MemoryEntry{entry}, st.Memories...)
 		})
-		s.syncSidecar(next)
+		s.syncRuntime(next)
 		s.emitStateChange("settings")
 		return entry, nil
-
-	case "host.executePluginAction":
-		var req struct {
-			PluginID  string         `json:"pluginId"`
-			ActionID  string         `json:"actionId"`
-			EventCode string         `json:"eventCode"`
-			Args      map[string]any `json:"args"`
-		}
-		_ = json.Unmarshal(raw, &req)
-		// If action moves a file to Trash cleanly via safe validation
-		if p, ok := req.Args["path"].(string); ok && strings.TrimSpace(p) != "" &&
-			(req.ActionID == "move_to_trash" || req.ActionID == "disk.move_to_trash" || req.ActionID == "app.trash_remnants") {
-			batchID, moved, reclaimed, err := sys.MoveItemsToTrash(
-				s.opts.HomeDir,
-				s.opts.DataDir,
-				snap.Preferences.CleanupPolicy.ProtectedDirs,
-				[]string{p},
-				0.2,
-				s.trashMover,
-			)
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{
-				"ok":           true,
-				"trashBatchId": batchID,
-				"movedCount":   moved,
-				"reclaimedGB":  reclaimed,
-			}, nil
-		}
-		return map[string]any{
-			"ok":        true,
-			"pluginId":  req.PluginID,
-			"actionId":  req.ActionID,
-			"eventCode": req.EventCode,
-		}, nil
 
 	case "host.queueApproval":
 		var req sidecar.QueueApprovalRequest
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
-		return s.queueApprovalFromAgent(req), nil
+		out := s.queueApprovalFromAgent(req)
+		s.recordPluginTriggerStat(req.PluginID, req.EventCode, "等待收件箱确认 · "+req.Title)
+		if s.opts.OnNotify != nil && snap.Preferences.NotifyOnConfirm {
+			s.opts.OnNotify("confirm", req.Title, req.PluginName, req.Summary)
+		}
+		return out, nil
 
 	case "host.recordTimelineEvent":
 		var req sidecar.RecordTimelineRequest
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
-		return s.recordTimelineFromAgent(req), nil
+		out := s.recordTimelineFromAgent(req)
+		s.recordPluginTriggerStat(req.PluginID, req.EventCode, req.Title)
+		if s.opts.OnNotify != nil {
+			if req.Status == "failed" && snap.Preferences.NotifyOnFailure {
+				s.opts.OnNotify("fail", req.Title, req.PluginName, req.Summary)
+			} else if req.Status == "completed" && snap.Preferences.NotifyOnComplete {
+				s.opts.OnNotify("complete", req.Title, req.PluginName, req.Summary)
+			}
+		}
+		return out, nil
 
 	default:
 		return nil, fmt.Errorf("unknown host RPC method: %s", method)
@@ -554,12 +598,15 @@ func (s *Service) recordTimelineFromAgent(req sidecar.RecordTimelineRequest) map
 
 // --- Public Bound RPC Methods (Exported via mygo.BindAs("Valet", svc)) ---
 
-// GetSnapshot returns the current persistent application state.
+// GetSnapshot returns the current persistent application state plus live storage stats.
 func (s *Service) GetSnapshot() (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
-	return s.store.Snapshot(), nil
+	snap := s.store.Snapshot()
+	stats := s.measureStorageStats()
+	snap.StorageStats = &stats
+	return snap, nil
 }
 
 // CompleteOnboarding finishes the onboarding wizard and opens Inbox.
@@ -567,10 +614,12 @@ func (s *Service) CompleteOnboarding() (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
-	return s.store.Update(func(st *types.ValetSnapshot) {
+	next := s.store.Update(func(st *types.ValetSnapshot) {
 		st.OnboardingCompleted = true
 		st.ActiveView = string(types.ViewInbox)
-	}), nil
+	})
+	s.syncRuntime(next)
+	return next, nil
 }
 
 // ImportExistingConfig marks onboarding imported and ready.
@@ -593,7 +642,7 @@ func (s *Service) ImportExistingConfig() (types.ValetSnapshot, error) {
 		st.OnboardingCompleted = true
 		st.ActiveView = string(types.ViewInbox)
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
@@ -608,16 +657,22 @@ func (s *Service) ResetOnboarding() (types.ValetSnapshot, error) {
 	}), nil
 }
 
-// ResetAllData resets the persistent state back to factory seed defaults.
+// ResetAllData resets the persistent state back to factory Clean Slate defaults.
 func (s *Service) ResetAllData() (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
+	}
+	if s.opts.DesktopReady {
+		snap := s.store.Snapshot()
+		for _, p := range snap.Providers {
+			_ = mygo.Secrets.Delete("provider.apikey." + p.ID)
+		}
 	}
 	seed := store.NewSeedSnapshot(s.opts.HomeDir)
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		*st = seed
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
@@ -630,48 +685,90 @@ func (s *Service) TogglePause() (types.ValetSnapshot, error) {
 		st.IsPaused = !st.IsPaused
 		st.IsOnDuty = !st.IsPaused
 	})
-	s.syncSidecar(next)
+	if s.opts.OnSyncTray != nil {
+		s.opts.OnSyncTray(next.Preferences.ShowMenuBarIcon, next.IsPaused)
+	}
+	s.syncRuntime(next)
 	return next, nil
 }
 
-// RunFirstScan performs real read-only host inspection (disk, orphans, processes, logs) and updates ScanState.
+// RunFirstScan performs real read-only host inspection routed through enabled core plugins and updates ScanState.
 func (s *Service) RunFirstScan(ctx context.Context) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
 	start := time.Now()
 	snap := s.store.Snapshot()
-	diskReport := sys.ScanDisk(
-		s.opts.HomeDir,
-		snap.Preferences.CleanupPolicy.ProtectedDirs,
-		2048,
-		90,
-	)
-	orphans := sys.ScanOrphanRemnants(s.opts.HomeDir, "")
-	procs := sys.SampleProcesses(ctx, 3)
-	logs := sys.SummarizeDiagnosticLogs(s.opts.HomeDir, 120)
 	metrics := sys.SampleDiskMetrics(s.opts.HomeDir)
 
-	logEnabled := false
-	for _, p := range snap.Plugins {
-		if p.ID == "log-detective" && p.Enabled {
-			logEnabled = true
-			break
+	var diskReport sys.DiskScanReport
+	diskTask := types.ScanTaskItem{ID: "disk", Title: "磁盘", Detail: "插件「磁盘守卫」已停用，已跳过", SizeLabel: "—", Status: "skipped"}
+	if diskRes, err := s.engine.Invoke(ctx, snap, "disk-guard", "disk.scan", "fs.scan_cleanable", map[string]any{"minSizeMB": 2048, "idleDays": 90}); err == nil {
+		if rep, ok := diskRes.Data.(sys.DiskScanReport); ok {
+			diskReport = rep
+		}
+		diskTask = types.ScanTaskItem{
+			ID:        "disk",
+			Title:     "磁盘",
+			Detail:    fmt.Sprintf("可用 %.1f GB / %.0f GB · 发现 %d 项可安全释放资产", metrics.DiskFreeGB, metrics.DiskTotalGB, len(diskReport.Items)),
+			SizeLabel: fmt.Sprintf("%.1f GB", diskReport.EstimatedReclaimableGB),
+			SizeGB:    diskReport.EstimatedReclaimableGB,
+			Status:    "done",
 		}
 	}
 
-	topProcDetail := "系统负载平稳"
-	if len(procs.Rows) > 0 {
-		topProcDetail = fmt.Sprintf("最高占用：%s (CPU %d%% · %s)", procs.Rows[0].Name, procs.Rows[0].CPUPct, procs.Rows[0].MemLabel)
+	orphanTask := types.ScanTaskItem{ID: "orphan", Title: "卸载残留", Detail: "插件「卸载清道夫」已停用，已跳过", SizeLabel: "—", Status: "skipped"}
+	if orphRes, err := s.engine.Invoke(ctx, snap, "uninstall-scrubber", "app.scan_remnants", "fs.scan_orphans", map[string]any{}); err == nil {
+		orphanCount := 0
+		if m, ok := orphRes.Data.(map[string]any); ok {
+			if list, ok := m["remnants"].([]sys.OrphanRemnant); ok {
+				orphanCount = len(list)
+			}
+		}
+		orphanTask = types.ScanTaskItem{
+			ID:        "orphan",
+			Title:     "卸载残留",
+			Detail:    fmt.Sprintf("扫描到 %d 项疑似残留缓存目录", orphanCount),
+			SizeLabel: fmt.Sprintf("%d 项", orphanCount),
+			SizeGB:    0,
+			Status:    "done",
+		}
 	}
 
-	logDetail := "日志侦探未启用，已跳过"
-	logStatus := "skipped"
-	logLabel := "—"
-	if logEnabled {
-		logStatus = "done"
-		logDetail = logs.Summary
-		logLabel = fmt.Sprintf("%d 份", logs.Count)
+	var procs sys.ProcessSampleSummary
+	procTask := types.ScanTaskItem{ID: "process", Title: "进程", Detail: "插件「进程哨兵」已停用，已跳过", SizeLabel: "—", Status: "skipped"}
+	if procRes, err := s.engine.Invoke(ctx, snap, "process-sentinel", "process.sample", "proc.sample", map[string]any{"limit": 3}); err == nil {
+		if ps, ok := procRes.Data.(sys.ProcessSampleSummary); ok {
+			procs = ps
+		} else {
+			procs.Rows = procRes.Rows
+		}
+		topProcDetail := "系统负载平稳"
+		if len(procs.Rows) > 0 {
+			topProcDetail = fmt.Sprintf("最高占用：%s (CPU %d%% · %s)", procs.Rows[0].Name, procs.Rows[0].CPUPct, procs.Rows[0].MemLabel)
+		}
+		procTask = types.ScanTaskItem{
+			ID:        "process",
+			Title:     "进程",
+			Detail:    topProcDetail,
+			SizeLabel: fmt.Sprintf("CPU %d%%", procs.CPUPct),
+			SizeGB:    0,
+			Status:    "done",
+		}
+	}
+
+	logTask := types.ScanTaskItem{ID: "log", Title: "系统日志", Detail: "插件「日志侦探」未启用，已跳过", SizeLabel: "—", Status: "skipped"}
+	if logRes, err := s.engine.Invoke(ctx, snap, "log-detective", "log.summarize", "log.summarize_crashes", map[string]any{"minutes": 120}); err == nil {
+		if summary, ok := logRes.Data.(sys.CrashSummary); ok {
+			logTask = types.ScanTaskItem{
+				ID:        "log",
+				Title:     "系统日志",
+				Detail:    summary.Summary,
+				SizeLabel: fmt.Sprintf("%d 份", summary.Count),
+				SizeGB:    0,
+				Status:    "done",
+			}
+		}
 	}
 
 	elapsed := int(math.Max(1, math.Round(time.Since(start).Seconds())))
@@ -679,47 +776,16 @@ func (s *Service) RunFirstScan(ctx context.Context) (types.ValetSnapshot, error)
 		st.SystemMetrics.DiskPct = metrics.DiskPct
 		st.SystemMetrics.DiskFreeGB = metrics.DiskFreeGB
 		st.SystemMetrics.DiskTotalGB = metrics.DiskTotalGB
-		st.SystemMetrics.CPUPct = procs.CPUPct
-		st.SystemMetrics.MemPct = procs.MemPct
+		if procs.CPUPct > 0 {
+			st.SystemMetrics.CPUPct = procs.CPUPct
+			st.SystemMetrics.MemPct = procs.MemPct
+		}
 		st.Scan = types.ScanState{
 			Status:        "done",
 			ProgressPct:   100,
 			ElapsedSec:    elapsed,
 			ReclaimableGB: diskReport.EstimatedReclaimableGB,
-			Tasks: []types.ScanTaskItem{
-				{
-					ID:        "disk",
-					Title:     "磁盘",
-					Detail:    fmt.Sprintf("可用 %.1f GB / %.0f GB · 发现 %d 项可安全释放资产", metrics.DiskFreeGB, metrics.DiskTotalGB, len(diskReport.Items)),
-					SizeLabel: fmt.Sprintf("%.1f GB", diskReport.EstimatedReclaimableGB),
-					SizeGB:    diskReport.EstimatedReclaimableGB,
-					Status:    "done",
-				},
-				{
-					ID:        "orphan",
-					Title:     "卸载残留",
-					Detail:    fmt.Sprintf("扫描到 %d 项疑似残留缓存目录", len(orphans)),
-					SizeLabel: fmt.Sprintf("%d 项", len(orphans)),
-					SizeGB:    0,
-					Status:    "done",
-				},
-				{
-					ID:        "process",
-					Title:     "进程",
-					Detail:    topProcDetail,
-					SizeLabel: fmt.Sprintf("CPU %d%%", procs.CPUPct),
-					SizeGB:    0,
-					Status:    "done",
-				},
-				{
-					ID:        "log",
-					Title:     "系统日志",
-					Detail:    logDetail,
-					SizeLabel: logLabel,
-					SizeGB:    0,
-					Status:    logStatus,
-				},
-			},
+			Tasks:         []types.ScanTaskItem{diskTask, orphanTask, procTask, logTask},
 		}
 	})
 	return next, nil
@@ -979,16 +1045,30 @@ func (s *Service) InstallPluginDraft(chatID, messageID string, draft types.Plugi
 			}
 		}
 
-		events := make([]types.PluginEventPolicy, 0, len(parsed.Events))
-		for _, ev := range parsed.Events {
+		events := make([]types.PluginEventPolicy, 0, len(parsed.TriggerSpecs))
+		for _, tr := range parsed.TriggerSpecs {
+			pol := tr.Policy
+			if pol == "" {
+				pol = "auto"
+			}
+			desc := tr.Description
+			if desc == "" {
+				desc = draft.WhenExpression
+			}
 			events = append(events, types.PluginEventPolicy{
-				ID: ev, Description: draft.WhenExpression, Policy: "auto", Count24h: 0,
+				ID: tr.ID, Description: desc, Policy: pol, Count24h: 0,
 			})
 		}
-		actions := make([]types.PluginActionCapability, 0, len(parsed.Actions))
-		for _, act := range parsed.Actions {
+		actions := make([]types.PluginActionCapability, 0, len(parsed.ActionSpecs))
+		for _, act := range parsed.ActionSpecs {
+			label := "可撤销 · 7 天"
+			if act.Safety == "readonly" {
+				label = "只读"
+			} else if act.Safety == "confirm_always" {
+				label = "每次确认"
+			}
 			actions = append(actions, types.PluginActionCapability{
-				ID: act, Safety: "reversible", SafetyLabel: "可撤销 · 7 天",
+				ID: act.ID, Safety: act.Safety, SafetyLabel: label,
 			})
 		}
 		st.Plugins = append(st.Plugins, types.PluginState{
@@ -998,15 +1078,15 @@ func (s *Service) InstallPluginDraft(chatID, messageID string, draft types.Plugi
 			Version: parsed.Version, BundleID: "local.valet." + draft.ID,
 			IconKind: "code", IconLabel: "{ }", Source: "local",
 			Enabled: true, Installed: true,
-			StatusSubtitle: "本地生成插件 · 热重载生效中",
-			Triggers24h:    []int{0, 0, 0, 0, 0, 0, 0, 0, 0, 2},
+			StatusSubtitle: "本地生成插件 · 传感器与工具热重载生效中",
+			Triggers24h:    []int{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 			Events:         events,
 			Actions:        actions,
 			ManifestYAML:   draft.ManifestYAML,
 		})
 	})
 
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
@@ -1074,7 +1154,7 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 	reclaimed := target.ReclaimableGB
 
 	switch {
-	case target.Category == "files" || target.ToolName == "disk_move_to_trash" || target.ToolName == "app_trash_remnants":
+	case target.Category == "files" || strings.Contains(target.ToolName, "trash"):
 		if len(checkedPaths) > 0 {
 			bID, _, realReclaimed, err := sys.MoveItemsToTrash(
 				s.opts.HomeDir,
@@ -1390,7 +1470,7 @@ func (s *Service) RestoreTimelineEvent(eventID string) (types.ValetSnapshot, err
 
 // --- Plugins ---
 
-// TogglePluginEnabled toggles plugin enabled status and hot-reloads the Pi Durable registry.
+// TogglePluginEnabled toggles plugin enabled status and hot-reloads the engine & Pi Durable registry.
 func (s *Service) TogglePluginEnabled(pluginID string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
@@ -1402,7 +1482,7 @@ func (s *Service) TogglePluginEnabled(pluginID string) (types.ValetSnapshot, err
 			}
 		}
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
@@ -1419,11 +1499,11 @@ func (s *Service) InstallMarketplacePlugin(pluginID string) (types.ValetSnapshot
 			}
 		}
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
-// InstallCustomPlugin parses YAML, installs a local plugin, and hot-reloads it into Pi Durable.
+// InstallCustomPlugin parses YAML, installs a local plugin, and hot-reloads sensors & Pi Durable.
 func (s *Service) InstallCustomPlugin(params types.InstallCustomPluginParams) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
@@ -1445,18 +1525,7 @@ func (s *Service) InstallCustomPlugin(params types.InstallCustomPluginParams) (t
 		tagline = "~/Valet/plugins/custom · 本地开发"
 	}
 
-	evList := make([]types.PluginEventPolicy, 0, len(parsed.Events))
-	for _, ev := range parsed.Events {
-		evList = append(evList, types.PluginEventPolicy{
-			ID: ev, Description: "自定义 Manifest 触发规则", Policy: "ask",
-		})
-	}
-	actList := make([]types.PluginActionCapability, 0, len(parsed.Actions))
-	for _, act := range parsed.Actions {
-		actList = append(actList, types.PluginActionCapability{
-			ID: act, Safety: "reversible", SafetyLabel: "可撤销",
-		})
-	}
+	evList, actList := manifestSpecsToPoliciesAndActions(parsed, nil)
 
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		st.Plugins = append(st.Plugins, types.PluginState{
@@ -1466,11 +1535,39 @@ func (s *Service) InstallCustomPlugin(params types.InstallCustomPluginParams) (t
 			IconKind: "code", IconLabel: "{ }", Source: "local",
 			Enabled: true, Installed: true,
 			StatusSubtitle: "~/Valet/plugins/custom · 热重载中",
-			Triggers24h:    []int{0, 0, 0, 0, 0, 0, 0, 0, 0, 2},
+			Triggers24h:    make([]int, 10),
 			Events:         evList, Actions: actList, ManifestYAML: params.YAML,
 		})
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
+	return next, nil
+}
+
+// UpdatePluginManifest parses updated YAML for an existing plugin, preserves matching event policies, and hot-reloads.
+func (s *Service) UpdatePluginManifest(pluginID, manifestYAML string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	parsed, err := plugins.ParseManifestYAML(manifestYAML)
+	if err != nil {
+		return s.store.Snapshot(), err
+	}
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Plugins {
+			if st.Plugins[i].ID != pluginID {
+				continue
+			}
+			evList, actList := manifestSpecsToPoliciesAndActions(parsed, st.Plugins[i].Events)
+			if strings.TrimSpace(parsed.Version) != "" {
+				st.Plugins[i].Version = parsed.Version
+			}
+			st.Plugins[i].Events = evList
+			st.Plugins[i].Actions = actList
+			st.Plugins[i].ManifestYAML = manifestYAML
+			st.Plugins[i].StatusSubtitle = "刚刚热重载 · Manifest 已生效"
+		}
+	})
+	s.syncRuntime(next)
 	return next, nil
 }
 
@@ -1489,15 +1586,15 @@ func (s *Service) FixPluginAuth(pluginID string) (types.ValetSnapshot, error) {
 		for i := range st.TimelineEvents {
 			if st.TimelineEvents[i].AuthFixPluginID == pluginID && st.TimelineEvents[i].Status == "failed" {
 				st.TimelineEvents[i].Status = "completed"
-				st.TimelineEvents[i].Summary = "Token 已重新授权并完成构建日志读取，CI 失败源于测试超时。"
+				st.TimelineEvents[i].Summary = "授权已恢复，相关触发器现已就绪。"
 			}
 		}
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
-// UpdatePluginEventPolicy updates event policy ("auto"|"ask"|"record") and syncs Sidecar.
+// UpdatePluginEventPolicy updates event policy ("auto"|"ask"|"record") and syncs Engine & Sidecar.
 func (s *Service) UpdatePluginEventPolicy(pluginID, eventID, policy string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
@@ -1513,11 +1610,11 @@ func (s *Service) UpdatePluginEventPolicy(pluginID, eventID, policy string) (typ
 			}
 		}
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
-// UpdatePluginConfig updates per-plugin config and syncs Sidecar.
+// UpdatePluginConfig updates per-plugin config and syncs Engine & Sidecar.
 func (s *Service) UpdatePluginConfig(pluginID string, cfg types.PluginConfig) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
@@ -1529,12 +1626,22 @@ func (s *Service) UpdatePluginConfig(pluginID string, cfg types.PluginConfig) (t
 			}
 		}
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
 // SimulatePluginEvent injects an event through Valet's event throttle + Pi Durable agent pipeline.
 func (s *Service) SimulatePluginEvent(ctx context.Context, pluginID, eventCode string) (types.SimulateEventResult, error) {
+	return s.dispatchPluginEventInternal(ctx, pluginID, eventCode, map[string]any{"simulated": true}, true)
+}
+
+func (s *Service) dispatchPluginEventInternal(
+	ctx context.Context,
+	pluginID string,
+	eventCode string,
+	payload map[string]any,
+	simulated bool,
+) (types.SimulateEventResult, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.SimulateEventResult{}, err
 	}
@@ -1550,20 +1657,33 @@ func (s *Service) SimulatePluginEvent(ctx context.Context, pluginID, eventCode s
 	if plugin == nil {
 		return types.SimulateEventResult{}, fmt.Errorf("plugin not found: %s", pluginID)
 	}
+	if !simulated && (!plugin.Installed || !plugin.Enabled) {
+		return types.SimulateEventResult{}, fmt.Errorf("plugin %s is disabled", pluginID)
+	}
 
-	if !s.throttle.Allow(pluginID, eventCode, snap.Preferences.Thresholds.EventThrottle10m, true) {
+	if s.engine != nil && !s.engine.Throttle().Allow(pluginID, eventCode, snap.Preferences.Thresholds.EventThrottle10m, simulated) {
 		return types.SimulateEventResult{}, errors.New("event throttled")
 	}
 
-	s.syncSidecarBlocking(ctx, snap)
+	s.recordPluginTriggerStat(pluginID, eventCode, fmt.Sprintf("刚刚触发 · %s", eventCode))
+
+	reqPayload := make(map[string]any, len(payload)+2)
+	for k, v := range payload {
+		reqPayload[k] = v
+	}
+	reqPayload["bundle"] = plugin.BundleID
+	if simulated {
+		reqPayload["simulated"] = true
+	}
 
 	var resp sidecar.PluginEventResponse
 	if s.client != nil && plugin.Installed && plugin.Enabled {
+		s.syncSidecarBlocking(ctx, s.store.Snapshot())
 		_ = s.client.Call(ctx, "plugin.event", sidecar.PluginEventRequest{
 			PluginID:  pluginID,
 			EventCode: eventCode,
-			Payload:   map[string]any{"simulated": true, "bundle": plugin.BundleID},
-			Simulated: true,
+			Payload:   reqPayload,
+			Simulated: simulated,
 		}, &resp)
 	}
 
@@ -1588,7 +1708,6 @@ func (s *Service) SimulatePluginEvent(ctx context.Context, pluginID, eventCode s
 		return types.SimulateEventResult{Event: *createdEvt, InboxItem: createdInbox}, nil
 	}
 
-	// Fallback if plugin is disabled or diagnostic-only
 	now := time.Now()
 	nowHHMM := now.Format("15:04")
 	policy := "ask"
@@ -1603,36 +1722,42 @@ func (s *Service) SimulatePluginEvent(ctx context.Context, pluginID, eventCode s
 		badge = plugin.Name + " · 第三方"
 	}
 	evtStatus := "completed"
-	summary := "策略为「自动处理」，Valet 已记录并在后台执行安全诊断。"
+	summary := "策略为「自动处理」，Valet 已记录事件触发。"
 	if policy == "ask" {
 		evtStatus = "pending_confirm"
 		summary = "策略为「问我」，需要你在收件箱或时间线确认后执行下一步动作。"
 	} else if policy == "record" {
 		summary = "策略为「仅记录」，已归档到时间线供你随时回溯。"
 	}
+	sourceLabel := "来自运行时感知"
+	titlePrefix := "传感器事件："
+	if simulated {
+		sourceLabel = "来自开发者事件模拟器"
+		titlePrefix = "模拟事件："
+	}
 
-	evtID := fmt.Sprintf("evt-sim-%d", now.UnixNano())
+	evtID := fmt.Sprintf("evt-plug-%d", now.UnixNano())
 	evt := types.TimelineEvent{
 		ID: evtID, Timestamp: now.Format(time.RFC3339), TimeLabel: nowHHMM,
-		DayGroup: "today", Title: fmt.Sprintf("模拟事件：%s 捕获 %s", plugin.Name, eventCode),
+		DayGroup: "today", Title: fmt.Sprintf("%s%s 捕获 %s", titlePrefix, plugin.Name, eventCode),
 		Summary: summary, PluginID: plugin.ID, PluginName: plugin.Name, PluginBadge: badge,
-		EventCode: eventCode, Status: evtStatus, TriggerLatencyLabel: nowHHMM + " · 来自开发者事件模拟器",
-		Payload: map[string]any{"plugin": plugin.BundleID, "event": eventCode, "policy": policy, "simulated": true},
-		Reasoning: fmt.Sprintf("由插件「%s」的开发者调试器手动注入事件 %s，用于验证策略路由与时间线渲染链路。", plugin.Name, eventCode),
+		EventCode: eventCode, Status: evtStatus, TriggerLatencyLabel: nowHHMM + " · " + sourceLabel,
+		Payload: reqPayload,
+		Reasoning: fmt.Sprintf("插件「%s」捕获事件 %s，当前按策略「%s」路由记录。", plugin.Name, eventCode, policy),
 		ActionItems: []types.TimelineActionItem{},
 		TraceSteps: []types.TraceStep{
-			{ID: "s1", Time: nowHHMM, Stage: "事件注入", Detail: eventCode + " 已进入事件总线", Status: "done"},
+			{ID: "s1", Time: nowHHMM, Stage: "事件触发", Detail: eventCode + " 已进入事件总线", Status: "done"},
 		},
-		Logs: []types.LogLine{{ID: "sl1", TS: now.Format("15:04:05"), Level: "INFO", Message: "Simulated trigger " + eventCode}},
+		Logs: []types.LogLine{{ID: "sl1", TS: now.Format("15:04:05"), Level: "INFO", Message: "Dispatched " + eventCode}},
 	}
 
 	var inb *types.InboxApprovalItem
 	if policy == "ask" {
 		item := types.InboxApprovalItem{
-			ID: fmt.Sprintf("inbox-sim-%d", now.UnixNano()), Timestamp: evt.Timestamp,
+			ID: fmt.Sprintf("inbox-plug-%d", now.UnixNano()), Timestamp: evt.Timestamp,
 			TimeLabel: nowHHMM, AgeLabel: "刚刚", Category: "files", IconKind: "disk",
 			Title: evt.Title, Summary: evt.Summary, PluginID: plugin.ID, PluginName: plugin.Name,
-			PluginBadge: plugin.Name, EventCode: eventCode, Reversible7d: true, ReclaimableGB: 0.2,
+			PluginBadge: plugin.Name, EventCode: eventCode, Reversible7d: false, ReclaimableGB: 0,
 			ApproveLabel: "批准执行", DismissLabel: "忽略", Status: "pending", LinkedTimelineEventID: evt.ID,
 			Payload: evt.Payload, Reasoning: evt.Reasoning, ActionItems: evt.ActionItems,
 			TraceSteps: evt.TraceSteps, Logs: evt.Logs,
@@ -1646,6 +1771,7 @@ func (s *Service) SimulatePluginEvent(ctx context.Context, pluginID, eventCode s
 			st.InboxItems = append([]types.InboxApprovalItem{*inb}, st.InboxItems...)
 		}
 	})
+	s.emitStateChange("timeline")
 	return types.SimulateEventResult{Event: evt, InboxItem: inb}, nil
 }
 
@@ -1659,94 +1785,169 @@ func (s *Service) SelectProvider(providerID string) (types.ValetSnapshot, error)
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		st.Preferences.ActiveProviderID = providerID
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
-// UpdateProvider updates API keys, base URLs, and connection status for a provider.
+// UpdateProvider updates API keys (stored in OS Keychain when available), base URLs, and connection status for a provider.
 func (s *Service) UpdateProvider(providerID string, patch types.AgentProviderConfig) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
+	trimmedKey := strings.TrimSpace(patch.APIKey)
+	if s.opts.DesktopReady {
+		if trimmedKey != "" {
+			_ = mygo.Secrets.Set("provider.apikey."+providerID, []byte(trimmedKey))
+		} else {
+			_ = mygo.Secrets.Delete("provider.apikey." + providerID)
+		}
+	}
+	patch.ID = providerID
+	patch.APIKey = trimmedKey
+	patch.APIKeyMasked = maskSecretKey(trimmedKey)
+
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.Providers {
 			if st.Providers[i].ID == providerID {
-				patch.ID = providerID
 				st.Providers[i] = patch
 			}
 		}
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
-// VerifyProvider performs real endpoint health checking for Ollama/Custom or API keys when provided.
+// VerifyProvider performs real HTTP endpoint discovery and credential validation against the configured provider.
 func (s *Service) VerifyProvider(ctx context.Context, provider types.AgentProviderConfig) (types.ProviderVerifyResult, error) {
 	start := time.Now()
-	if provider.ID == "ollama" {
-		base := strings.TrimRight(provider.BaseURL, "/")
-		if base == "" {
-			base = "http://localhost:11434"
-		}
-		reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-		req, _ := http.NewRequestWithContext(reqCtx, http.MethodGet, base+"/api/tags", nil)
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			_ = resp.Body.Close()
-			lat := int(math.Max(1, float64(time.Since(start).Milliseconds())))
-			return types.ProviderVerifyResult{
-				OK:         resp.StatusCode < 500,
-				LatencyMs:  lat,
-				ModelCount: len(provider.Models),
-				Message:    fmt.Sprintf("本地节点 %s 已响应（HTTP %d）· 延迟 %dms", base, resp.StatusCode, lat),
-			}, nil
-		}
-		return types.ProviderVerifyResult{
-			OK:         true,
-			LatencyMs:  14,
-			ModelCount: len(provider.Models),
-			Message:    fmt.Sprintf("未检测到本地 %s 服务，已启用本地测试代理节点", base),
-		}, nil
+	client, err := buildHTTPClient(provider.ProxyURL, 6*time.Second)
+	if err != nil {
+		return types.ProviderVerifyResult{OK: false, Message: "代理地址格式无效: " + err.Error()}, nil
 	}
 
 	key := strings.TrimSpace(provider.APIKey)
-	if key == "" && provider.ID != "custom" {
-		return types.ProviderVerifyResult{OK: false, Message: "请输入有效的 API Key 后再验证"}, nil
+	base := strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+	if base == "" {
+		base = strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
 	}
-	count := provider.AvailableModelCount
-	if count == 0 {
-		count = len(provider.Models)
-	}
-	if count == 0 {
-		count = 4
-	}
-	lat := 180
-	if !strings.Contains(key, "-mock-") && provider.BaseURL != "" {
-		reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		if req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, provider.BaseURL, nil); err == nil {
-			if resp, rErr := http.DefaultClient.Do(req); rErr == nil {
-				_ = resp.Body.Close()
-				lat = int(math.Max(10, float64(time.Since(start).Milliseconds())))
+
+	var req *http.Request
+	switch provider.ID {
+	case "ollama":
+		if base == "" {
+			base = "http://localhost:11434"
+		}
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/tags", nil)
+	case "anthropic":
+		if key == "" {
+			return types.ProviderVerifyResult{OK: false, Message: "请输入有效的 Anthropic API Key"}, nil
+		}
+		if base == "" {
+			base = "https://api.anthropic.com/v1"
+		}
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+		if err == nil {
+			req.Header.Set("x-api-key", key)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		}
+	case "openai":
+		if key == "" {
+			return types.ProviderVerifyResult{OK: false, Message: "请输入有效的 OpenAI API Key"}, nil
+		}
+		if base == "" {
+			base = "https://api.openai.com/v1"
+		}
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+		if err == nil {
+			req.Header.Set("Authorization", "Bearer "+key)
+			if org := strings.TrimSpace(provider.OrgID); org != "" {
+				req.Header.Set("OpenAI-Organization", org)
 			}
 		}
+	case "gemini":
+		if key == "" {
+			return types.ProviderVerifyResult{OK: false, Message: "请输入有效的 Gemini API Key"}, nil
+		}
+		if base == "" {
+			base = "https://generativelanguage.googleapis.com/v1beta"
+		}
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/models?key="+url.QueryEscape(key), nil)
+	case "openrouter":
+		if key == "" {
+			return types.ProviderVerifyResult{OK: false, Message: "请输入有效的 OpenRouter API Key"}, nil
+		}
+		if base == "" {
+			base = "https://openrouter.ai/api/v1"
+		}
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+		if err == nil {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+	default:
+		if base == "" {
+			return types.ProviderVerifyResult{OK: false, Message: "请填写自定义服务的 Base URL"}, nil
+		}
+		modelsURL := base
+		if !strings.HasSuffix(modelsURL, "/models") {
+			modelsURL += "/models"
+		}
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
+		if err == nil && key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+	}
+
+	if err != nil {
+		return types.ProviderVerifyResult{OK: false, Message: "构造验证请求失败: " + err.Error()}, nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		lat := int(math.Max(1, float64(time.Since(start).Milliseconds())))
+		return types.ProviderVerifyResult{
+			OK:        false,
+			LatencyMs: lat,
+			Message:   fmt.Sprintf("连接 %s 失败: %v", base, err),
+		}, nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	lat := int(math.Max(1, float64(time.Since(start).Milliseconds())))
+
+	if resp.StatusCode >= 400 {
+		return types.ProviderVerifyResult{
+			OK:        false,
+			LatencyMs: lat,
+			Message:   fmt.Sprintf("鉴权或接口失败（HTTP %d）· 延迟 %dms", resp.StatusCode, lat),
+		}, nil
+	}
+
+	models := parseModelsFromResponse(provider.ID, body)
+	count := len(models)
+	if count == 0 {
+		models = provider.Models
+		count = len(models)
 	}
 	return types.ProviderVerifyResult{
 		OK:         true,
 		LatencyMs:  lat,
 		ModelCount: count,
-		Message:    fmt.Sprintf("已验证 · 延迟 %dms · 可用 %d 个模型", lat, count),
+		Models:     models,
+		Message:    fmt.Sprintf("已验证（HTTP %d）· 延迟 %dms · 发现 %d 个模型", resp.StatusCode, lat, count),
 	}, nil
 }
 
-// SendTestAgentMessage sends a probe message using the configured provider.
-func (s *Service) SendTestAgentMessage(provider types.AgentProviderConfig, model string) (types.TestMessageResult, error) {
-	return types.TestMessageResult{
-		OK:        true,
-		LatencyMs: 145,
-		Reply:     fmt.Sprintf("测试成功：%s (%s) 已连接至 Pi Durable 引擎。", provider.Name, model),
-	}, nil
+// SendTestAgentMessage sends a real single-turn probe completion using the Pi Durable sidecar.
+func (s *Service) SendTestAgentMessage(ctx context.Context, provider types.AgentProviderConfig, model string) (types.TestMessageResult, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.TestMessageResult{}, err
+	}
+	var out types.TestMessageResult
+	err := s.client.Call(ctx, "agent.testProvider", sidecar.TestProviderRequest{
+		Provider: provider,
+		Model:    model,
+	}, &out)
+	return out, err
 }
 
 // UpdateModels updates primary/fast/vision model selections.
@@ -1757,7 +1958,7 @@ func (s *Service) UpdateModels(models types.ModelSelection) (types.ValetSnapshot
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		st.Preferences.Models = models
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
@@ -1786,11 +1987,11 @@ func (s *Service) SetAutonomyLevel(level string) (types.ValetSnapshot, error) {
 			}
 		}
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
-// UpdatePreferences applies a full preferences update and syncs Sidecar.
+// UpdatePreferences applies a full preferences update, syncs native Tray/Login hooks, and reloads Engine & Sidecar.
 func (s *Service) UpdatePreferences(prefs types.ValetPreferences) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
@@ -1805,7 +2006,13 @@ func (s *Service) UpdatePreferences(prefs types.ValetPreferences) (types.ValetSn
 			}
 		}
 	})
-	s.syncSidecar(next)
+	if s.opts.OnSyncTray != nil {
+		s.opts.OnSyncTray(next.Preferences.ShowMenuBarIcon, next.IsPaused)
+	}
+	if s.opts.OnSyncLogin != nil {
+		s.opts.OnSyncLogin(next.Preferences.LaunchAtLogin)
+	}
+	s.syncRuntime(next)
 	return next, nil
 }
 
@@ -1817,7 +2024,7 @@ func (s *Service) ResetThresholds() (types.ValetSnapshot, error) {
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		st.Preferences.Thresholds = store.DefaultThresholds()
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
@@ -1898,21 +2105,23 @@ func (s *Service) SetPermissionGranted(permissionID string, granted bool) (types
 	}), nil
 }
 
-// ToggleAutomation enables/disables an automation rule.
+// ToggleAutomation enables/disables an automation rule and reloads the Engine scheduler.
 func (s *Service) ToggleAutomation(id string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
-	return s.store.Update(func(st *types.ValetSnapshot) {
+	next := s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.Automations {
 			if st.Automations[i].ID == id {
 				st.Automations[i].Enabled = !st.Automations[i].Enabled
 			}
 		}
-	}), nil
+	})
+	s.syncRuntime(next)
+	return next, nil
 }
 
-// AddAutomationRule appends a new cron/event rule.
+// AddAutomationRule appends a new cron/event rule and reloads the Engine scheduler.
 func (s *Service) AddAutomationRule(rule types.AutomationRule) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
@@ -1920,51 +2129,184 @@ func (s *Service) AddAutomationRule(rule types.AutomationRule) (types.ValetSnaps
 	if rule.ID == "" {
 		rule.ID = fmt.Sprintf("auto-%d", time.Now().UnixNano())
 	}
-	return s.store.Update(func(st *types.ValetSnapshot) {
+	if strings.TrimSpace(rule.CronExpr) == "" && rule.TriggerType == "cron" {
+		rule.CronExpr = defaultCronExprFromSchedule(rule.ScheduleTop + " " + rule.ScheduleBottom)
+	}
+	next := s.store.Update(func(st *types.ValetSnapshot) {
 		st.Automations = append(st.Automations, rule)
-	}), nil
+	})
+	s.syncRuntime(next)
+	return next, nil
 }
 
-// ToggleMcpServer enables/disables an MCP server configuration.
+// DeleteAutomationRule removes an automation rule and reloads the Engine scheduler.
+func (s *Service) DeleteAutomationRule(id string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		filtered := make([]types.AutomationRule, 0, len(st.Automations))
+		for _, r := range st.Automations {
+			if r.ID != id {
+				filtered = append(filtered, r)
+			}
+		}
+		st.Automations = filtered
+	})
+	s.syncRuntime(next)
+	return next, nil
+}
+
+// RunAutomationNow executes an automation rule immediately through the Pi Durable agent.
+func (s *Service) RunAutomationNow(ctx context.Context, id string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	snap := s.store.Snapshot()
+	var rule *types.AutomationRule
+	for i := range snap.Automations {
+		if snap.Automations[i].ID == id {
+			cp := snap.Automations[i]
+			rule = &cp
+			break
+		}
+	}
+	if rule == nil {
+		return snap, fmt.Errorf("automation rule not found: %s", id)
+	}
+
+	nowHHMM := time.Now().Format("15:04")
+	s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Automations {
+			if st.Automations[i].ID == id {
+				st.Automations[i].LastRunAt = nowHHMM
+			}
+		}
+	})
+
+	prompt := strings.TrimSpace(rule.Prompt)
+	if prompt == "" {
+		prompt = fmt.Sprintf("请立即执行自动化规则「%s」：%s", rule.Title, rule.Subtitle)
+	}
+	model := snap.Preferences.Models.Fast
+	if strings.TrimSpace(model) == "" {
+		model = snap.Preferences.Models.Primary
+	}
+	if _, err := s.SendChatMessage(ctx, types.SendChatParams{
+		ChatID: "chat-default",
+		Prompt: prompt,
+		Model:  model,
+	}); err != nil {
+		return s.store.Snapshot(), err
+	}
+	s.emitStateChange("automations")
+	return s.store.Snapshot(), nil
+}
+
+// ToggleMcpServer enables/disables an MCP server configuration and syncs Sidecar.
 func (s *Service) ToggleMcpServer(id string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
-	return s.store.Update(func(st *types.ValetSnapshot) {
+	next := s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.McpServers {
 			if st.McpServers[i].ID == id {
 				st.McpServers[i].Enabled = !st.McpServers[i].Enabled
 			}
 		}
-	}), nil
+	})
+	s.syncRuntime(next)
+	return next, nil
 }
 
-// ReconnectMcpServer clears authExpired on an MCP server and re-enables it.
-func (s *Service) ReconnectMcpServer(id string) (types.ValetSnapshot, error) {
+// ReconnectMcpServer probes an MCP server via Sidecar, updates tool count/status, and syncs Sidecar.
+func (s *Service) ReconnectMcpServer(ctx context.Context, id string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
-	return s.store.Update(func(st *types.ValetSnapshot) {
+	snap := s.store.Snapshot()
+	var target *types.McpServerItem
+	for i := range snap.McpServers {
+		if snap.McpServers[i].ID == id {
+			cp := snap.McpServers[i]
+			target = &cp
+			break
+		}
+	}
+	if target == nil {
+		return snap, fmt.Errorf("mcp server not found: %s", id)
+	}
+	probed := s.probeMcpServer(ctx, *target)
+	probed.Enabled = true
+	next := s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.McpServers {
 			if st.McpServers[i].ID == id {
-				st.McpServers[i].AuthExpired = false
-				st.McpServers[i].Enabled = true
+				st.McpServers[i] = probed
 			}
 		}
-	}), nil
+	})
+	s.syncRuntime(next)
+	return next, nil
 }
 
-// AddMcpServer registers a new MCP server configuration.
-func (s *Service) AddMcpServer(srv types.McpServerItem) (types.ValetSnapshot, error) {
+// AddMcpServer registers a new MCP server, probes it when enabled, and syncs Sidecar.
+func (s *Service) AddMcpServer(ctx context.Context, srv types.McpServerItem) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
 	if srv.ID == "" {
 		srv.ID = fmt.Sprintf("mcp-%d", time.Now().UnixNano())
 	}
-	return s.store.Update(func(st *types.ValetSnapshot) {
+	if srv.Enabled {
+		srv = s.probeMcpServer(ctx, srv)
+	}
+	next := s.store.Update(func(st *types.ValetSnapshot) {
 		st.McpServers = append(st.McpServers, srv)
-	}), nil
+	})
+	s.syncRuntime(next)
+	return next, nil
+}
+
+// DeleteMcpServer removes an MCP server configuration and syncs Sidecar.
+func (s *Service) DeleteMcpServer(id string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		filtered := make([]types.McpServerItem, 0, len(st.McpServers))
+		for _, srv := range st.McpServers {
+			if srv.ID != id {
+				filtered = append(filtered, srv)
+			}
+		}
+		st.McpServers = filtered
+	})
+	s.syncRuntime(next)
+	return next, nil
+}
+
+func (s *Service) probeMcpServer(ctx context.Context, srv types.McpServerItem) types.McpServerItem {
+	if s.client == nil {
+		return srv
+	}
+	var probe sidecar.ProbeMcpResponse
+	if err := s.client.Call(ctx, "mcp.probe", sidecar.ProbeMcpRequest{Server: srv}, &probe); err != nil {
+		srv.StatusError = err.Error()
+		srv.AuthExpired = true
+		return srv
+	}
+	if probe.TransportLabel != "" {
+		srv.TransportLabel = probe.TransportLabel
+	}
+	if probe.OK {
+		srv.ToolCount = probe.ToolCount
+		srv.AuthExpired = false
+		srv.StatusError = ""
+	} else {
+		srv.StatusError = probe.Error
+		srv.AuthExpired = true
+	}
+	return srv
 }
 
 // DeleteMemory deletes a single memory item and updates Sidecar.
@@ -1981,7 +2323,7 @@ func (s *Service) DeleteMemory(id string) (types.ValetSnapshot, error) {
 		}
 		st.Memories = filtered
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
 }
 
@@ -1993,8 +2335,192 @@ func (s *Service) ClearMemories() (types.ValetSnapshot, error) {
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		st.Memories = []types.MemoryEntry{}
 	})
-	s.syncSidecar(next)
+	s.syncRuntime(next)
 	return next, nil
+}
+
+func (s *Service) measureStorageStats() types.StorageStats {
+	dataDir := s.opts.DataDir
+	dbBytes := fileOrGlobSize(dataDir, "pi-agent.sqlite", "pi-agent.sqlite-wal", "pi-agent.sqlite-shm")
+	stateBytes := fileOrGlobSize(dataDir, "state.json")
+	vaultBytes := dirSizeBytes(filepath.Join(dataDir, "trash"))
+	totalBytes := dbBytes + stateBytes + vaultBytes
+	return types.StorageStats{
+		DataDir:       dataDir,
+		TotalBytes:    totalBytes,
+		TotalLabel:    formatBytesHuman(totalBytes),
+		DatabaseLabel: formatBytesHuman(dbBytes),
+		StateLabel:    formatBytesHuman(stateBytes),
+		VaultLabel:    formatBytesHuman(vaultBytes),
+	}
+}
+
+func fileOrGlobSize(dir string, names ...string) int64 {
+	var total int64
+	for _, n := range names {
+		if info, err := os.Stat(filepath.Join(dir, n)); err == nil && !info.IsDir() {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+func dirSizeBytes(root string) int64 {
+	var total int64
+	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total
+}
+
+func formatBytesHuman(b int64) string {
+	switch {
+	case b <= 0:
+		return "0 KB"
+	case b < 1024*1024:
+		kb := math.Max(1, math.Round(float64(b)/1024.0))
+		return fmt.Sprintf("%.0f KB", kb)
+	case b < 1024*1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1024.0*1024.0))
+	default:
+		return fmt.Sprintf("%.2f GB", float64(b)/(1024.0*1024.0*1024.0))
+	}
+}
+
+func manifestSpecsToPoliciesAndActions(
+	parsed plugins.ParsedManifest,
+	existing []types.PluginEventPolicy,
+) ([]types.PluginEventPolicy, []types.PluginActionCapability) {
+	prevMap := make(map[string]types.PluginEventPolicy, len(existing))
+	for _, ev := range existing {
+		prevMap[ev.ID] = ev
+	}
+	evList := make([]types.PluginEventPolicy, 0, len(parsed.TriggerSpecs))
+	for _, ts := range parsed.TriggerSpecs {
+		if prev, ok := prevMap[ts.ID]; ok {
+			if strings.TrimSpace(ts.Description) != "" {
+				prev.Description = ts.Description
+			}
+			evList = append(evList, prev)
+			continue
+		}
+		desc := strings.TrimSpace(ts.Description)
+		if desc == "" {
+			desc = "Manifest 声明触发规则"
+		}
+		pol := ts.Policy
+		if pol == "" {
+			pol = "ask"
+		}
+		evList = append(evList, types.PluginEventPolicy{
+			ID: ts.ID, Description: desc, Policy: pol,
+		})
+	}
+	actList := make([]types.PluginActionCapability, 0, len(parsed.ActionSpecs))
+	for _, as := range parsed.ActionSpecs {
+		actList = append(actList, types.PluginActionCapability{
+			ID: as.ID, Safety: as.Safety, SafetyLabel: safetyLabelFor(as.Safety),
+		})
+	}
+	return evList, actList
+}
+
+func safetyLabelFor(safety string) string {
+	switch safety {
+	case "readonly":
+		return "只读"
+	case "confirm_always":
+		return "始终确认"
+	default:
+		return "可撤销"
+	}
+}
+
+func maskSecretKey(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if len(s) <= 8 {
+		return strings.Repeat("*", len(s))
+	}
+	return s[:4] + "••••••••" + s[len(s)-4:]
+}
+
+func buildHTTPClient(proxyRaw string, timeout time.Duration) (*http.Client, error) {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if p := strings.TrimSpace(proxyRaw); p != "" {
+		parsed, err := url.Parse(p)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return nil, errors.New("proxy URL must include scheme and host")
+		}
+		tr.Proxy = http.ProxyURL(parsed)
+	}
+	return &http.Client{Timeout: timeout, Transport: tr}, nil
+}
+
+func parseModelsFromResponse(providerID string, body []byte) []string {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]struct{})
+	add := func(id string) {
+		id = strings.TrimSpace(strings.TrimPrefix(id, "models/"))
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+
+	if items, ok := raw["data"].([]any); ok {
+		for _, item := range items {
+			if m, ok := item.(map[string]any); ok {
+				if id, ok := m["id"].(string); ok {
+					add(id)
+				}
+			}
+		}
+	}
+	if items, ok := raw["models"].([]any); ok {
+		for _, item := range items {
+			if m, ok := item.(map[string]any); ok {
+				if name, ok := m["name"].(string); ok {
+					add(name)
+				} else if id, ok := m["id"].(string); ok {
+					add(id)
+				}
+			}
+		}
+	}
+	_ = providerID
+	if len(out) > 40 {
+		out = out[:40]
+	}
+	return out
+}
+
+func defaultCronExprFromSchedule(schedule string) string {
+	s := strings.ToLower(strings.TrimSpace(schedule))
+	switch {
+	case strings.Contains(s, "小时"), strings.Contains(s, "hourly"):
+		return "0 * * * *"
+	case strings.Contains(s, "周一"), strings.Contains(s, "每周"), strings.Contains(s, "weekly"):
+		return "0 9 * * 1"
+	case strings.Contains(s, "每天"), strings.Contains(s, "每日"), strings.Contains(s, "daily"):
+		return "0 9 * * *"
+	default:
+		return "0 9 * * *"
+	}
 }
 
 func computeCheckedGB(items []types.TimelineActionItem, fallback float64) float64 {

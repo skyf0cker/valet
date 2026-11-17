@@ -96,7 +96,7 @@ export function createStewardCoreExtension(options: {
     replay: "safe",
     execute: async () => {
       const overview = await bridge.callHost<Record<string, unknown>>(
-        "host.systemOverview",
+        "host.kernel.overview",
         {},
       );
       return textResult(JSON.stringify(overview, null, 2), { overview: overview as never });
@@ -113,7 +113,7 @@ export function createStewardCoreExtension(options: {
     }),
     execute: async (args) => {
       const saved = await bridge.callHost<Record<string, unknown>>(
-        "host.saveMemory",
+        "host.kernel.saveMemory",
         {
           content: args.content,
           source: args.source ?? "对话学习",
@@ -148,25 +148,43 @@ export function createStewardCoreExtension(options: {
       const actionTarget = args.targetPath ? `(${args.targetPath})` : "";
       const actionExpression = `${condSuffix ? `${condSuffix.trim()} -> ` : ""}${args.actionId}${actionTarget}`;
 
+      const driver =
+        args.actionId === "move_to_trash"
+          ? "fs.trash"
+          : args.actionId === "move_to"
+            ? "fs.move"
+            : "plugin.noop";
+      const watchDir = args.glob
+        ? args.glob.includes("/")
+          ? args.glob.slice(0, args.glob.lastIndexOf("/"))
+          : "~/Downloads"
+        : "";
+
       const yamlLines = [
         `id: local.valet.${id}`,
         `name: ${args.name}`,
         `version: 0.1.0`,
         `triggers:`,
-        `  - event: ${args.eventCode}`,
+        `  - id: ${args.eventCode}`,
       ];
-      if (args.glob) yamlLines.push(`    glob: "${args.glob}"`);
+      if (args.glob) {
+        yamlLines.push(`    sensor: fs_watch`);
+        if (watchDir) yamlLines.push(`    watch_dirs: [${watchDir}]`);
+        yamlLines.push(`    ops: [create]`);
+        yamlLines.push(`    glob: "${args.glob}"`);
+        yamlLines.push(`    policy: auto`);
+      }
       if (args.condition) {
         yamlLines.push(`condition:`);
         yamlLines.push(`  - ${args.condition}`);
       }
       yamlLines.push(`actions:`);
-      yamlLines.push(`  - ${args.actionId}:`);
-      yamlLines.push(
-        args.targetPath
-          ? `      target: "${args.targetPath}"`
-          : `      retention_days: 7`,
-      );
+      yamlLines.push(`  - id: ${args.actionId}`);
+      yamlLines.push(`    driver: ${driver}`);
+      yamlLines.push(`    safety: reversible`);
+      if (args.targetPath) {
+        yamlLines.push(`    target: "${args.targetPath}"`);
+      }
 
       const draft: PluginDraftSpec = {
         id,

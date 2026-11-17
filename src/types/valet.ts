@@ -337,6 +337,9 @@ export interface AutomationRule {
   subtitle?: string;
   enabled: boolean;
   triggerType: "cron" | "event";
+  cronExpr?: string;
+  prompt?: string;
+  lastRunAt?: string;
 }
 
 export interface McpServerItem {
@@ -347,6 +350,20 @@ export interface McpServerItem {
   toolCount: number;
   enabled: boolean;
   authExpired?: boolean;
+  transport?: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  url?: string;
+  statusError?: string;
+}
+
+export interface StorageStats {
+  totalLabel: string;
+  totalBytes: number;
+  databaseLabel: string;
+  stateLabel: string;
+  vaultLabel: string;
+  dataDir: string;
 }
 
 export interface MemoryEntry {
@@ -450,6 +467,7 @@ export interface ScanState {
 }
 
 export interface ValetSnapshot {
+  schemaVersion?: number;
   onboardingCompleted: boolean;
   onboardingStep: OnboardingStepId;
   activeView: AppView;
@@ -475,4 +493,5 @@ export interface ValetSnapshot {
   preferences: ValetPreferences;
   systemMetrics: SystemMetrics;
   scan: ScanState;
+  storageStats?: StorageStats;
 }

@@ -30,6 +30,9 @@ export interface AutomationRule {
   subtitle?: string;
   enabled: boolean;
   triggerType: string;
+  cronExpr?: string;
+  prompt?: string;
+  lastRunAt?: string;
 }
 
 export interface ChatAttachment {
@@ -138,6 +141,11 @@ export interface McpServerItem {
   toolCount: number;
   enabled: boolean;
   authExpired?: boolean;
+  transport?: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  statusError?: string;
 }
 
 export interface MemoryEntry {
@@ -277,6 +285,7 @@ export interface ProviderVerifyResult {
   ok: boolean;
   latencyMs: number;
   modelCount: number;
+  models?: string[];
   message: string;
 }
 
@@ -329,6 +338,15 @@ export interface SimulateEventResult {
 
 export interface StateChangeNotice {
   scope: string;
+}
+
+export interface StorageStats {
+  totalLabel: string;
+  totalBytes: number;
+  databaseLabel: string;
+  stateLabel: string;
+  vaultLabel: string;
+  dataDir: string;
 }
 
 export interface SystemMetrics {
@@ -441,6 +459,7 @@ export interface ValetPreferences {
 }
 
 export interface ValetSnapshot {
+  schemaVersion: number;
   onboardingCompleted: boolean;
   onboardingStep: number;
   activeView: string;
@@ -466,6 +485,7 @@ export interface ValetSnapshot {
   preferences: ValetPreferences;
   systemMetrics: SystemMetrics;
   scan: ScanState;
+  storageStats?: StorageStats;
 }
 
 // ---- Services ----
@@ -479,11 +499,11 @@ export const Valet = {
   abortChat(chatID: string): Promise<boolean> {
     return call("Valet.AbortChat", chatID);
   },
-  /** AddAutomationRule appends a new cron/event rule. */
+  /** AddAutomationRule appends a new cron/event rule and reloads the Engine scheduler. */
   addAutomationRule(rule: AutomationRule): Promise<ValetSnapshot> {
     return call("Valet.AddAutomationRule", rule);
   },
-  /** AddMcpServer registers a new MCP server configuration. */
+  /** AddMcpServer registers a new MCP server, probes it when enabled, and syncs Sidecar. */
   addMcpServer(srv: McpServerItem): Promise<ValetSnapshot> {
     return call("Valet.AddMcpServer", srv);
   },
@@ -514,6 +534,14 @@ export const Valet = {
   createChatThread(): Promise<ValetSnapshot> {
     return call("Valet.CreateChatThread");
   },
+  /** DeleteAutomationRule removes an automation rule and reloads the Engine scheduler. */
+  deleteAutomationRule(id: string): Promise<ValetSnapshot> {
+    return call("Valet.DeleteAutomationRule", id);
+  },
+  /** DeleteMcpServer removes an MCP server configuration and syncs Sidecar. */
+  deleteMcpServer(id: string): Promise<ValetSnapshot> {
+    return call("Valet.DeleteMcpServer", id);
+  },
   /** DeleteMemory deletes a single memory item and updates Sidecar. */
   deleteMemory(id: string): Promise<ValetSnapshot> {
     return call("Valet.DeleteMemory", id);
@@ -530,7 +558,7 @@ export const Valet = {
   fixPluginAuth(pluginID: string): Promise<ValetSnapshot> {
     return call("Valet.FixPluginAuth", pluginID);
   },
-  /** GetSnapshot returns the current persistent application state. */
+  /** GetSnapshot returns the current persistent application state plus live storage stats. */
   getSnapshot(): Promise<ValetSnapshot> {
     return call("Valet.GetSnapshot");
   },
@@ -542,7 +570,7 @@ export const Valet = {
   importExistingConfig(): Promise<ValetSnapshot> {
     return call("Valet.ImportExistingConfig");
   },
-  /** InstallCustomPlugin parses YAML, installs a local plugin, and hot-reloads it into Pi Durable. */
+  /** InstallCustomPlugin parses YAML, installs a local plugin, and hot-reloads sensors & Pi Durable. */
   installCustomPlugin(params: InstallCustomPluginParams): Promise<ValetSnapshot> {
     return call("Valet.InstallCustomPlugin", params);
   },
@@ -566,11 +594,11 @@ export const Valet = {
   pollPermissionStatus(permissionID: string): Promise<boolean> {
     return call("Valet.PollPermissionStatus", permissionID);
   },
-  /** ReconnectMcpServer clears authExpired on an MCP server and re-enables it. */
+  /** ReconnectMcpServer probes an MCP server via Sidecar, updates tool count/status, and syncs Sidecar. */
   reconnectMcpServer(id: string): Promise<ValetSnapshot> {
     return call("Valet.ReconnectMcpServer", id);
   },
-  /** ResetAllData resets the persistent state back to factory seed defaults. */
+  /** ResetAllData resets the persistent state back to factory Clean Slate defaults. */
   resetAllData(): Promise<ValetSnapshot> {
     return call("Valet.ResetAllData");
   },
@@ -590,7 +618,11 @@ export const Valet = {
   restoreTimelineEvent(eventID: string): Promise<ValetSnapshot> {
     return call("Valet.RestoreTimelineEvent", eventID);
   },
-  /** RunFirstScan performs real read-only host inspection (disk, orphans, processes, logs) and updates ScanState. */
+  /** RunAutomationNow executes an automation rule immediately through the Pi Durable agent. */
+  runAutomationNow(id: string): Promise<ValetSnapshot> {
+    return call("Valet.RunAutomationNow", id);
+  },
+  /** RunFirstScan performs real read-only host inspection routed through enabled core plugins and updates ScanState. */
   runFirstScan(): Promise<ValetSnapshot> {
     return call("Valet.RunFirstScan");
   },
@@ -602,7 +634,7 @@ export const Valet = {
   sendChatMessage(params: SendChatParams): Promise<SendChatResult> {
     return call("Valet.SendChatMessage", params);
   },
-  /** SendTestAgentMessage sends a probe message using the configured provider. */
+  /** SendTestAgentMessage sends a real single-turn probe completion using the Pi Durable sidecar. */
   sendTestAgentMessage(provider: AgentProviderConfig, model: string): Promise<TestMessageResult> {
     return call("Valet.SendTestAgentMessage", provider, model);
   },
@@ -618,7 +650,7 @@ export const Valet = {
   simulatePluginEvent(pluginID: string, eventCode: string): Promise<SimulateEventResult> {
     return call("Valet.SimulatePluginEvent", pluginID, eventCode);
   },
-  /** ToggleAutomation enables/disables an automation rule. */
+  /** ToggleAutomation enables/disables an automation rule and reloads the Engine scheduler. */
   toggleAutomation(id: string): Promise<ValetSnapshot> {
     return call("Valet.ToggleAutomation", id);
   },
@@ -626,7 +658,7 @@ export const Valet = {
   toggleInboxActionItem(itemID: string, actionID: string): Promise<ValetSnapshot> {
     return call("Valet.ToggleInboxActionItem", itemID, actionID);
   },
-  /** ToggleMcpServer enables/disables an MCP server configuration. */
+  /** ToggleMcpServer enables/disables an MCP server configuration and syncs Sidecar. */
   toggleMcpServer(id: string): Promise<ValetSnapshot> {
     return call("Valet.ToggleMcpServer", id);
   },
@@ -634,7 +666,7 @@ export const Valet = {
   togglePause(): Promise<ValetSnapshot> {
     return call("Valet.TogglePause");
   },
-  /** TogglePluginEnabled toggles plugin enabled status and hot-reloads the Pi Durable registry. */
+  /** TogglePluginEnabled toggles plugin enabled status and hot-reloads the engine & Pi Durable registry. */
   togglePluginEnabled(pluginID: string): Promise<ValetSnapshot> {
     return call("Valet.TogglePluginEnabled", pluginID);
   },
@@ -650,23 +682,27 @@ export const Valet = {
   updateModels(models: ModelSelection): Promise<ValetSnapshot> {
     return call("Valet.UpdateModels", models);
   },
-  /** UpdatePluginConfig updates per-plugin config and syncs Sidecar. */
+  /** UpdatePluginConfig updates per-plugin config and syncs Engine & Sidecar. */
   updatePluginConfig(pluginID: string, cfg: PluginConfig): Promise<ValetSnapshot> {
     return call("Valet.UpdatePluginConfig", pluginID, cfg);
   },
-  /** UpdatePluginEventPolicy updates event policy ("auto"|"ask"|"record") and syncs Sidecar. */
+  /** UpdatePluginEventPolicy updates event policy ("auto"|"ask"|"record") and syncs Engine & Sidecar. */
   updatePluginEventPolicy(pluginID: string, eventID: string, policy: string): Promise<ValetSnapshot> {
     return call("Valet.UpdatePluginEventPolicy", pluginID, eventID, policy);
   },
-  /** UpdatePreferences applies a full preferences update and syncs Sidecar. */
+  /** UpdatePluginManifest parses updated YAML for an existing plugin, preserves matching event policies, and hot-reloads. */
+  updatePluginManifest(pluginID: string, manifestYAML: string): Promise<ValetSnapshot> {
+    return call("Valet.UpdatePluginManifest", pluginID, manifestYAML);
+  },
+  /** UpdatePreferences applies a full preferences update, syncs native Tray/Login hooks, and reloads Engine & Sidecar. */
   updatePreferences(prefs: ValetPreferences): Promise<ValetSnapshot> {
     return call("Valet.UpdatePreferences", prefs);
   },
-  /** UpdateProvider updates API keys, base URLs, and connection status for a provider. */
+  /** UpdateProvider updates API keys (stored in OS Keychain when available), base URLs, and connection status for a provider. */
   updateProvider(providerID: string, patch: AgentProviderConfig): Promise<ValetSnapshot> {
     return call("Valet.UpdateProvider", providerID, patch);
   },
-  /** VerifyProvider performs real endpoint health checking for Ollama/Custom or API keys when provided. */
+  /** VerifyProvider performs real HTTP endpoint discovery and credential validation against the configured provider. */
   verifyProvider(provider: AgentProviderConfig): Promise<ProviderVerifyResult> {
     return call("Valet.VerifyProvider", provider);
   },

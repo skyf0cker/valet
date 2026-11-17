@@ -75,6 +75,8 @@ export interface AgentProviderConfig {
   name: string;
   apiKey: string;
   baseUrl: string;
+  proxyUrl?: string;
+  orgId?: string;
   endpoint: string;
   verified: boolean;
   models: string[];
@@ -170,6 +172,21 @@ export interface ChatMessage {
   pluginDraft?: PluginDraftSpec;
 }
 
+export interface McpServerConfig {
+  id: string;
+  abbr: string;
+  name: string;
+  transportLabel: string;
+  toolCount: number;
+  enabled: boolean;
+  authExpired?: boolean;
+  transport?: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  url?: string;
+  statusError?: string;
+}
+
 export interface ValetSyncState {
   homeDir: string;
   dataDir: string;
@@ -177,7 +194,25 @@ export interface ValetSyncState {
   preferences: ValetPreferences;
   providers: AgentProviderConfig[];
   plugins: PluginState[];
+  mcpServers?: McpServerConfig[];
   memories: MemoryEntry[];
+}
+
+export interface TestProviderRequest {
+  provider: AgentProviderConfig;
+  model: string;
+}
+
+export interface ProbeMcpRequest {
+  server: McpServerConfig;
+}
+
+export interface ProbeMcpResponse {
+  ok: boolean;
+  toolCount: number;
+  transportLabel: string;
+  tools?: string[];
+  error?: string;
 }
 
 export interface ToolPolicyMeta {
