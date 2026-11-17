@@ -268,7 +268,7 @@ export const InboxView: React.FC = () => {
                       : "h-[28px] px-3 text-[12px]"
                   } ${
                     active
-                      ? "bg-[var(--ink-primary)] font-semibold text-[var(--ink-on-primary)]"
+                      ? "bg-[var(--ink-primary)] font-medium text-[var(--ink-on-primary)]"
                       : `border border-[var(--border-control)] bg-[var(--bg-surface)] hover:border-[var(--border-strong)] ${
                           mutedProcessed ? "text-[var(--ink-muted)]" : "text-[var(--ink-strong)]"
                         }`
@@ -399,10 +399,10 @@ export const InboxView: React.FC = () => {
                 <div className="flex min-w-0 flex-1 flex-col gap-1.5 pl-2.5 pr-3 lg:gap-2 lg:pl-3.5 lg:pr-5">
                   <div className="flex flex-wrap items-center gap-1.5 lg:gap-2">
                     <span
-                      className={`font-semibold text-[var(--ink-strong)] ${
+                      className={`font-[460] text-[var(--ink-strong)] ${
                         sidebarCollapsed
-                          ? "text-[13.5px] leading-[18px]"
-                          : "text-[14px] leading-[18px] lg:text-[15px]"
+                          ? "text-[13.5px] leading-[19px]"
+                          : "text-[14px] leading-[20px] lg:text-[15px]"
                       }`}
                     >
                       {item.title}
@@ -417,7 +417,7 @@ export const InboxView: React.FC = () => {
                     )}
 
                     {item.warningTag && (
-                      <span className="inline-flex h-[18px] shrink-0 items-center rounded-full border border-[var(--amber-pill)] px-[6px] text-[9.5px] font-semibold text-[var(--amber-text)] lg:h-[20px] lg:px-[7px] lg:text-[10px]">
+                      <span className="inline-flex h-[18px] shrink-0 items-center rounded-full border border-[var(--amber-pill)] px-[6px] text-[9.5px] font-medium text-[var(--amber-text)] lg:h-[20px] lg:px-[7px] lg:text-[10px]">
                         {item.warningTag}
                       </span>
                     )}
@@ -490,7 +490,7 @@ export const InboxView: React.FC = () => {
                         <button
                           type="button"
                           onClick={() => selectInboxItem(item.id)}
-                          className="cursor-pointer text-[10.5px] font-semibold text-[var(--ink-strong)] hover:underline lg:text-[11px]"
+                          className="cursor-pointer text-[10.5px] font-medium text-[var(--ink-strong)] hover:underline lg:text-[11px]"
                         >
                           {sidebarCollapsed ? "清单 →" : "查看完整清单 →"}
                         </button>

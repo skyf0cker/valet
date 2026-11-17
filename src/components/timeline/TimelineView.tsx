@@ -173,7 +173,7 @@ export const TimelineView: React.FC = () => {
                       : "h-[28px] px-3 text-[12px]"
                   } ${
                     active
-                      ? "bg-[var(--ink-primary)] font-semibold text-[var(--ink-on-primary)]"
+                      ? "bg-[var(--ink-primary)] font-medium text-[var(--ink-on-primary)]"
                       : "border border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-strong)] hover:border-[var(--border-strong)]"
                   }`}
                 >
@@ -213,7 +213,7 @@ export const TimelineView: React.FC = () => {
               scrollContainerRef.current?.scrollTo({ top: 0, behavior: "smooth" });
               clearArrivalNotice();
             }}
-            className="animate-valet-pill-drop absolute top-3 left-1/2 z-20 flex h-[30px] cursor-pointer items-center gap-2 rounded-full bg-[var(--ink-primary)] px-3.5 text-[12px] font-semibold text-[var(--ink-on-primary)] shadow-[var(--shadow-popover)]"
+            className="animate-valet-pill-drop absolute top-3 left-1/2 z-20 flex h-[30px] cursor-pointer items-center gap-2 rounded-full bg-[var(--ink-primary)] px-3.5 text-[12px] font-medium text-[var(--ink-on-primary)] shadow-[var(--shadow-popover)]"
           >
             <span className="h-1.5 w-1.5 rounded-full bg-[var(--ink-on-primary)]" />
             <span>1 个新事件 · {arrivalNotice.pluginName} ↑</span>

@@ -99,7 +99,7 @@ export const TimelineDetailDrawer: React.FC = () => {
                   {event.eventCode}
                 </span>
               </div>
-              <h3 className="font-[family-name:var(--font-serif-zh)] text-[26px] font-medium leading-[36px] tracking-[-0.01em] text-[var(--ink-strong)]">
+              <h3 className="font-[family-name:var(--font-serif-zh)] text-[26px] font-normal leading-[36px] tracking-[-0.01em] text-[var(--ink-strong)]">
                 {event.title}
               </h3>
             </div>
@@ -215,7 +215,7 @@ export const TimelineDetailDrawer: React.FC = () => {
                           {!last && <span className="my-1 w-[1px] flex-1 bg-[var(--border-base)]" />}
                         </div>
                         <div className="flex flex-1 flex-col gap-0.5 pb-4">
-                          <span className="text-[13px] font-semibold text-[var(--ink-strong)]">
+                          <span className="text-[13px] font-medium text-[var(--ink-strong)]">
                             {step.stage}
                           </span>
                           <span className="text-[12px] text-[var(--ink-muted)]">

@@ -86,7 +86,7 @@ export const InboxDetailDrawer: React.FC = () => {
             <div className="flex flex-col gap-2">
               <div className="flex flex-wrap items-center gap-2">
                 {item.status === "pending" ? (
-                  <span className="inline-flex h-[24px] shrink-0 items-center rounded-full border border-[var(--amber-pill)] px-[9px] text-[11px] font-semibold text-[var(--amber-text)]">
+                  <span className="inline-flex h-[24px] shrink-0 items-center rounded-full border border-[var(--amber-pill)] px-[9px] text-[11px] font-medium text-[var(--amber-text)]">
                     待你批准
                   </span>
                 ) : item.status === "approved" ? (
@@ -103,13 +103,13 @@ export const InboxDetailDrawer: React.FC = () => {
                   {item.eventCode}
                 </span>
                 {item.warningTag && (
-                  <span className="inline-flex h-[20px] items-center rounded-full border border-[var(--amber-pill)] px-2 text-[10px] font-semibold text-[var(--amber-text)]">
+                  <span className="inline-flex h-[20px] items-center rounded-full border border-[var(--amber-pill)] px-2 text-[10px] font-medium text-[var(--amber-text)]">
                     {item.warningTag}
                   </span>
                 )}
               </div>
 
-              <h3 className="font-[family-name:var(--font-serif-zh)] text-[24px] font-medium leading-[34px] tracking-[-0.01em] text-[var(--ink-strong)]">
+              <h3 className="font-[family-name:var(--font-serif-zh)] text-[24px] font-normal leading-[34px] tracking-[-0.01em] text-[var(--ink-strong)]">
                 {item.title}
               </h3>
             </div>
@@ -229,7 +229,7 @@ export const InboxDetailDrawer: React.FC = () => {
                           )}
                         </div>
                         <div className="flex flex-1 flex-col gap-0.5 pb-4">
-                          <span className="text-[13px] font-semibold text-[var(--ink-strong)]">
+                          <span className="text-[13px] font-medium text-[var(--ink-strong)]">
                             {step.stage}
                           </span>
                           <span className="text-[12px] text-[var(--ink-muted)]">

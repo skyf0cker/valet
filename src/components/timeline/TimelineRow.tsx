@@ -112,7 +112,7 @@ export const TimelineRow: React.FC<TimelineRowProps> = ({
       >
         <div className="flex flex-wrap items-center gap-2">
           <span
-            className={`font-semibold leading-[18px] text-[var(--ink-strong)] ${
+            className={`font-[460] leading-[20px] text-[var(--ink-strong)] ${
               compact ? "text-[13.5px]" : "text-[14px] lg:text-[15px]"
             }`}
           >

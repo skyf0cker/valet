@@ -65,7 +65,7 @@ export const WorkspacePageHeader: React.FC<WorkspacePageHeaderProps> = ({
               {kicker}
             </div>
             <h1
-              className={`font-[family-name:var(--font-serif-zh)] font-medium tracking-[-0.01em] text-[var(--ink-strong)] ${
+              className={`font-[family-name:var(--font-serif-zh)] font-normal tracking-[-0.01em] text-[var(--ink-strong)] ${
                 sidebarCollapsed
                   ? "text-[24px] leading-[32px]"
                   : "text-[26px] leading-[34px] lg:text-[34px] lg:leading-[44px]"

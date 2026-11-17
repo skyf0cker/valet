@@ -2,7 +2,7 @@ import React from "react";
 import type { TimelineStatus } from "../../types/valet";
 
 export const PluginTag: React.FC<{ label: string }> = ({ label }) => (
-  <span className="inline-flex h-[20px] shrink-0 items-center rounded-[5px] border border-[var(--ink-primary)] bg-[var(--bg-canvas)] px-[7px] text-[11px] font-semibold leading-[14px] text-[var(--ink-primary)]">
+  <span className="inline-flex h-[20px] shrink-0 items-center rounded-[5px] border border-[var(--border-strong)] bg-[var(--bg-canvas)] px-[7px] text-[11px] font-normal leading-[14px] text-[var(--ink-secondary)]">
     {label}
   </span>
 );
@@ -28,7 +28,7 @@ export const StatusPill: React.FC<{
 }> = ({ status, pendingLabel = "待确认" }) => {
   if (status === "running") {
     return (
-      <span className="inline-flex h-[24px] shrink-0 items-center gap-1.5 rounded-full bg-[var(--ink-primary)] px-[9px] text-[11px] font-semibold text-[var(--ink-on-primary)]">
+      <span className="inline-flex h-[24px] shrink-0 items-center gap-1.5 rounded-full bg-[var(--ink-primary)] px-[9px] text-[11px] font-medium text-[var(--ink-on-primary)]">
         <svg
           width="10"
           height="10"
@@ -45,14 +45,14 @@ export const StatusPill: React.FC<{
   }
   if (status === "pending_confirm") {
     return (
-      <span className="inline-flex h-[24px] shrink-0 items-center rounded-full border border-[var(--amber-pill)] px-[9px] text-[11px] font-semibold text-[var(--amber-text)]">
+      <span className="inline-flex h-[24px] shrink-0 items-center rounded-full border border-[var(--amber-pill)] px-[9px] text-[11px] font-medium text-[var(--amber-text)]">
         {pendingLabel}
       </span>
     );
   }
   if (status === "failed") {
     return (
-      <span className="inline-flex h-[24px] shrink-0 items-center rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] px-[9px] text-[11px] font-semibold text-[var(--danger)]">
+      <span className="inline-flex h-[24px] shrink-0 items-center rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] px-[9px] text-[11px] font-medium text-[var(--danger)]">
         失败
       </span>
     );
