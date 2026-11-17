@@ -100,6 +100,6 @@ export const SettingRow: React.FC<{
         </span>
       )}
     </div>
-    <div className="flex shrink-0 items-center gap-2">{children}</div>
+    <div className="flex min-w-0 max-w-full shrink-0 items-center gap-2">{children}</div>
   </div>
 );

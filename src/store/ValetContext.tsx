@@ -173,6 +173,57 @@ function computeSelectedGB(
   return fallbackGB;
 }
 
+function isFastModelId(id: string): boolean {
+  const low = id.toLowerCase();
+  return (
+    low.includes("haiku") ||
+    low.includes("flash") ||
+    low.includes("mini") ||
+    low.includes("nano") ||
+    low.includes("fast") ||
+    low.includes("lite")
+  );
+}
+
+function reconcileProviderModelSelection(
+  prev: ValetSnapshot,
+  models: string[]
+): {
+  preferences: ValetPreferences;
+  chatThreads: ChatThread[];
+} {
+  if (models.length === 0) {
+    return {
+      preferences: prev.preferences,
+      chatThreads: prev.chatThreads,
+    };
+  }
+  const hasModel = (id: string) => models.includes(id);
+  const primary = hasModel(prev.preferences.models.primary)
+    ? prev.preferences.models.primary
+    : models[0]!;
+  const fast = hasModel(prev.preferences.models.fast)
+    ? prev.preferences.models.fast
+    : models.find(isFastModelId) ?? models[models.length - 1] ?? primary;
+  const vision =
+    prev.preferences.models.vision === "同主模型" ||
+    hasModel(prev.preferences.models.vision)
+      ? prev.preferences.models.vision
+      : "同主模型";
+
+  const chatThreads = prev.chatThreads.map((t) =>
+    hasModel(t.model) ? t : { ...t, model: primary }
+  );
+
+  return {
+    preferences: {
+      ...prev.preferences,
+      models: { primary, fast, vision },
+    },
+    chatThreads,
+  };
+}
+
 function mergeBackendSnapshot(
   prev: ValetSnapshot,
   remoteRaw: MyGoSnapshot
@@ -610,21 +661,45 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   const approveInboxItem = useCallback(
     (itemId: string) => {
-      let toastMsg = "已批准执行该动作";
+      const target = stateRef.current.inboxItems.find((i) => i.id === itemId);
+      if (!target || target.status !== "pending") return;
+
+      const reclaimed =
+        target.actionItems.some((a) => a.sizeMB > 0)
+          ? computeSelectedGB(target.actionItems, target.reclaimableGB ?? 0)
+          : target.reclaimableGB ?? 0;
+
+      const toastMsg = target.reversible7d
+        ? `已批准「${target.pluginName}」清理 ${reclaimed > 0 ? `${reclaimed} GB` : ""}（7 天内可还原）`
+        : `已批准并执行「${target.title}」`;
+
+      if (isMyGo()) {
+        void Valet.approveInboxItem(itemId)
+          .then((snap) => {
+            setState((prev) =>
+              mergeBackendSnapshot(
+                {
+                  ...prev,
+                  selectedInboxItemId:
+                    prev.selectedInboxItemId === itemId ? null : prev.selectedInboxItemId,
+                },
+                snap
+              )
+            );
+            triggerNod();
+            pushToast(toastMsg, "success");
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+        return;
+      }
+
       setState((prev) => {
-        const target = prev.inboxItems.find((i) => i.id === itemId);
-        if (!target || target.status !== "pending") return prev;
+        const cur = prev.inboxItems.find((i) => i.id === itemId);
+        if (!cur || cur.status !== "pending") return prev;
 
         const nowTime = new Date().toTimeString().slice(0, 5);
-        const reclaimed =
-          target.actionItems.some((a) => a.sizeMB > 0)
-            ? computeSelectedGB(target.actionItems, target.reclaimableGB ?? 0)
-            : target.reclaimableGB ?? 0;
-
-        toastMsg = target.reversible7d
-          ? `已批准「${target.pluginName}」清理 ${reclaimed > 0 ? `${reclaimed} GB` : ""}（7 天内可还原）`
-          : `已批准并执行「${target.title}」`;
-
         const nextInbox = prev.inboxItems.map((it) =>
           it.id === itemId
             ? {
@@ -638,15 +713,15 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         );
 
         let nextTimeline = prev.timelineEvents;
-        if (target.linkedTimelineEventId) {
+        if (cur.linkedTimelineEventId) {
           nextTimeline = prev.timelineEvents.map((evt) =>
-            evt.id === target.linkedTimelineEventId
+            evt.id === cur.linkedTimelineEventId
               ? {
                   ...evt,
                   status: "completed" as const,
                   reclaimedGB: reclaimed > 0 ? reclaimed : evt.reclaimedGB,
-                  canRestore: target.reversible7d,
-                  summary: target.reversible7d
+                  canRestore: cur.reversible7d,
+                  summary: cur.reversible7d
                     ? `已在收件箱批准并移入废纸篓（释放 ${reclaimed} GB，7 天内可还原）。`
                     : `已在收件箱批准并执行完成。`,
                   traceSteps: evt.traceSteps.map((s) => ({ ...s, status: "done" as const })),
@@ -655,30 +730,30 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           );
         } else {
           const newEvt: TimelineEvent = {
-            id: `evt-from-${target.id}`,
+            id: `evt-from-${cur.id}`,
             timestamp: new Date().toISOString(),
             timeLabel: nowTime,
             dayGroup: "today",
-            title: target.title,
-            summary: target.reversible7d
+            title: cur.title,
+            summary: cur.reversible7d
               ? `已在收件箱批准处理（${reclaimed > 0 ? `释放 ${reclaimed} GB，` : ""}7 天内可还原）。`
-              : target.category === "process"
+              : cur.category === "process"
                 ? "已向进程发送 SIGTERM 并释放系统资源。"
                 : "已在收件箱批准外发该日程顺延消息。",
-            pluginId: target.pluginId,
-            pluginName: target.pluginName,
-            pluginBadge: target.pluginBadge,
-            eventCode: target.eventCode,
+            pluginId: cur.pluginId,
+            pluginName: cur.pluginName,
+            pluginBadge: cur.pluginBadge,
+            eventCode: cur.eventCode,
             status: "completed",
             reclaimedGB: reclaimed > 0 ? reclaimed : undefined,
-            intercepted: target.category === "process",
-            canRestore: target.reversible7d,
+            intercepted: cur.category === "process",
+            canRestore: cur.reversible7d,
             triggerLatencyLabel: `${nowTime} · 收件箱批准执行`,
-            payload: target.payload,
-            reasoning: target.reasoning,
-            actionItems: target.actionItems,
-            traceSteps: target.traceSteps.map((s) => ({ ...s, status: "done" as const })),
-            logs: target.logs,
+            payload: cur.payload,
+            reasoning: cur.reasoning,
+            actionItems: cur.actionItems,
+            traceSteps: cur.traceSteps.map((s) => ({ ...s, status: "done" as const })),
+            logs: cur.logs,
           };
           nextTimeline = [newEvt, ...prev.timelineEvents];
         }
@@ -704,11 +779,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       });
       triggerNod();
       pushToast(toastMsg, "success");
-      if (isMyGo()) {
-        syncFromBackend(Valet.approveInboxItem(itemId));
-      }
     },
-    [pushToast, syncFromBackend, triggerNod]
+    [pushToast, triggerNod]
   );
 
   const dismissInboxItem = useCallback(
@@ -750,28 +822,52 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   );
 
   const approveAllReversibleInboxItems = useCallback(() => {
-    let batchCount = 0;
-    let totalFreed = 0;
+    const targets = stateRef.current.inboxItems.filter(
+      (i) => i.status === "pending" && i.reversible7d
+    );
+    if (targets.length === 0) return;
+
+    const batchCount = targets.length;
+    const totalFreed = Number(
+      targets
+        .reduce((acc, t) => {
+          const g = t.actionItems.some((a) => a.sizeMB > 0)
+            ? computeSelectedGB(t.actionItems, t.reclaimableGB ?? 0)
+            : t.reclaimableGB ?? 0;
+          return acc + g;
+        }, 0)
+        .toFixed(1)
+    );
+
+    if (isMyGo()) {
+      void Valet.approveAllReversible()
+        .then((snap) => {
+          setState((prev) =>
+            mergeBackendSnapshot({ ...prev, selectedInboxItemId: null }, snap)
+          );
+          triggerNod();
+          pushToast(
+            `已批量批准 ${batchCount} 个可还原项，释放 ${totalFreed} GB（7 天内可从时间线/已处理还原）`,
+            "success"
+          );
+        })
+        .catch((err: unknown) => {
+          pushToast(err instanceof Error ? err.message : String(err), "danger");
+        });
+      return;
+    }
+
     setState((prev) => {
-      const targets = prev.inboxItems.filter(
+      const curTargets = prev.inboxItems.filter(
         (i) => i.status === "pending" && i.reversible7d
       );
-      if (targets.length === 0) return prev;
+      if (curTargets.length === 0) return prev;
 
-      batchCount = targets.length;
       const nowTime = new Date().toTimeString().slice(0, 5);
-      const targetIds = new Set(targets.map((t) => t.id));
+      const targetIds = new Set(curTargets.map((t) => t.id));
       const linkedIds = new Set(
-        targets.map((t) => t.linkedTimelineEventId).filter(Boolean) as string[]
+        curTargets.map((t) => t.linkedTimelineEventId).filter(Boolean) as string[]
       );
-
-      totalFreed = targets.reduce((acc, t) => {
-        const g = t.actionItems.some((a) => a.sizeMB > 0)
-          ? computeSelectedGB(t.actionItems, t.reclaimableGB ?? 0)
-          : t.reclaimableGB ?? 0;
-        return acc + g;
-      }, 0);
-      totalFreed = Number(totalFreed.toFixed(1));
 
       const nextInbox = prev.inboxItems.map((it) =>
         targetIds.has(it.id)
@@ -784,7 +880,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           : it
       );
 
-      const newTimelineFromUnlinked: TimelineEvent[] = targets
+      const newTimelineFromUnlinked: TimelineEvent[] = curTargets
         .filter((t) => !t.linkedTimelineEventId)
         .map((t) => ({
           id: `evt-batch-${t.id}`,
@@ -829,7 +925,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         ...prev,
         selectedInboxItemId: null,
         inboxItems: nextInbox,
-        inboxProcessedHistoryCount: prev.inboxProcessedHistoryCount + batchCount,
+        inboxProcessedHistoryCount: prev.inboxProcessedHistoryCount + curTargets.length,
         timelineEvents: [...newTimelineFromUnlinked, ...updatedExistingTimeline],
         systemMetrics: {
           ...prev.systemMetrics,
@@ -839,17 +935,12 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       };
     });
 
-    if (batchCount > 0) {
-      triggerNod();
-      pushToast(
-        `已批量批准 ${batchCount} 个可还原项，释放 ${totalFreed} GB（7 天内可从时间线/已处理还原）`,
-        "success"
-      );
-    }
-    if (isMyGo()) {
-      syncFromBackend(Valet.approveAllReversible());
-    }
-  }, [pushToast, syncFromBackend, triggerNod]);
+    triggerNod();
+    pushToast(
+      `已批量批准 ${batchCount} 个可还原项，释放 ${totalFreed} GB（7 天内可从时间线/已处理还原）`,
+      "success"
+    );
+  }, [pushToast, triggerNod]);
 
   const restoreApprovedInboxItem = useCallback(
     (itemId: string) => {
@@ -1195,9 +1286,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     (providerId: ProviderId) => {
       setState((prev) => {
         const target = prev.providers.find((p) => p.id === providerId);
-        const firstModel = target?.models[0] ?? prev.preferences.models.primary;
-        const fastModel = target?.models[target.models.length - 1] ?? firstModel;
-        return {
+        const models = target?.models ?? [];
+        const nextBase: ValetSnapshot = {
           ...prev,
           providers: prev.providers.map((p) =>
             p.id === providerId ? { ...p, connected: p.verified || p.id === "ollama" } : p
@@ -1205,12 +1295,11 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           preferences: {
             ...prev.preferences,
             activeProviderId: providerId,
-            models: {
-              ...prev.preferences.models,
-              primary: firstModel,
-              fast: fastModel,
-            },
           },
+        };
+        return {
+          ...nextBase,
+          ...reconcileProviderModelSelection(nextBase, models),
         };
       });
       if (isMyGo()) {
@@ -1223,10 +1312,26 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const updateProvider = useCallback(
     (providerId: ProviderId, patch: Partial<AgentProviderConfig>) => {
       const existing = stateRef.current.providers.find((p) => p.id === providerId);
-      setState((prev) => ({
-        ...prev,
-        providers: prev.providers.map((p) => (p.id === providerId ? { ...p, ...patch } : p)),
-      }));
+      setState((prev) => {
+        const nextProviders = prev.providers.map((p) =>
+          p.id === providerId ? { ...p, ...patch } : p
+        );
+        if (
+          prev.preferences.activeProviderId === providerId &&
+          patch.models &&
+          patch.models.length > 0
+        ) {
+          return {
+            ...prev,
+            providers: nextProviders,
+            ...reconcileProviderModelSelection(prev, patch.models),
+          };
+        }
+        return {
+          ...prev,
+          providers: nextProviders,
+        };
+      });
       if (isMyGo() && existing) {
         const merged = { ...existing, ...patch, id: providerId };
         syncFromBackend(Valet.updateProvider(providerId, merged as unknown as MyGoProviderConfig));
@@ -1238,13 +1343,19 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const updateModels = useCallback(
     (patch: Partial<ModelSelection>) => {
       const nextModels = { ...stateRef.current.preferences.models, ...patch };
-      setState((prev) => ({
-        ...prev,
-        preferences: {
-          ...prev.preferences,
-          models: { ...prev.preferences.models, ...patch },
-        },
-      }));
+      setState((prev) => {
+        const nextThreads = nextModels.primary
+          ? prev.chatThreads.map((t) => ({ ...t, model: nextModels.primary }))
+          : prev.chatThreads;
+        return {
+          ...prev,
+          preferences: {
+            ...prev.preferences,
+            models: nextModels,
+          },
+          chatThreads: nextThreads,
+        };
+      });
       if (isMyGo()) {
         syncFromBackend(Valet.updateModels(nextModels as MyGoModelSelection));
       }
@@ -1512,15 +1623,33 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   const executeTimelineEventActions = useCallback(
     (eventId: string) => {
-      let cleanedGBLabel = "";
+      const target = stateRef.current.timelineEvents.find((e) => e.id === eventId);
+      if (!target) return;
+
+      const selectedMB = target.actionItems
+        .filter((item) => item.checked)
+        .reduce((acc, item) => acc + item.sizeMB, 0);
+      const reclaimedGB = Number((selectedMB / 1024).toFixed(1));
+      const cleanedGBLabel = reclaimedGB > 0 ? `${reclaimedGB} GB` : "所选项目";
+
+      if (isMyGo()) {
+        void Valet.executeTimelineEvent(eventId)
+          .then((snap) => {
+            setState((prev) =>
+              mergeBackendSnapshot({ ...prev, selectedTimelineEventId: null }, snap)
+            );
+            triggerNod();
+            pushToast(`已移入废纸篓（${cleanedGBLabel || "完成"}），7 天内可还原`, "success");
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+        return;
+      }
+
       setState((prev) => {
-        const target = prev.timelineEvents.find((e) => e.id === eventId);
-        if (!target) return prev;
-        const selectedMB = target.actionItems
-          .filter((item) => item.checked)
-          .reduce((acc, item) => acc + item.sizeMB, 0);
-        const reclaimedGB = Number((selectedMB / 1024).toFixed(1));
-        cleanedGBLabel = reclaimedGB > 0 ? `${reclaimedGB} GB` : "所选项目";
+        const cur = prev.timelineEvents.find((e) => e.id === eventId);
+        if (!cur) return prev;
         const nowTime = new Date().toTimeString().slice(0, 5);
 
         const nextEvents = prev.timelineEvents.map((evt) => {
@@ -1574,11 +1703,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       });
       triggerNod();
       pushToast(`已移入废纸篓（${cleanedGBLabel || "完成"}），7 天内可还原`, "success");
-      if (isMyGo()) {
-        syncFromBackend(Valet.executeTimelineEvent(eventId));
-      }
     },
-    [pushToast, syncFromBackend, triggerNod]
+    [pushToast, triggerNod]
   );
 
   const ignoreTimelineEvent = useCallback(
@@ -1708,7 +1834,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }) => {
       const activeId = stateRef.current.activeChatId;
       const activeChat = stateRef.current.chatThreads.find((c) => c.id === activeId);
-      const model = activeChat?.model ?? stateRef.current.preferences.models.primary;
+      const model = stateRef.current.preferences.models.primary || activeChat?.model || "claude-opus-4";
       const nowTime = new Date().toTimeString().slice(0, 5);
       const userMsg: ChatMessage = {
         id: `usr-${Date.now()}`,

@@ -86,8 +86,15 @@ func (r *DriverRegistry) Execute(ctx context.Context, driverName string, ic Invo
 }
 
 func handleScanCleanable(_ context.Context, ic InvokeContext, _ ActionSpec, args map[string]any) (InvokeResult, error) {
-	minSizeMB := intArg(args, "minSizeMB", 2048)
-	idleDays := intArg(args, "idleDays", 90)
+	scope := strings.ToLower(stringArg(args, "scope"))
+	defaultMinSizeMB := 500
+	defaultIdleDays := 90
+	if scope == "downloads" {
+		defaultMinSizeMB = 10
+		defaultIdleDays = 0
+	}
+	minSizeMB := intArg(args, "minSizeMB", defaultMinSizeMB)
+	idleDays := intArg(args, "idleDays", defaultIdleDays)
 	report := sys.ScanDisk(ic.HomeDir, ic.ProtectedDirs, minSizeMB, idleDays)
 	return InvokeResult{
 		OK:      true,

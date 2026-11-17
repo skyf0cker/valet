@@ -209,12 +209,21 @@ export const PluginDraftCard: React.FC<{
   );
 };
 
-export const FormattedText: React.FC<{ text: string }> = ({ text }) => {
+function stripThinkMarkup(raw: string): string {
+  if (!raw) return "";
+  let clean = raw.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "");
+  if (/<think(?:ing)?>/i.test(clean)) {
+    clean = clean.replace(/<think(?:ing)?>[\s\S]*$/i, "");
+  }
+  return clean.replace(/^\s+/, "");
+}
+
+const InlineFormatted: React.FC<{ text: string }> = ({ text }) => {
   const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
   return (
     <>
       {parts.map((part, i) => {
-        if (part.startsWith("`") && part.endsWith("`")) {
+        if (part.startsWith("`") && part.endsWith("`") && part.length >= 2) {
           return (
             <code
               key={i}
@@ -224,7 +233,7 @@ export const FormattedText: React.FC<{ text: string }> = ({ text }) => {
             </code>
           );
         }
-        if (part.startsWith("**") && part.endsWith("**")) {
+        if (part.startsWith("**") && part.endsWith("**") && part.length >= 4) {
           return (
             <strong key={i} className="font-semibold text-[var(--ink-strong)]">
               {part.slice(2, -2)}
@@ -234,5 +243,118 @@ export const FormattedText: React.FC<{ text: string }> = ({ text }) => {
         return <React.Fragment key={i}>{part}</React.Fragment>;
       })}
     </>
+  );
+};
+
+const MarkdownTextBlock: React.FC<{ text: string }> = ({ text }) => {
+  const lines = text.split("\n");
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i] ?? "";
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      i++;
+      continue;
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,3})\s+(.+)$/);
+    if (headingMatch) {
+      const level = headingMatch[1]!.length;
+      const content = headingMatch[2]!;
+      blocks.push(
+        <div
+          key={`h-${i}`}
+          className={`font-semibold text-[var(--ink-strong)] ${
+            level === 1 ? "mt-2 text-[15px]" : "mt-1.5 text-[13.5px]"
+          }`}
+        >
+          <InlineFormatted text={content} />
+        </div>
+      );
+      i++;
+      continue;
+    }
+
+    if (/^[-*•]\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (i < lines.length && /^[-*•]\s+/.test((lines[i] ?? "").trim())) {
+        items.push((lines[i] ?? "").trim().replace(/^[-*•]\s+/, ""));
+        i++;
+      }
+      blocks.push(
+        <ul key={`ul-${i}`} className="my-1 flex flex-col gap-1 pl-4 list-disc">
+          {items.map((item, idx) => (
+            <li key={idx}>
+              <InlineFormatted text={item} />
+            </li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+
+    if (/^\d+\.\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\d+\.\s+/.test((lines[i] ?? "").trim())) {
+        items.push((lines[i] ?? "").trim().replace(/^\d+\.\s+/, ""));
+        i++;
+      }
+      blocks.push(
+        <ol key={`ol-${i}`} className="my-1 flex flex-col gap-1 pl-4 list-decimal">
+          {items.map((item, idx) => (
+            <li key={idx}>
+              <InlineFormatted text={item} />
+            </li>
+          ))}
+        </ol>
+      );
+      continue;
+    }
+
+    const paraLines: string[] = [];
+    while (
+      i < lines.length &&
+      (lines[i] ?? "").trim() !== "" &&
+      !/^(#{1,3})\s+/.test((lines[i] ?? "").trim()) &&
+      !/^[-*•]\s+/.test((lines[i] ?? "").trim()) &&
+      !/^\d+\.\s+/.test((lines[i] ?? "").trim())
+    ) {
+      paraLines.push(lines[i]!);
+      i++;
+    }
+    blocks.push(
+      <p key={`p-${i}`} className="whitespace-pre-wrap break-words">
+        <InlineFormatted text={paraLines.join("\n")} />
+      </p>
+    );
+  }
+
+  return <div className="flex flex-col gap-1.5">{blocks}</div>;
+};
+
+export const FormattedText: React.FC<{ text: string }> = ({ text }) => {
+  const cleaned = stripThinkMarkup(text);
+  const segments = cleaned.split(/(```[\s\S]*?```)/g);
+  return (
+    <div className="flex flex-col gap-2">
+      {segments.map((seg, idx) => {
+        if (seg.startsWith("```") && seg.endsWith("```") && seg.length >= 6) {
+          const inner = seg.slice(3, -3).replace(/^[^\n]*\n/, "");
+          return (
+            <pre
+              key={idx}
+              className="overflow-x-auto rounded-[8px] bg-[var(--bg-code)] p-3 font-mono text-[11.5px] leading-[18px] text-[var(--ink-secondary)]"
+            >
+              {inner}
+            </pre>
+          );
+        }
+        if (!seg.trim()) return null;
+        return <MarkdownTextBlock key={idx} text={seg} />;
+      })}
+    </div>
   );
 };

@@ -899,6 +899,9 @@ export const SettingsView: React.FC = () => {
                       onChange={(e) =>
                         updateProvider(activeProvider.id, {
                           apiKey: e.target.value,
+                          apiKeyMasked: e.target.value
+                            ? `${e.target.value.slice(0, 6)}••••${e.target.value.slice(-4)}`
+                            : "",
                           verified: false,
                         })
                       }
@@ -957,34 +960,37 @@ export const SettingsView: React.FC = () => {
                     disabled={verifyingProvider}
                     onClick={async () => {
                       setVerifyingProvider(true);
-                      const res = await valetService.verifyProvider(activeProvider);
-                      setVerifyingProvider(false);
-                      const discovered =
-                        res.models && res.models.length > 0
-                          ? res.models
-                          : activeProvider.models;
-                      updateProvider(activeProvider.id, {
-                        verified: res.ok,
-                        connected: res.ok,
-                        latencyMs: res.latencyMs,
-                        availableModelCount: res.modelCount || discovered.length,
-                        models: discovered,
-                      });
-                      if (res.ok && discovered.length > 0) {
-                        const nextPrimary = discovered.includes(preferences.models.primary)
-                          ? preferences.models.primary
-                          : discovered[0]!;
-                        const nextFast = discovered.includes(preferences.models.fast)
-                          ? preferences.models.fast
-                          : discovered[discovered.length - 1] ?? nextPrimary;
-                        if (
-                          nextPrimary !== preferences.models.primary ||
-                          nextFast !== preferences.models.fast
-                        ) {
-                          updateModels({ primary: nextPrimary, fast: nextFast });
+                      setProviderTestReply(null);
+                      try {
+                        const res = await valetService.verifyProvider(activeProvider);
+                        if (res.ok) {
+                          const discovered =
+                            res.models && res.models.length > 0
+                              ? res.models
+                              : activeProvider.models;
+                          updateProvider(activeProvider.id, {
+                            verified: true,
+                            connected: true,
+                            latencyMs: res.latencyMs,
+                            availableModelCount: res.modelCount || discovered.length,
+                            models: discovered,
+                          });
+                        } else {
+                          updateProvider(activeProvider.id, {
+                            verified: false,
+                            connected: false,
+                            latencyMs: res.latencyMs,
+                          });
+                          setProviderTestReply(`验证失败：${res.message}`);
                         }
+                        pushToast(res.message, res.ok ? "success" : "warning");
+                      } catch (err) {
+                        const msg = err instanceof Error ? err.message : String(err);
+                        setProviderTestReply(`验证失败：${msg}`);
+                        pushToast(msg, "danger");
+                      } finally {
+                        setVerifyingProvider(false);
                       }
-                      pushToast(res.message, res.ok ? "success" : "warning");
                     }}
                     className="inline-flex h-7 cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] px-3 text-[11px] font-semibold text-[var(--ink-on-primary)] disabled:opacity-60"
                   >

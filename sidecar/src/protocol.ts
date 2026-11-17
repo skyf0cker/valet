@@ -134,6 +134,10 @@ export interface ChatAttachment {
   name: string;
   meta?: string;
   badge?: string;
+  path?: string;
+  dataUrl?: string;
+  mimeType?: string;
+  textExcerpt?: string;
 }
 
 export interface ProcessSampleRow {

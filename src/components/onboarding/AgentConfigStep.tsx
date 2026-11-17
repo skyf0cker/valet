@@ -49,47 +49,54 @@ export const AgentConfigStep: React.FC = () => {
 
   const handleVerify = async () => {
     setVerifying(true);
-    const res = await valetService.verifyProvider(activeProvider);
-    setVerifying(false);
-    const discovered = res.models && res.models.length > 0 ? res.models : activeProvider.models;
-    updateProvider(activeProvider.id, {
-      verified: res.ok,
-      connected: res.ok,
-      latencyMs: res.latencyMs,
-      availableModelCount: res.modelCount || discovered.length,
-      models: discovered,
-    });
-    if (res.ok && discovered.length > 0) {
-      const nextPrimary = discovered.includes(state.preferences.models.primary)
-        ? state.preferences.models.primary
-        : discovered[0]!;
-      const nextFast = discovered.includes(state.preferences.models.fast)
-        ? state.preferences.models.fast
-        : discovered[discovered.length - 1] ?? nextPrimary;
-      if (
-        nextPrimary !== state.preferences.models.primary ||
-        nextFast !== state.preferences.models.fast
-      ) {
-        updateModels({ primary: nextPrimary, fast: nextFast });
+    try {
+      const res = await valetService.verifyProvider(activeProvider);
+      if (res.ok) {
+        const discovered =
+          res.models && res.models.length > 0 ? res.models : activeProvider.models;
+        updateProvider(activeProvider.id, {
+          verified: true,
+          connected: true,
+          latencyMs: res.latencyMs,
+          availableModelCount: res.modelCount || discovered.length,
+          models: discovered,
+        });
+      } else {
+        updateProvider(activeProvider.id, {
+          verified: false,
+          connected: false,
+          latencyMs: res.latencyMs,
+        });
       }
+      pushToast(res.message, res.ok ? "success" : "warning");
+    } catch (err) {
+      pushToast(err instanceof Error ? err.message : String(err), "danger");
+    } finally {
+      setVerifying(false);
     }
-    pushToast(res.message, res.ok ? "success" : "warning");
   };
 
   const handleTestMessage = async () => {
     setTestingMsg(true);
     setTestReply(null);
-    const res = await valetService.sendTestAgentMessage(
-      activeProvider,
-      state.preferences.models.primary
-    );
-    setTestingMsg(false);
-    setTestReply(res.reply);
-    pushToast(res.reply, "success");
+    try {
+      const res = await valetService.sendTestAgentMessage(
+        activeProvider,
+        state.preferences.models.primary
+      );
+      setTestReply(res.reply);
+      pushToast(res.reply, res.ok ? "success" : "warning");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setTestReply(`测试失败：${msg}`);
+      pushToast(msg, "danger");
+    } finally {
+      setTestingMsg(false);
+    }
   };
 
   return (
-    <div className="flex h-full flex-col overflow-y-auto px-16 pt-12 pb-9 lg:px-20">
+    <div className="flex h-full flex-col overflow-x-hidden overflow-y-auto px-16 pt-12 pb-9 lg:px-20">
       <div className="font-mono text-[12px] font-medium uppercase tracking-[0.14em] text-[var(--ink-muted)]">
         Step 04 / 05 — Agent 配置
       </div>
@@ -321,17 +328,17 @@ export const AgentConfigStep: React.FC = () => {
         </div>
 
         {/* Right column: 03 Models */}
-        <div className="flex flex-1 flex-col gap-2">
+        <div className="flex min-w-0 flex-1 flex-col gap-2">
           <div className="font-mono text-[11px] font-medium uppercase tracking-[0.14em] text-[var(--ink-primary)]">
             03 · Models
           </div>
 
-          <div className="flex flex-col rounded-[9px] border border-[var(--border-control)] bg-[var(--bg-canvas)]">
-            <div className="flex h-[42px] items-center gap-2.5 border-b border-[var(--border-light)] px-3">
+          <div className="flex min-w-0 flex-col rounded-[9px] border border-[var(--border-control)] bg-[var(--bg-canvas)]">
+            <div className="flex h-[42px] min-w-0 items-center gap-2.5 border-b border-[var(--border-light)] px-3">
               <span className="w-16 shrink-0 text-[12px] text-[var(--ink-muted)]">
                 主模型
               </span>
-              <div className="flex flex-1 items-center">
+              <div className="flex min-w-0 flex-1 items-center">
                 <SelectMenu
                   value={state.preferences.models.primary}
                   options={modelOptions}
@@ -341,16 +348,16 @@ export const AgentConfigStep: React.FC = () => {
                   triggerClassName="border-0 bg-transparent px-1 font-semibold"
                 />
               </div>
-              <span className="font-mono text-[10px] tracking-[0.08em] text-[var(--ink-muted)]">
+              <span className="shrink-0 font-mono text-[10px] tracking-[0.08em] text-[var(--ink-muted)]">
                 推理·规划
               </span>
             </div>
 
-            <div className="flex h-[42px] items-center gap-2.5 border-b border-[var(--border-light)] px-3">
+            <div className="flex h-[42px] min-w-0 items-center gap-2.5 border-b border-[var(--border-light)] px-3">
               <span className="w-16 shrink-0 text-[12px] text-[var(--ink-muted)]">
                 快速模型
               </span>
-              <div className="flex flex-1 items-center">
+              <div className="flex min-w-0 flex-1 items-center">
                 <SelectMenu
                   value={state.preferences.models.fast}
                   options={modelOptions}
@@ -360,16 +367,16 @@ export const AgentConfigStep: React.FC = () => {
                   triggerClassName="border-0 bg-transparent px-1 font-semibold"
                 />
               </div>
-              <span className="font-mono text-[10px] tracking-[0.08em] text-[var(--ink-muted)]">
+              <span className="shrink-0 font-mono text-[10px] tracking-[0.08em] text-[var(--ink-muted)]">
                 摘要·分类
               </span>
             </div>
 
-            <div className="flex h-[42px] items-center gap-2.5 px-3">
+            <div className="flex h-[42px] min-w-0 items-center gap-2.5 px-3">
               <span className="w-16 shrink-0 text-[12px] text-[var(--ink-muted)]">
                 视觉模型
               </span>
-              <div className="flex flex-1 items-center">
+              <div className="flex min-w-0 flex-1 items-center">
                 <SelectMenu
                   value={state.preferences.models.vision}
                   options={visionOptions}
@@ -378,14 +385,14 @@ export const AgentConfigStep: React.FC = () => {
                   triggerClassName="border-0 bg-transparent px-1 font-semibold"
                 />
               </div>
-              <span className="font-mono text-[10px] tracking-[0.08em] text-[var(--ink-muted)]">
+              <span className="shrink-0 font-mono text-[10px] tracking-[0.08em] text-[var(--ink-muted)]">
                 读屏·定位
               </span>
             </div>
           </div>
 
           {testReply && (
-            <div className="animate-valet-modal-in mt-2 rounded-[9px] border border-[var(--border-base)] bg-[var(--bg-sidebar)] px-3 py-2.5 text-[12px] leading-[18px] text-[var(--ink-secondary)]">
+            <div className="animate-valet-modal-in mt-2 break-words rounded-[9px] border border-[var(--border-base)] bg-[var(--bg-sidebar)] px-3 py-2.5 text-[12px] leading-[18px] text-[var(--ink-secondary)]">
               {testReply}
             </div>
           )}
@@ -394,7 +401,7 @@ export const AgentConfigStep: React.FC = () => {
 
       <div className="flex-1" />
 
-      <div className="mt-5 flex items-center justify-between border-t border-[var(--border-base)] pt-5">
+      <div className="mt-5 flex shrink-0 items-center justify-between border-t border-[var(--border-base)] pt-5">
         <button
           type="button"
           onClick={() => setOnboardingStep(3)}

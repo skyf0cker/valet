@@ -13,7 +13,6 @@ export const ChatView: React.FC = () => {
     sidebarCollapsed,
     createNewChat,
     selectChatThread,
-    updateChatThreadModel,
     sendChatMessage,
     performProcessAction,
     installPluginDraft,
@@ -29,14 +28,6 @@ export const ChatView: React.FC = () => {
     state.chatThreads.find((t) => t.id === state.activeChatId) ?? state.chatThreads[0];
   const activeStream =
     chatStream && thread && chatStream.chatId === thread.id ? chatStream : null;
-
-  const activeProvider =
-    state.providers.find((p) => p.id === state.preferences.activeProviderId) ??
-    state.providers[0];
-
-  const modelOptions = (activeProvider?.models ?? ["claude-opus-4", "claude-haiku-4"]).map(
-    (m) => ({ value: m, label: m })
-  );
 
   // M5 thinking shimmer staggered chip progression
   useEffect(() => {
@@ -84,17 +75,6 @@ export const ChatView: React.FC = () => {
           />
         </div>
 
-        <div className="app-no-drag">
-          <SelectMenu
-            value={thread.model}
-            options={modelOptions}
-            onChange={(val) => updateChatThreadModel(thread.id, val)}
-            mono
-            align="left"
-            triggerClassName="h-[22px] rounded-[6px] border border-[var(--border-light)] bg-[var(--bg-subtle)] px-2 text-[10.5px] lg:h-[24px] lg:text-[11px]"
-          />
-        </div>
-
         <div className="flex-1" />
 
         {thread.timelineActionCount > 0 && (
@@ -138,14 +118,37 @@ export const ChatView: React.FC = () => {
                 <div className="flex max-w-[460px] flex-col items-end gap-1.5">
                   {msg.attachments && msg.attachments.length > 0 && (
                     <div className="flex flex-wrap justify-end gap-1.5">
-                      {msg.attachments.map((att) => (
-                        <span
-                          key={att.id}
-                          className="rounded-[6px] border border-[var(--border-card)] bg-[var(--bg-subtle)] px-2 py-0.5 font-mono text-[10px] text-[var(--ink-muted)]"
-                        >
-                          {att.name}
-                        </span>
-                      ))}
+                      {msg.attachments.map((att) =>
+                        att.dataUrl ? (
+                          <div
+                            key={att.id}
+                            className="flex items-center gap-2 overflow-hidden rounded-[8px] border border-[var(--border-card)] bg-[var(--bg-subtle)] p-1 pr-2.5"
+                          >
+                            <img
+                              src={att.dataUrl}
+                              alt={att.name}
+                              className="h-9 w-14 shrink-0 rounded-[5px] object-cover"
+                            />
+                            <div className="flex flex-col">
+                              <span className="max-w-[140px] truncate text-[11px] font-medium text-[var(--ink-strong)]">
+                                {att.name}
+                              </span>
+                              {att.meta && (
+                                <span className="font-mono text-[9.5px] text-[var(--ink-subtle)]">
+                                  {att.meta}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        ) : (
+                          <span
+                            key={att.id}
+                            className="rounded-[6px] border border-[var(--border-card)] bg-[var(--bg-subtle)] px-2 py-0.5 font-mono text-[10px] text-[var(--ink-muted)]"
+                          >
+                            {att.name}
+                          </span>
+                        )
+                      )}
                     </div>
                   )}
                   <div className="rounded-t-[16px] rounded-bl-[16px] rounded-br-[4px] border border-[var(--border-light)] bg-[var(--bg-elevated)] px-3.5 py-2 text-[13px] leading-[20px] text-[var(--ink-body)] lg:px-[15px] lg:py-[11px] lg:text-[14px] lg:leading-[22px]">
@@ -203,15 +206,32 @@ export const ChatView: React.FC = () => {
 
           {/* M5 Thinking Shimmer State */}
           {sending && (
-            <div className="flex gap-3.5">
-              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] border border-[var(--brand-icon-border)] bg-[var(--brand-icon-bg)] text-[var(--brand-icon-fg)]">
-                <BowtieSvg size={17} />
+            <div className="flex gap-2.5 lg:gap-3.5">
+              <div
+                className={`flex shrink-0 items-center justify-center border border-[var(--brand-icon-border)] bg-[var(--brand-icon-bg)] text-[var(--brand-icon-fg)] ${
+                  sidebarCollapsed
+                    ? "h-6 w-6 rounded-[7px]"
+                    : "h-7 w-7 rounded-[8px]"
+                }`}
+              >
+                <BowtieSvg size={sidebarCollapsed ? 15 : 17} />
               </div>
 
-              <div className="flex flex-1 flex-col gap-2.5 pt-0.5">
-                <div className="valet-shimmer-text w-fit text-[13.5px] font-semibold leading-[18px]">
-                  {activeStream?.thinkingText || "正在分析当前系统状态并调取工具…"}
+              <div className="flex min-w-0 flex-1 flex-col gap-2 lg:gap-2.5">
+                <div className="flex items-baseline gap-2">
+                  <span className="font-[family-name:var(--font-serif-en)] text-[17px] italic leading-[20px] text-[var(--ink-strong)] lg:text-[19px] lg:leading-[24px]">
+                    Valet
+                  </span>
                 </div>
+
+                {(!activeStream?.partialText ||
+                  activeStream?.steps?.some(
+                    (s) => s.status === "running" || s.status === "pending"
+                  )) && (
+                  <div className="valet-shimmer-text max-w-full truncate text-[13.5px] font-semibold leading-[18px]">
+                    {activeStream?.thinkingText || "正在分析当前系统状态并调取工具…"}
+                  </div>
+                )}
 
                 <div className="flex flex-wrap gap-1.5">
                   {activeStream?.steps && activeStream.steps.length > 0 ? (

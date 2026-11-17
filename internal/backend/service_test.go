@@ -352,3 +352,311 @@ func TestLegacyV1MigrationAndProviderVerification(t *testing.T) {
 		t.Fatalf("expected VerifyProvider to return OK=false on HTTP 401, got %+v", failRes)
 	}
 }
+
+func TestProviderModelDiscoveryAndReconciliation(t *testing.T) {
+	tmpRoot := t.TempDir()
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		DataDir:      filepath.Join(tmpRoot, "data"),
+		HomeDir:      filepath.Join(tmpRoot, "home"),
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	defer func() {
+		_ = svc.close()
+	}()
+
+	// 1. OpenRouter: >600KB payload, >60 models, hits /models/user, filters ~aliases & image-only models
+	var openrouterPaths []string
+	orSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openrouterPaths = append(openrouterPaths, r.URL.Path)
+		if r.URL.Path != "/api/v1/models/user" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer sk-or-test" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		type orEntry struct {
+			ID           string         `json:"id"`
+			Description  string         `json:"description"`
+			Architecture map[string]any `json:"architecture"`
+		}
+		var entries []orEntry
+		entries = append(entries,
+			orEntry{ID: "~anthropic/claude-fable-latest", Description: "alias"},
+			orEntry{ID: "black-forest-labs/flux.2-pro", Description: "image", Architecture: map[string]any{"output_modalities": []string{"image"}}},
+		)
+		bigPad := strings.Repeat("context ", 1200) // ~9.6KB per item -> >600KB total for 70 items
+		for i := 0; i < 65; i++ {
+			entries = append(entries, orEntry{
+				ID:           "provider/model-" + strings.ReplaceAll(strings.TrimSpace(time.Duration(i).String()), "ns", ""),
+				Description:  bigPad,
+				Architecture: map[string]any{"output_modalities": []string{"text"}},
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": entries})
+	}))
+	defer orSrv.Close()
+
+	orRes, err := svc.VerifyProvider(context.Background(), types.AgentProviderConfig{
+		ID:      "openrouter",
+		APIKey:  "sk-or-test",
+		BaseURL: orSrv.URL + "/api/v1",
+	})
+	if err != nil {
+		t.Fatalf("VerifyProvider(openrouter) error: %v", err)
+	}
+	if !orRes.OK {
+		t.Fatalf("expected OpenRouter verify OK=true, got %+v", orRes)
+	}
+	if len(openrouterPaths) == 0 || openrouterPaths[0] != "/api/v1/models/user" {
+		t.Fatalf("expected OpenRouter to hit /api/v1/models/user, got %v", openrouterPaths)
+	}
+	if len(orRes.Models) != 65 {
+		t.Fatalf("expected all 65 text models without 512KB/40-model truncation, got %d", len(orRes.Models))
+	}
+
+	// 2. Anthropic without /v1 suffix hits /v1/models with x-api-key
+	var anthPath, anthKey string
+	anthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		anthPath = r.URL.Path
+		anthKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"claude-sonnet-4-5"},{"id":"claude-haiku-4-5"}]}`))
+	}))
+	defer anthSrv.Close()
+
+	anthRes, err := svc.VerifyProvider(context.Background(), types.AgentProviderConfig{
+		ID:      "anthropic",
+		APIKey:  "sk-ant-test",
+		BaseURL: anthSrv.URL,
+	})
+	if err != nil || !anthRes.OK || anthPath != "/v1/models" || anthKey != "sk-ant-test" || len(anthRes.Models) != 2 {
+		t.Fatalf("unexpected Anthropic verify result: res=%+v path=%s key=%s err=%v", anthRes, anthPath, anthKey, err)
+	}
+
+	// 3. Gemini without /v1beta suffix hits /v1beta/models and filters generateContent
+	var gemPath string
+	gemSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gemPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[{"name":"models/gemini-2.5-pro","supportedGenerationMethods":["generateContent"]},{"name":"models/text-embedding-004","supportedGenerationMethods":["embedContent"]}]}`))
+	}))
+	defer gemSrv.Close()
+
+	gemRes, err := svc.VerifyProvider(context.Background(), types.AgentProviderConfig{
+		ID:      "gemini",
+		APIKey:  "AIzaTest",
+		BaseURL: gemSrv.URL,
+	})
+	if err != nil || !gemRes.OK || gemPath != "/v1beta/models" || len(gemRes.Models) != 1 || gemRes.Models[0] != "gemini-2.5-pro" {
+		t.Fatalf("unexpected Gemini verify result: res=%+v path=%s err=%v", gemRes, gemPath, err)
+	}
+
+	// 4. Ollama without scheme hits /api/tags
+	var ollamaPath string
+	olSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ollamaPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[{"name":"qwen3:32b"},{"name":"llama3.3:70b"}]}`))
+	}))
+	defer olSrv.Close()
+
+	olRes, err := svc.VerifyProvider(context.Background(), types.AgentProviderConfig{
+		ID:      "ollama",
+		BaseURL: strings.TrimPrefix(olSrv.URL, "http://"),
+	})
+	if err != nil || !olRes.OK || ollamaPath != "/api/tags" || len(olRes.Models) != 2 {
+		t.Fatalf("unexpected Ollama verify result: res=%+v path=%s err=%v", olRes, ollamaPath, err)
+	}
+
+	// 5. SelectProvider & UpdateProvider reconcile Preferences.Models and stale ChatThreads
+	selSnap, err := svc.SelectProvider("openrouter")
+	if err != nil {
+		t.Fatalf("SelectProvider(openrouter) failed: %v", err)
+	}
+	if selSnap.Preferences.Models.Primary != "anthropic/claude-sonnet-4.5" {
+		t.Fatalf("expected reconciled OpenRouter primary model, got %q", selSnap.Preferences.Models.Primary)
+	}
+	if len(selSnap.ChatThreads) == 0 || selSnap.ChatThreads[0].Model != selSnap.Preferences.Models.Primary {
+		t.Fatalf("expected ChatThread model synced to active provider model, got %+v", selSnap.ChatThreads)
+	}
+
+	// Now update openrouter with discovered models -> primary & chat thread update atomically
+	var updatedOR types.AgentProviderConfig
+	for _, p := range selSnap.Providers {
+		if p.ID == "openrouter" {
+			updatedOR = p
+			break
+		}
+	}
+	updatedOR.Models = []string{"openrouter/tencent/hy4", "google/gemini-2.5-flash"}
+	updatedOR.Verified = true
+	updatedOR.Connected = true
+	updSnap, err := svc.UpdateProvider("openrouter", updatedOR)
+	if err != nil {
+		t.Fatalf("UpdateProvider failed: %v", err)
+	}
+	if updSnap.Preferences.Models.Primary != "openrouter/tencent/hy4" ||
+		updSnap.Preferences.Models.Fast != "google/gemini-2.5-flash" ||
+		updSnap.ChatThreads[0].Model != "openrouter/tencent/hy4" {
+		t.Fatalf("expected UpdateProvider to reconcile models & chat threads, got prefs=%+v thread=%q",
+			updSnap.Preferences.Models, updSnap.ChatThreads[0].Model)
+	}
+}
+
+func TestTrashApprovalAndModelSync(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	downloadsDir := filepath.Join(homeDir, "Downloads")
+	trashVault := filepath.Join(tmpRoot, "os-trash")
+	if err := os.MkdirAll(downloadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(trashVault, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	freshDMG := filepath.Join(downloadsDir, "fresh-installer.dmg")
+	if err := os.WriteFile(freshDMG, make([]byte, 2*1024*1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. ScanDisk with idleDays=0 finds freshly created Downloads files, and ExpandHome resolves bare/relative Downloads paths.
+	report := sys.ScanDisk(homeDir, []string{"~/Projects"}, 1, 0)
+	foundFresh := false
+	for _, item := range report.Items {
+		if strings.Contains(item.Path, "fresh-installer.dmg") {
+			foundFresh = true
+			break
+		}
+	}
+	if !foundFresh {
+		t.Fatalf("expected ScanDisk(..., idleDays=0) to include fresh-installer.dmg, got %+v", report.Items)
+	}
+	if got := sys.ExpandHome("fresh-installer.dmg", homeDir); got != freshDMG {
+		t.Fatalf("expected ExpandHome(bare filename) -> %q, got %q", freshDMG, got)
+	}
+	if got := sys.ExpandHome("Downloads/fresh-installer.dmg", homeDir); got != freshDMG {
+		t.Fatalf("expected ExpandHome(relative Downloads) -> %q, got %q", freshDMG, got)
+	}
+
+	// 2. Non-nil mover must return an explicit error instead of simulating when target is missing.
+	realMover := func(absPath, _ string) (string, error) {
+		dest := filepath.Join(trashVault, filepath.Base(absPath))
+		if err := os.Rename(absPath, dest); err != nil {
+			return "", err
+		}
+		return dest, nil
+	}
+	if _, _, _, err := sys.MoveItemsToTrash(homeDir, dataDir, nil, []string{"~/Downloads/does-not-exist.dmg"}, 0.1, realMover); err == nil {
+		t.Fatalf("expected error from MoveItemsToTrash with non-nil mover for missing path")
+	}
+
+	// 3. ApproveInboxItem in DesktopReady mode rejects empty-path cards and really moves files when bound.
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		DataDir:      dataDir,
+		HomeDir:      homeDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	defer func() {
+		if err := svc.close(); err != nil {
+			t.Errorf("close error: %v", err)
+		}
+	}()
+
+	svc.mu.Lock()
+	svc.opts.DesktopReady = true
+	svc.trashMover = realMover
+	svc.mu.Unlock()
+
+	svc.store.Update(func(st *types.ValetSnapshot) {
+		st.InboxItems = []types.InboxApprovalItem{
+			{
+				ID:           "inbox-empty",
+				PluginID:     "disk-guard",
+				PluginName:   "磁盘守卫",
+				Category:     "files",
+				Title:        "空路径旧审批卡",
+				Status:       "pending",
+				Reversible7d: true,
+				ToolName:     "disk_move_to_trash",
+				ActionItems:  nil,
+			},
+			{
+				ID:            "inbox-real",
+				PluginID:      "disk-guard",
+				PluginName:    "磁盘守卫",
+				Category:      "files",
+				Title:         "清理 fresh-installer.dmg",
+				Status:        "pending",
+				Reversible7d:  true,
+				ReclaimableGB: 0.1,
+				ToolName:      "disk_move_to_trash",
+				ActionItems: []types.TimelineActionItem{
+					{
+						ID:        "a1",
+						Label:     "fresh-installer.dmg",
+						Path:      "fresh-installer.dmg",
+						SizeMB:    2,
+						SizeLabel: "2.0 MB",
+						Checked:   true,
+					},
+				},
+			},
+		}
+	})
+
+	if _, err := svc.ApproveInboxItem(context.Background(), "inbox-empty"); err == nil {
+		t.Fatalf("expected DesktopReady ApproveInboxItem to reject empty-path file approval")
+	}
+
+	if _, err := svc.ApproveInboxItem(context.Background(), "inbox-real"); err != nil {
+		t.Fatalf("ApproveInboxItem(inbox-real) failed: %v", err)
+	}
+	if _, statErr := os.Stat(freshDMG); !os.IsNotExist(statErr) {
+		t.Fatalf("expected %s to be moved out of Downloads, statErr=%v", freshDMG, statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(trashVault, "fresh-installer.dmg")); statErr != nil {
+		t.Fatalf("expected file in mock OS Trash vault, statErr=%v", statErr)
+	}
+
+	// 4. UpdateModels keeps ChatThreads[i].Model synced with Preferences.Models.Primary.
+	nextSnap, err := svc.UpdateModels(types.ModelSelection{
+		Primary: "claude-haiku-4-5",
+		Fast:    "claude-haiku-4-5",
+		Vision:  "同主模型",
+	})
+	if err != nil {
+		t.Fatalf("UpdateModels failed: %v", err)
+	}
+	if len(nextSnap.ChatThreads) == 0 || nextSnap.ChatThreads[0].Model != "claude-haiku-4-5" {
+		t.Fatalf("expected ChatThreads[0].Model synced to Primary model, got %+v", nextSnap.ChatThreads)
+	}
+
+	if _, err := svc.SelectProvider("openrouter"); err != nil {
+		t.Fatalf("SelectProvider(openrouter) failed: %v", err)
+	}
+	orSnap, err := svc.UpdateModels(types.ModelSelection{
+		Primary: "openai/gpt-4.1",
+		Fast:    "google/gemini-2.5-pro",
+		Vision:  "anthropic/claude-sonnet-4.5",
+	})
+	if err != nil {
+		t.Fatalf("UpdateModels(openrouter) failed: %v", err)
+	}
+	if orSnap.Preferences.Models.Primary != "openai/gpt-4.1" || orSnap.ChatThreads[0].Model != "openai/gpt-4.1" {
+		t.Fatalf("expected OpenRouter primary & ChatThread synced to openai/gpt-4.1, got prefs=%+v thread=%q",
+			orSnap.Preferences.Models, orSnap.ChatThreads[0].Model)
+	}
+}

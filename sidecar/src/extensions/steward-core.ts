@@ -4,7 +4,7 @@ import {
   defineTool,
   section,
 } from "@earendil-works/pi-durable";
-import { bool, obj, opt, str } from "@earendil-works/pi-schema";
+import { arr, bool, num, obj, opt, str } from "@earendil-works/pi-schema";
 import type { ToolPolicyRegistry, TurnSideEffectTracker } from "../approval.ts";
 import type {
   HostBridge,
@@ -205,33 +205,85 @@ export function createStewardCoreExtension(options: {
   const inboxProposeApprovalTool = defineTool({
     name: "inbox_propose_approval",
     description:
-      "Queue an explicit human approval card in Valet Inbox before touching user files or sending external messages.",
+      "Queue an explicit human approval card in Valet Inbox before touching user files or sending external messages. Prefer calling action tools such as disk_move_to_trash or app_trash_remnants directly (they automatically queue Inbox cards when confirmation is required). For file actions, you MUST supply a non-empty paths array of concrete filesystem paths.",
     parameters: obj({
       pluginId: opt(str()),
       title: str(),
       summary: str(),
       category: opt(str()),
       reversible7d: opt(bool()),
+      paths: opt(arr(str())),
+      estimatedGB: opt(num()),
     }),
     execute: async (args, api) => {
+      const category =
+        args.category === "process" || args.category === "outbound"
+          ? args.category
+          : "files";
+      const cleanPaths = Array.isArray(args.paths)
+        ? args.paths.map((p) => String(p).trim()).filter(Boolean)
+        : [];
+      if (category === "files" && cleanPaths.length === 0) {
+        return {
+          output: [
+            {
+              type: "text" as const,
+              text: "提交文件清理审批失败：必须提供非空的 paths 文件路径列表，或直接调用 disk_move_to_trash / app_trash_remnants 并传入具体 paths。",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const estimatedGB =
+        typeof args.estimatedGB === "number" && Number.isFinite(args.estimatedGB)
+          ? args.estimatedGB
+          : undefined;
+      const pluginId = args.pluginId ?? "disk-guard";
+      const pluginName =
+        pluginId === "app-uninstaller" ? "卸载清理助手" : "磁盘守卫";
+      const toolName =
+        category === "files"
+          ? pluginId === "app-uninstaller"
+            ? "app_trash_remnants"
+            : "disk_move_to_trash"
+          : "plugin_noop";
+
+      const actionItems = cleanPaths.map((p, idx) => ({
+        id: `propose-${Date.now()}-${idx + 1}`,
+        label: p,
+        path: p,
+        sizeMB:
+          estimatedGB && estimatedGB > 0
+            ? Math.round(((estimatedGB * 1024) / cleanPaths.length) * 10) / 10
+            : 0,
+        sizeLabel:
+          cleanPaths.length === 1 && estimatedGB && estimatedGB > 0
+            ? `${estimatedGB} GB`
+            : "待确认项目",
+        checked: true,
+      }));
+
       const req: QueueApprovalParams = {
-        pluginId: args.pluginId ?? "disk-guard",
-        pluginName: "磁盘守卫",
-        eventCode: "disk.large_file",
-        category:
-          args.category === "process" || args.category === "outbound"
-            ? args.category
-            : "files",
+        pluginId,
+        pluginName,
+        eventCode:
+          pluginId === "app-uninstaller" ? "app.orphan_found" : "disk.large_file",
+        category,
         iconKind: "disk",
         title: args.title,
         summary: args.summary,
         reasoning: args.summary,
         reversible7d: args.reversible7d ?? true,
+        reclaimableGB: estimatedGB,
         approveLabel: "批准执行",
         dismissLabel: "忽略",
-        toolName: "disk_move_to_trash",
-        toolArgs: {},
-        actionItems: [],
+        toolName,
+        toolArgs:
+          cleanPaths.length > 0
+            ? { paths: cleanPaths, ...(estimatedGB ? { estimatedGB } : {}) }
+            : {},
+        actionItems,
       };
       const queued = await bridge.callHost<{
         inboxId: string;
@@ -276,7 +328,7 @@ export function createStewardCoreExtension(options: {
           `当前安全自主级别：${s.preferences.autonomyLevel}`,
           `受保护路径（严禁改动）：${s.preferences.cleanupPolicy.protectedDirs.join(", ")}`,
           `严禁触碰的应用：${s.preferences.blockedApps.join(", ")}`,
-          "规则：清理文件优先移入废纸篓并支持 7 天还原；遇到需用户批准的操作时，触发工具并引导用户前往「收件箱」拍板。",
+          "规则：清理文件优先移入废纸篓并支持 7 天还原；需要删除或清理文件时，请直接调用对应工具（如 disk_move_to_trash / app_trash_remnants）并传入完整 paths，安全拦截会自动把待批事项推入「收件箱」；若使用 inbox_propose_approval，必须传入具体的 paths 路径列表。",
         ].join("\n");
       }),
       section("valet_memories", () => {

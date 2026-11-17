@@ -255,11 +255,23 @@ type PluginDraftSpec struct {
 
 // ChatAttachment represents a file, image, or screen attachment on a message.
 type ChatAttachment struct {
-	ID    string `json:"id"`
-	Kind  string `json:"kind"` // "image" | "file" | "screen"
-	Name  string `json:"name"`
-	Meta  string `json:"meta,omitempty"`
-	Badge string `json:"badge,omitempty"`
+	ID          string `json:"id"`
+	Kind        string `json:"kind"` // "image" | "file" | "screen"
+	Name        string `json:"name"`
+	Meta        string `json:"meta,omitempty"`
+	Badge       string `json:"badge,omitempty"`
+	Path        string `json:"path,omitempty"`
+	DataURL     string `json:"dataUrl,omitempty"`
+	MimeType    string `json:"mimeType,omitempty"`
+	TextExcerpt string `json:"textExcerpt,omitempty"`
+}
+
+// ScreenCaptureResult reports the outcome of a native macOS screen capture request.
+type ScreenCaptureResult struct {
+	OK               bool            `json:"ok"`
+	PermissionDenied bool            `json:"permissionDenied,omitempty"`
+	Error            string          `json:"error,omitempty"`
+	Attachment       *ChatAttachment `json:"attachment,omitempty"`
 }
 
 // ChatMessage stores one message inside a chat thread.

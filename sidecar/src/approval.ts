@@ -177,7 +177,9 @@ export function evaluateToolPolicy(
   }
 
   if (
-    (meta.checklistKey === "sendMessageOrEmail" ||
+    ((meta.checklistKey === "deleteOrOverwrite" &&
+      (meta.safety !== "reversible" || eventPolicy !== "auto")) ||
+      meta.checklistKey === "sendMessageOrEmail" ||
       meta.checklistKey === "runTerminalCommand" ||
       meta.checklistKey === "paymentOrSubscription" ||
       meta.checklistKey === "modifySystemSettings") &&

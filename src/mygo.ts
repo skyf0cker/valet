@@ -41,6 +41,10 @@ export interface ChatAttachment {
   name: string;
   meta?: string;
   badge?: string;
+  path?: string;
+  dataUrl?: string;
+  mimeType?: string;
+  textExcerpt?: string;
 }
 
 export interface ChatMessage {
@@ -315,6 +319,13 @@ export interface ScanTaskItem {
   durationHint?: string;
 }
 
+export interface ScreenCaptureResult {
+  ok: boolean;
+  permissionDenied?: boolean;
+  error?: string;
+  attachment?: ChatAttachment;
+}
+
 export interface SendChatParams {
   chatId: string;
   prompt: string;
@@ -518,6 +529,13 @@ export const Valet = {
   approveInboxItem(itemID: string): Promise<ValetSnapshot> {
     return call("Valet.ApproveInboxItem", itemID);
   },
+  /**
+   * CaptureCurrentScreen verifies Screen Recording access, captures a bounded screenshot on macOS,
+   * and syncs the updated permission state.
+   */
+  captureCurrentScreen(): Promise<ScreenCaptureResult> {
+    return call("Valet.CaptureCurrentScreen");
+  },
   /** CheckPermissions probes real macOS privacy permissions via MyGo / permissionflow. */
   checkPermissions(): Promise<ValetSnapshot> {
     return call("Valet.CheckPermissions");
@@ -626,7 +644,7 @@ export const Valet = {
   runFirstScan(): Promise<ValetSnapshot> {
     return call("Valet.RunFirstScan");
   },
-  /** SelectProvider changes the active LLM provider ID. */
+  /** SelectProvider changes the active LLM provider ID and reconciles active model selections. */
   selectProvider(providerID: string): Promise<ValetSnapshot> {
     return call("Valet.SelectProvider", providerID);
   },

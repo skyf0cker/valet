@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   fauxAssistantMessage,
+  fauxThinking,
   fauxToolCall,
 } from "@earendil-works/pi-ai";
 import { evaluateToolPolicy } from "../approval.ts";
@@ -522,6 +523,231 @@ rl.on("line", (line) => {
       model: "claude-opus-4",
     });
     expect(disabledCleanRes.replyMessage.content).toContain("停用");
+
+    await rt.close();
+  });
+
+  it("registers dynamic models for openrouter/openai-compat/anthropic/gemini and never leaks raw thinking to chatStream or replies", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-models-"));
+    tempDirs.push(dir);
+    const dbPath = join(dir, "pi-agent.sqlite");
+    const bridge = new FakeHostBridge();
+    const state = makeBaseState(dir);
+    state.providers = [
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        apiKey: "sk-or-live-test-key",
+        baseUrl: "https://openrouter.ai/api/v1",
+        endpoint: "",
+        verified: true,
+        models: ["openrouter/tencent/hy4", "deepseek/deepseek-r1"],
+        connected: true,
+      },
+      {
+        id: "openai",
+        name: "OpenAI",
+        apiKey: "sk-custom-gw-key",
+        baseUrl: "https://my-gateway.example.com",
+        endpoint: "",
+        verified: true,
+        models: ["my-custom-gpt"],
+        connected: true,
+      },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        apiKey: "sk-ant-live-test-key",
+        baseUrl: "https://anthropic-proxy.example.com/v1",
+        endpoint: "",
+        verified: true,
+        models: ["claude-sonnet-4-5", "custom-claude-alias"],
+        connected: true,
+      },
+      {
+        id: "gemini",
+        name: "Google Gemini",
+        apiKey: "AIzaSyLiveKey123",
+        baseUrl: "https://generativelanguage.googleapis.com",
+        endpoint: "",
+        verified: true,
+        models: ["models/gemini-2.5-pro", "gemini-custom-preview"],
+        connected: true,
+      },
+    ];
+
+    const rt = new ValetDurableRuntime(bridge);
+    await rt.init({ dbPath, state });
+
+    // OpenRouter registers discovered models on openai-completions and excludes ~* aliases
+    const orModels = rt.models.models.getModels("openrouter");
+    expect(orModels.some((m) => m.id.startsWith("~"))).toBe(false);
+    const hy4 = orModels.find((m) => m.id === "openrouter/tencent/hy4");
+    expect(hy4).toBeDefined();
+    expect(hy4?.api).toBe("openai-completions");
+    const resolvedOR = rt.models.resolveModelRef("openrouter/tencent/hy4", {
+      ...state,
+      preferences: { ...state.preferences, activeProviderId: "openrouter" },
+    });
+    expect(resolvedOR.usingLocalFallback).toBe(false);
+    expect(resolvedOR.ref).toEqual({
+      provider: "openrouter",
+      modelId: "openrouter/tencent/hy4",
+    });
+
+    // OpenAI custom gateway uses openai-completions + /v1 and registers discovered models
+    const oaModel = rt.models.models.getModel("openai", "my-custom-gpt");
+    expect(oaModel?.api).toBe("openai-completions");
+    expect(oaModel?.baseUrl).toBe("https://my-gateway.example.com/v1");
+
+    // Anthropic strips /v1 so SDK appends /v1/messages cleanly & keeps custom model
+    const antModel = rt.models.models.getModel("anthropic", "custom-claude-alias");
+    expect(antModel?.baseUrl).toBe("https://anthropic-proxy.example.com");
+
+    // Gemini appends /v1beta and strips models/ prefix
+    const gemModel = rt.models.models.getModel("google", "gemini-2.5-pro");
+    expect(gemModel?.baseUrl).toBe("https://generativelanguage.googleapis.com/v1beta");
+    expect(rt.models.models.getModel("google", "gemini-custom-preview")).toBeDefined();
+
+    // Switch back to mock key so sendChat uses local faux steward script to test thinking/tag stripping
+    await rt.syncState({
+      ...state,
+      providers: state.providers.map((p) =>
+        p.id === "anthropic" ? { ...p, apiKey: "sk-ant-api03-mock-test" } : p,
+      ),
+    });
+
+    // Ensure raw thinking monologue & <think> tags never leak to chatStream or replyMessage
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage([
+          fauxThinking(
+            "PRIVATE_MONOLOGUE_SHOULD_NOT_LEAK New files found: 163+163+159=485 let me compute internally",
+          ),
+          {
+            type: "text",
+            text: "<think>INTERNAL_TAG_THINKING_SHOULD_BE_STRIPPED</think>\n扫描完成，共发现 3 项可清理目标。",
+          },
+        ]),
+    ]);
+
+    const chatRes = await rt.sendChat({
+      chatId: "chat-no-leak",
+      prompt: "检查一下",
+      model: "claude-opus-4",
+    });
+    expect(chatRes.replyMessage.content).toBe("扫描完成，共发现 3 项可清理目标。");
+    expect(chatRes.replyMessage.content).not.toContain("INTERNAL_TAG_THINKING");
+    expect(chatRes.replyMessage.content).not.toContain("PRIVATE_MONOLOGUE");
+
+    for (const evt of bridge.streamEvents as Array<{
+      thinkingText?: string;
+      partialText?: string;
+    }>) {
+      if (evt.thinkingText) {
+        expect(evt.thinkingText).not.toContain("PRIVATE_MONOLOGUE");
+      }
+      if (evt.partialText) {
+        expect(evt.partialText).not.toContain("INTERNAL_TAG_THINKING");
+      }
+    }
+
+    await rt.close();
+  });
+
+  it("enforces concrete paths in inbox_propose_approval and delivers multimodal image blocks for screen attachments", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-rt-inbox-screen-"));
+    tempDirs.push(dir);
+
+    const bridge = new FakeHostBridge();
+    const state = makeBaseState(dir);
+    const rt = new ValetDurableRuntime(bridge);
+    await rt.init({ dbPath: join(dir, "pi.sqlite"), state });
+
+    let invalidToolError = false;
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("inbox_propose_approval", {
+              title: "无路径提案",
+              summary: "未传路径的提案应被拒绝",
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      (ctx) => {
+        const lastTool = [...ctx.messages]
+          .reverse()
+          .find((m) => m.role === "toolResult");
+        if (lastTool?.role === "toolResult") {
+          invalidToolError = Boolean(lastTool.isError);
+        }
+        return fauxAssistantMessage(
+          [
+            fauxToolCall("inbox_propose_approval", {
+              title: "删除测试安装包",
+              summary: "包含完整路径的文件清理提案",
+              paths: ["/Users/testuser/Downloads/demo.dmg"],
+              estimatedGB: 0.4,
+            }),
+          ],
+          { stopReason: "toolUse" },
+        );
+      },
+      () => fauxAssistantMessage("已将具体文件清理提案推入收件箱。"),
+    ]);
+
+    const res1 = await rt.sendChat({
+      chatId: "chat-propose-1",
+      prompt: "提交清理审批",
+      model: "claude-opus-4",
+    });
+    expect(res1.replyMessage.content).toContain("收件箱");
+    expect(invalidToolError).toBe(true);
+    expect(bridge.queued.length).toBe(1);
+    expect(bridge.queued[0]?.actionItems.length).toBe(1);
+    expect(bridge.queued[0]?.actionItems[0]?.path).toBe("/Users/testuser/Downloads/demo.dmg");
+    expect(bridge.queued[0]?.toolArgs.paths).toEqual(["/Users/testuser/Downloads/demo.dmg"]);
+
+    let receivedImageBlock = false;
+    rt.models.setLocalStewardScript([
+      (ctx) => {
+        const lastUser = [...ctx.messages]
+          .reverse()
+          .find((m) => m.role === "user");
+        if (lastUser?.role === "user" && Array.isArray(lastUser.content)) {
+          receivedImageBlock = lastUser.content.some(
+            (b) =>
+              b.type === "image" &&
+              b.mimeType === "image/png" &&
+              b.data.length > 10,
+          );
+        }
+        return fauxAssistantMessage("已收到并分析你附加的屏幕截图。");
+      },
+    ]);
+
+    const tinyPng =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const res2 = await rt.sendChat({
+      chatId: "chat-screen-1",
+      prompt: "请看下当前屏幕",
+      model: "claude-opus-4",
+      attachments: [
+        {
+          id: "scr-1",
+          kind: "screen",
+          name: "当前屏幕.png",
+          meta: "1×1 · 1 KB",
+          badge: "SCR",
+          dataUrl: tinyPng,
+          mimeType: "image/png",
+        },
+      ],
+    });
+    expect(receivedImageBlock).toBe(true);
+    expect(res2.replyMessage.content).toContain("屏幕截图");
 
     await rt.close();
   });

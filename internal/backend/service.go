@@ -1146,31 +1146,61 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 	checkedPaths := make([]string, 0, len(target.ActionItems))
 	for _, a := range target.ActionItems {
 		if a.Checked && strings.TrimSpace(a.Path) != "" {
-			checkedPaths = append(checkedPaths, a.Path)
+			checkedPaths = append(checkedPaths, strings.TrimSpace(a.Path))
 		}
+	}
+	if len(target.ActionItems) == 0 {
+		checkedPaths = extractTargetPaths(target.ToolArgs)
+		if len(checkedPaths) == 0 {
+			checkedPaths = extractTargetPaths(target.Payload)
+		}
+	}
+
+	activeMover := s.trashMover
+	if snap.Preferences.CleanupPolicy.DeleteMethod == "安全移出到隔离区" {
+		activeMover = nil
 	}
 
 	batchID := ""
 	reclaimed := target.ReclaimableGB
 
 	switch {
+	case target.ToolName == "disk_empty_trash":
+		if s.client != nil {
+			_ = s.client.Call(ctx, "tool.executeApproved", sidecar.ExecuteApprovedRequest{
+				InboxID:      target.ID,
+				ToolName:     target.ToolName,
+				ToolArgs:     target.ToolArgs,
+				CheckedPaths: checkedPaths,
+			}, nil)
+		}
 	case target.Category == "files" || strings.Contains(target.ToolName, "trash"):
-		if len(checkedPaths) > 0 {
-			bID, _, realReclaimed, err := sys.MoveItemsToTrash(
-				s.opts.HomeDir,
-				s.opts.DataDir,
-				snap.Preferences.CleanupPolicy.ProtectedDirs,
-				checkedPaths,
-				reclaimed,
-				s.trashMover,
-			)
-			if err != nil {
-				return snap, err
+		if len(checkedPaths) == 0 {
+			if s.opts.DesktopReady {
+				if len(target.ActionItems) == 0 {
+					return snap, errors.New("该审批卡片未绑定具体文件路径（旧卡片无可执行目标），请忽略此卡并在对话中重新扫描清理")
+				}
+				return snap, errors.New("请至少勾选一项要清理的文件，或点击忽略")
 			}
-			batchID = bID
-			if realReclaimed > 0 {
-				reclaimed = realReclaimed
-			}
+			break
+		}
+		bID, movedCount, realReclaimed, err := sys.MoveItemsToTrash(
+			s.opts.HomeDir,
+			s.opts.DataDir,
+			snap.Preferences.CleanupPolicy.ProtectedDirs,
+			checkedPaths,
+			reclaimed,
+			activeMover,
+		)
+		if err != nil {
+			return snap, err
+		}
+		if s.opts.DesktopReady && movedCount == 0 {
+			return snap, errors.New("没有文件被实际移出，请检查目标路径是否存在")
+		}
+		batchID = bID
+		if realReclaimed > 0 {
+			reclaimed = realReclaimed
 		}
 	case target.ToolName == "process_terminate":
 		if rawPID, ok := target.Payload["pid"]; ok {
@@ -1189,7 +1219,7 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 	}
 
 	nowHHMM := time.Now().Format("15:04")
-	return s.store.Update(func(st *types.ValetSnapshot) {
+	nextSnap := s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.InboxItems {
 			if st.InboxItems[i].ID == itemID {
 				st.InboxItems[i].Status = "approved"
@@ -1226,7 +1256,45 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 				ReclaimedGB: reclaimed, CanRestore: target.Reversible7d, TrashBatchID: batchID,
 			}}, st.TimelineEvents...)
 		}
-	}), nil
+	})
+	if batchID != "" && s.opts.DesktopReady {
+		s.refreshHostMetrics()
+		nextSnap = s.store.Snapshot()
+	}
+	return nextSnap, nil
+}
+
+func extractTargetPaths(m map[string]any) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	var out []string
+	appendPath := func(s string) {
+		trimmed := strings.TrimSpace(s)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	if rawPaths, ok := m["paths"]; ok {
+		switch v := rawPaths.(type) {
+		case []string:
+			for _, p := range v {
+				appendPath(p)
+			}
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					appendPath(s)
+				}
+			}
+		}
+	}
+	for _, key := range []string{"path", "target"} {
+		if s, ok := m[key].(string); ok {
+			appendPath(s)
+		}
+	}
+	return out
 }
 
 // DismissInboxItem rejects an Inbox item without touching files or processes.
@@ -1372,22 +1440,40 @@ func (s *Service) ExecuteTimelineEvent(ctx context.Context, eventID string) (typ
 	checked := []string{}
 	for _, a := range target.ActionItems {
 		if a.Checked && strings.TrimSpace(a.Path) != "" {
-			checked = append(checked, a.Path)
+			checked = append(checked, strings.TrimSpace(a.Path))
 		}
 	}
+	if len(target.ActionItems) == 0 {
+		checked = extractTargetPaths(target.Payload)
+	}
+	if len(checked) == 0 && s.opts.DesktopReady {
+		if len(target.ActionItems) == 0 {
+			return snap, errors.New("该时间线事件未绑定具体文件路径，无法执行清理")
+		}
+		return snap, errors.New("请至少勾选一项要移入废纸篓的文件")
+	}
+
+	activeMover := s.trashMover
+	if snap.Preferences.CleanupPolicy.DeleteMethod == "安全移出到隔离区" {
+		activeMover = nil
+	}
+
 	batchID := ""
 	reclaimed := computeCheckedGB(target.ActionItems, target.ReclaimedGB)
 	if len(checked) > 0 {
-		bID, _, realReclaimed, err := sys.MoveItemsToTrash(
+		bID, movedCount, realReclaimed, err := sys.MoveItemsToTrash(
 			s.opts.HomeDir,
 			s.opts.DataDir,
 			snap.Preferences.CleanupPolicy.ProtectedDirs,
 			checked,
 			reclaimed,
-			s.trashMover,
+			activeMover,
 		)
 		if err != nil {
 			return snap, err
+		}
+		if s.opts.DesktopReady && movedCount == 0 {
+			return snap, errors.New("没有文件被实际移出，请检查目标路径是否存在")
 		}
 		batchID = bID
 		if realReclaimed > 0 {
@@ -1395,7 +1481,7 @@ func (s *Service) ExecuteTimelineEvent(ctx context.Context, eventID string) (typ
 		}
 	}
 
-	return s.store.Update(func(st *types.ValetSnapshot) {
+	nextSnap := s.store.Update(func(st *types.ValetSnapshot) {
 		st.SelectedTimelineEventID = nil
 		for i := range st.TimelineEvents {
 			if st.TimelineEvents[i].ID == eventID {
@@ -1406,7 +1492,12 @@ func (s *Service) ExecuteTimelineEvent(ctx context.Context, eventID string) (typ
 				st.TimelineEvents[i].Summary = "已按你的确认移入废纸篓（7 天内可还原）。"
 			}
 		}
-	}), nil
+	})
+	if batchID != "" && s.opts.DesktopReady {
+		s.refreshHostMetrics()
+		nextSnap = s.store.Snapshot()
+	}
+	return nextSnap, nil
 }
 
 // IgnoreTimelineEvent dismisses a pending Timeline confirmation event.
@@ -1777,13 +1868,19 @@ func (s *Service) dispatchPluginEventInternal(
 
 // --- Providers, Preferences & System ---
 
-// SelectProvider changes the active LLM provider ID.
+// SelectProvider changes the active LLM provider ID and reconciles active model selections.
 func (s *Service) SelectProvider(providerID string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		st.Preferences.ActiveProviderID = providerID
+		for i := range st.Providers {
+			if st.Providers[i].ID == providerID {
+				st.Providers[i].Connected = st.Providers[i].Verified || st.Providers[i].ID == "ollama"
+			}
+		}
+		reconcileActiveProviderModels(st, providerID)
 	})
 	s.syncRuntime(next)
 	return next, nil
@@ -1812,6 +1909,9 @@ func (s *Service) UpdateProvider(providerID string, patch types.AgentProviderCon
 				st.Providers[i] = patch
 			}
 		}
+		if st.Preferences.ActiveProviderID == providerID {
+			reconcileActiveProviderModels(st, providerID)
+		}
 	})
 	s.syncRuntime(next)
 	return next, nil
@@ -1820,120 +1920,105 @@ func (s *Service) UpdateProvider(providerID string, patch types.AgentProviderCon
 // VerifyProvider performs real HTTP endpoint discovery and credential validation against the configured provider.
 func (s *Service) VerifyProvider(ctx context.Context, provider types.AgentProviderConfig) (types.ProviderVerifyResult, error) {
 	start := time.Now()
-	client, err := buildHTTPClient(provider.ProxyURL, 6*time.Second)
+	client, err := buildHTTPClient(provider.ProxyURL, 15*time.Second)
 	if err != nil {
 		return types.ProviderVerifyResult{OK: false, Message: "代理地址格式无效: " + err.Error()}, nil
 	}
 
 	key := strings.TrimSpace(provider.APIKey)
-	base := strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
-	if base == "" {
-		base = strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+	rawBase := strings.TrimSpace(provider.BaseURL)
+	if rawBase == "" {
+		rawBase = strings.TrimSpace(provider.Endpoint)
 	}
 
-	var req *http.Request
-	switch provider.ID {
-	case "ollama":
-		if base == "" {
-			base = "http://localhost:11434"
+	candidates, defaultBase, errMsg := buildProviderProbeCandidates(provider.ID, rawBase, key, provider.OrgID)
+	if errMsg != "" {
+		return types.ProviderVerifyResult{OK: false, Message: errMsg}, nil
+	}
+
+	var (
+		lastStatus int
+		lastBody   []byte
+		lastLat    int
+		lastBase   = defaultBase
+		lastErr    error
+	)
+
+	for idx, cand := range candidates {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, cand.url, nil)
+		if reqErr != nil {
+			lastErr = reqErr
+			continue
 		}
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/tags", nil)
-	case "anthropic":
-		if key == "" {
-			return types.ProviderVerifyResult{OK: false, Message: "请输入有效的 Anthropic API Key"}, nil
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "Valet/0.1.0")
+		for hk, hv := range cand.headers {
+			req.Header.Set(hk, hv)
 		}
-		if base == "" {
-			base = "https://api.anthropic.com/v1"
+
+		resp, doErr := client.Do(req)
+		lastLat = int(math.Max(1, float64(time.Since(start).Milliseconds())))
+		if doErr != nil {
+			lastErr = doErr
+			lastBase = cand.url
+			continue
 		}
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
-		if err == nil {
-			req.Header.Set("x-api-key", key)
-			req.Header.Set("anthropic-version", "2023-06-01")
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			lastBase = cand.url
+			continue
 		}
-	case "openai":
-		if key == "" {
-			return types.ProviderVerifyResult{OK: false, Message: "请输入有效的 OpenAI API Key"}, nil
-		}
-		if base == "" {
-			base = "https://api.openai.com/v1"
-		}
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
-		if err == nil {
-			req.Header.Set("Authorization", "Bearer "+key)
-			if org := strings.TrimSpace(provider.OrgID); org != "" {
-				req.Header.Set("OpenAI-Organization", org)
+
+		lastStatus = resp.StatusCode
+		lastBody = body
+		lastBase = cand.url
+		lastErr = nil
+
+		if resp.StatusCode < 400 {
+			models := parseModelsFromResponse(provider.ID, body)
+			count := len(models)
+			if count == 0 {
+				models = provider.Models
+				count = len(models)
 			}
+			return types.ProviderVerifyResult{
+				OK:         true,
+				LatencyMs:  lastLat,
+				ModelCount: count,
+				Models:     models,
+				Message:    fmt.Sprintf("已验证（HTTP %d）· 延迟 %dms · 发现 %d 个模型", resp.StatusCode, lastLat, count),
+			}, nil
 		}
-	case "gemini":
-		if key == "" {
-			return types.ProviderVerifyResult{OK: false, Message: "请输入有效的 Gemini API Key"}, nil
-		}
-		if base == "" {
-			base = "https://generativelanguage.googleapis.com/v1beta"
-		}
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/models?key="+url.QueryEscape(key), nil)
-	case "openrouter":
-		if key == "" {
-			return types.ProviderVerifyResult{OK: false, Message: "请输入有效的 OpenRouter API Key"}, nil
-		}
-		if base == "" {
-			base = "https://openrouter.ai/api/v1"
-		}
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
-		if err == nil {
-			req.Header.Set("Authorization", "Bearer "+key)
-		}
-	default:
-		if base == "" {
-			return types.ProviderVerifyResult{OK: false, Message: "请填写自定义服务的 Base URL"}, nil
-		}
-		modelsURL := base
-		if !strings.HasSuffix(modelsURL, "/models") {
-			modelsURL += "/models"
-		}
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
-		if err == nil && key != "" {
-			req.Header.Set("Authorization", "Bearer "+key)
+
+		shouldRetry := idx+1 < len(candidates) &&
+			(resp.StatusCode == http.StatusNotFound ||
+				resp.StatusCode == http.StatusMethodNotAllowed ||
+				cand.retryOnAuth)
+		if !shouldRetry {
+			break
 		}
 	}
 
-	if err != nil {
-		return types.ProviderVerifyResult{OK: false, Message: "构造验证请求失败: " + err.Error()}, nil
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
+	if lastErr != nil && lastStatus == 0 {
 		lat := int(math.Max(1, float64(time.Since(start).Milliseconds())))
 		return types.ProviderVerifyResult{
 			OK:        false,
 			LatencyMs: lat,
-			Message:   fmt.Sprintf("连接 %s 失败: %v", base, err),
-		}, nil
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	lat := int(math.Max(1, float64(time.Since(start).Milliseconds())))
-
-	if resp.StatusCode >= 400 {
-		return types.ProviderVerifyResult{
-			OK:        false,
-			LatencyMs: lat,
-			Message:   fmt.Sprintf("鉴权或接口失败（HTTP %d）· 延迟 %dms", resp.StatusCode, lat),
+			Message:   fmt.Sprintf("连接 %s 失败: %v", lastBase, lastErr),
 		}, nil
 	}
 
-	models := parseModelsFromResponse(provider.ID, body)
-	count := len(models)
-	if count == 0 {
-		models = provider.Models
-		count = len(models)
+	detail := extractAPIErrorDetail(lastBody)
+	msg := fmt.Sprintf("鉴权或接口失败（HTTP %d）· 延迟 %dms", lastStatus, lastLat)
+	if detail != "" {
+		msg += " · " + detail
 	}
 	return types.ProviderVerifyResult{
-		OK:         true,
-		LatencyMs:  lat,
-		ModelCount: count,
-		Models:     models,
-		Message:    fmt.Sprintf("已验证（HTTP %d）· 延迟 %dms · 发现 %d 个模型", resp.StatusCode, lat, count),
+		OK:        false,
+		LatencyMs: lastLat,
+		Message:   msg,
 	}, nil
 }
 
@@ -1957,6 +2042,12 @@ func (s *Service) UpdateModels(models types.ModelSelection) (types.ValetSnapshot
 	}
 	next := s.store.Update(func(st *types.ValetSnapshot) {
 		st.Preferences.Models = models
+		reconcileActiveProviderModels(st, st.Preferences.ActiveProviderID)
+		if strings.TrimSpace(st.Preferences.Models.Primary) != "" {
+			for i := range st.ChatThreads {
+				st.ChatThreads[i].Model = st.Preferences.Models.Primary
+			}
+		}
 	})
 	s.syncRuntime(next)
 	return next, nil
@@ -2084,6 +2175,31 @@ func (s *Service) PollPermissionStatus(permissionID string) (bool, error) {
 		}
 	})
 	return granted, nil
+}
+
+// CaptureCurrentScreen verifies Screen Recording access, captures a bounded screenshot on macOS,
+// and syncs the updated permission state.
+func (s *Service) CaptureCurrentScreen(ctx context.Context) (types.ScreenCaptureResult, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ScreenCaptureResult{OK: false, Error: err.Error()}, err
+	}
+	res := sys.CaptureCurrentScreen(ctx, s.opts.DataDir, s.opts.DesktopReady)
+	if s.opts.DesktopReady && (res.OK || res.PermissionDenied) {
+		granted := res.OK && !res.PermissionDenied
+		s.store.Update(func(st *types.ValetSnapshot) {
+			for i := range st.Permissions {
+				if st.Permissions[i].ID == "screen_recording" {
+					st.Permissions[i].Granted = granted
+					for j := range st.Permissions[i].MockApps {
+						if st.Permissions[i].MockApps[j].IsValet {
+							st.Permissions[i].MockApps[j].Enabled = granted
+						}
+					}
+				}
+			}
+		})
+	}
+	return res, nil
 }
 
 // SetPermissionGranted updates a permission status explicitly (used by onboarding simulator or tests).
@@ -2463,16 +2579,394 @@ func buildHTTPClient(proxyRaw string, timeout time.Duration) (*http.Client, erro
 	return &http.Client{Timeout: timeout, Transport: tr}, nil
 }
 
-func parseModelsFromResponse(providerID string, body []byte) []string {
-	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil
+type probeCandidate struct {
+	url         string
+	headers     map[string]string
+	retryOnAuth bool
+}
+
+func isLocalEndpointHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "[::1]" || h == "0.0.0.0" {
+		return true
 	}
+	return strings.HasPrefix(h, "10.") || strings.HasPrefix(h, "192.168.") || strings.HasPrefix(h, "172.")
+}
+
+func normalizeEndpointURL(raw string, defaultScheme string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") {
+		scheme := defaultScheme
+		if scheme == "" {
+			hostPort := strings.SplitN(s, "/", 2)[0]
+			host := strings.SplitN(hostPort, ":", 2)[0]
+			if isLocalEndpointHost(host) {
+				scheme = "http"
+			} else {
+				scheme = "https"
+			}
+		}
+		s = scheme + "://" + s
+	}
+	s = strings.TrimRight(s, "/")
+	for _, suffix := range []string{"/chat/completions", "/completions", "/messages", "/responses"} {
+		if strings.HasSuffix(s, suffix) {
+			s = strings.TrimRight(strings.TrimSuffix(s, suffix), "/")
+			break
+		}
+	}
+	return s
+}
+
+func hasAPIVersionSuffix(base string) bool {
+	for _, v := range []string{"/v1", "/v1beta", "/v2", "/v3", "/v4"} {
+		if strings.HasSuffix(base, v) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripAPIVersionSuffix(base string) string {
+	for _, v := range []string{"/v1beta", "/v1", "/v2", "/v3", "/v4"} {
+		if strings.HasSuffix(base, v) {
+			return strings.TrimRight(strings.TrimSuffix(base, v), "/")
+		}
+	}
+	return base
+}
+
+func buildProviderProbeCandidates(providerID, rawBase, key, orgID string) ([]probeCandidate, string, string) {
+	switch providerID {
+	case "ollama":
+		base := normalizeEndpointURL(rawBase, "http")
+		if base == "" {
+			base = "http://localhost:11434"
+		}
+		root := strings.TrimRight(strings.TrimSuffix(base, "/api/tags"), "/")
+		root = strings.TrimRight(strings.TrimSuffix(root, "/v1"), "/")
+		headers := map[string]string{}
+		if key != "" {
+			headers["Authorization"] = "Bearer " + key
+		}
+		return []probeCandidate{
+			{url: root + "/api/tags", headers: headers},
+			{url: root + "/v1/models", headers: headers},
+		}, root, ""
+
+	case "anthropic":
+		if key == "" {
+			return nil, "", "请输入有效的 Anthropic API Key"
+		}
+		base := normalizeEndpointURL(rawBase, "https")
+		if base == "" {
+			base = "https://api.anthropic.com"
+		}
+		base = strings.TrimRight(strings.TrimSuffix(base, "/models"), "/")
+		primaryHdr := map[string]string{
+			"x-api-key":         key,
+			"anthropic-version": "2023-06-01",
+		}
+		bearerHdr := map[string]string{
+			"Authorization":     "Bearer " + key,
+			"x-api-key":         key,
+			"anthropic-version": "2023-06-01",
+		}
+		isCustomHost := !strings.Contains(strings.ToLower(base), "api.anthropic.com")
+		if hasAPIVersionSuffix(base) {
+			cands := []probeCandidate{
+				{url: base + "/models", headers: primaryHdr, retryOnAuth: isCustomHost},
+			}
+			if isCustomHost {
+				cands = append(cands, probeCandidate{url: base + "/models", headers: bearerHdr})
+			}
+			return cands, base, ""
+		}
+		cands := []probeCandidate{
+			{url: base + "/v1/models", headers: primaryHdr, retryOnAuth: isCustomHost},
+			{url: base + "/models", headers: primaryHdr, retryOnAuth: isCustomHost},
+		}
+		if isCustomHost {
+			cands = append(cands, probeCandidate{url: base + "/v1/models", headers: bearerHdr})
+		}
+		return cands, base, ""
+
+	case "gemini":
+		if key == "" {
+			return nil, "", "请输入有效的 Gemini API Key"
+		}
+		base := normalizeEndpointURL(rawBase, "https")
+		if base == "" {
+			base = "https://generativelanguage.googleapis.com/v1beta"
+		}
+		base = strings.TrimRight(strings.TrimSuffix(base, "/models"), "/")
+		headers := map[string]string{"x-goog-api-key": key}
+		q := "?key=" + url.QueryEscape(key)
+		if strings.HasSuffix(base, "/v1beta") || strings.HasSuffix(base, "/v1") {
+			return []probeCandidate{{url: base + "/models" + q, headers: headers}}, base, ""
+		}
+		return []probeCandidate{
+			{url: base + "/v1beta/models" + q, headers: headers},
+			{url: base + "/models" + q, headers: headers},
+		}, base, ""
+
+	case "openrouter":
+		if key == "" {
+			return nil, "", "请输入有效的 OpenRouter API Key"
+		}
+		base := normalizeEndpointURL(rawBase, "https")
+		if base == "" {
+			base = "https://openrouter.ai/api/v1"
+		}
+		if parsed, err := url.Parse(base); err == nil && strings.Contains(strings.ToLower(parsed.Hostname()), "openrouter.ai") {
+			if parsed.Path == "" || parsed.Path == "/" {
+				base += "/api/v1"
+			} else if parsed.Path == "/api" {
+				base += "/v1"
+			}
+		}
+		headers := map[string]string{
+			"Authorization":      "Bearer " + key,
+			"HTTP-Referer":       "https://valet.local",
+			"X-OpenRouter-Title": "Valet",
+		}
+		if strings.HasSuffix(base, "/models/user") {
+			return []probeCandidate{{url: base, headers: headers}}, base, ""
+		}
+		if strings.HasSuffix(base, "/models") {
+			root := strings.TrimRight(strings.TrimSuffix(base, "/models"), "/")
+			return []probeCandidate{
+				{url: root + "/models/user", headers: headers},
+				{url: base, headers: headers},
+			}, base, ""
+		}
+		if hasAPIVersionSuffix(base) {
+			return []probeCandidate{
+				{url: base + "/models/user", headers: headers},
+				{url: base + "/models", headers: headers},
+			}, base, ""
+		}
+		return []probeCandidate{
+			{url: base + "/v1/models/user", headers: headers},
+			{url: base + "/models/user", headers: headers},
+			{url: base + "/v1/models", headers: headers},
+			{url: base + "/models", headers: headers},
+		}, base, ""
+
+	default:
+		if providerID == "openai" && key == "" {
+			return nil, "", "请输入有效的 OpenAI API Key"
+		}
+		base := normalizeEndpointURL(rawBase, "")
+		if base == "" {
+			if providerID == "openai" {
+				base = "https://api.openai.com/v1"
+			} else {
+				return nil, "", "请填写自定义服务的 Base URL"
+			}
+		}
+		headers := map[string]string{}
+		if key != "" {
+			headers["Authorization"] = "Bearer " + key
+		}
+		if org := strings.TrimSpace(orgID); org != "" {
+			headers["OpenAI-Organization"] = org
+		}
+		if strings.HasSuffix(base, "/models") {
+			return []probeCandidate{{url: base, headers: headers}}, base, ""
+		}
+		if hasAPIVersionSuffix(base) {
+			cands := []probeCandidate{{url: base + "/models", headers: headers}}
+			stripped := stripAPIVersionSuffix(base)
+			if stripped != base {
+				cands = append(cands, probeCandidate{url: stripped + "/models", headers: headers})
+			}
+			return cands, base, ""
+		}
+		return []probeCandidate{
+			{url: base + "/v1/models", headers: headers},
+			{url: base + "/models", headers: headers},
+		}, base, ""
+	}
+}
+
+func extractAPIErrorDetail(body []byte) string {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return ""
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		var msg string
+		if errField, ok := parsed["error"].(map[string]any); ok {
+			if m, ok := errField["message"].(string); ok {
+				msg = m
+			}
+		} else if errStr, ok := parsed["error"].(string); ok {
+			msg = errStr
+		}
+		if msg == "" {
+			if m, ok := parsed["message"].(string); ok {
+				msg = m
+			}
+		}
+		msg = strings.Join(strings.Fields(msg), " ")
+		if msg != "" {
+			if len(msg) > 180 {
+				return msg[:180] + "…"
+			}
+			return msg
+		}
+	}
+	flat := strings.Join(strings.Fields(trimmed), " ")
+	if len(flat) > 140 {
+		return flat[:140] + "…"
+	}
+	return flat
+}
+
+func isFastModelID(id string) bool {
+	low := strings.ToLower(id)
+	return strings.Contains(low, "haiku") ||
+		strings.Contains(low, "flash") ||
+		strings.Contains(low, "mini") ||
+		strings.Contains(low, "nano") ||
+		strings.Contains(low, "fast") ||
+		strings.Contains(low, "lite")
+}
+
+func reconcileActiveProviderModels(st *types.ValetSnapshot, providerID string) {
+	var models []string
+	for _, p := range st.Providers {
+		if p.ID == providerID {
+			models = p.Models
+			break
+		}
+	}
+	if len(models) == 0 {
+		return
+	}
+	hasModel := func(target string) bool {
+		for _, m := range models {
+			if m == target {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasModel(st.Preferences.Models.Primary) {
+		st.Preferences.Models.Primary = models[0]
+	}
+	if !hasModel(st.Preferences.Models.Fast) {
+		fastPick := ""
+		for _, m := range models {
+			if isFastModelID(m) {
+				fastPick = m
+				break
+			}
+		}
+		if fastPick == "" {
+			if len(models) > 1 {
+				fastPick = models[len(models)-1]
+			} else {
+				fastPick = models[0]
+			}
+		}
+		st.Preferences.Models.Fast = fastPick
+	}
+	if st.Preferences.Models.Vision != "同主模型" && !hasModel(st.Preferences.Models.Vision) {
+		st.Preferences.Models.Vision = "同主模型"
+	}
+
+	for i := range st.ChatThreads {
+		if !hasModel(st.ChatThreads[i].Model) {
+			st.ChatThreads[i].Model = st.Preferences.Models.Primary
+		}
+	}
+}
+
+func shouldIncludeDiscoveredModel(providerID, id string, meta map[string]any) bool {
+	if id == "" || strings.HasPrefix(id, "~") {
+		return false
+	}
+	low := strings.ToLower(id)
+
+	if providerID == "gemini" {
+		if methods, ok := meta["supportedGenerationMethods"].([]any); ok && len(methods) > 0 {
+			supportsGen := false
+			for _, m := range methods {
+				if s, ok := m.(string); ok && s == "generateContent" {
+					supportsGen = true
+					break
+				}
+			}
+			if !supportsGen {
+				return false
+			}
+		}
+		for _, prefix := range []string{"embedding-", "text-embedding-", "gemini-embedding-", "aqa", "imagen-", "veo-"} {
+			if strings.HasPrefix(low, prefix) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if providerID == "openrouter" {
+		if arch, ok := meta["architecture"].(map[string]any); ok {
+			if outMods, ok := arch["output_modalities"].([]any); ok && len(outMods) > 0 {
+				supportsText := false
+				for _, mod := range outMods {
+					if s, ok := mod.(string); ok && s == "text" {
+						supportsText = true
+						break
+					}
+				}
+				if !supportsText {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	if providerID == "openai" || providerID == "custom" {
+		for _, skip := range []string{
+			"whisper-",
+			"tts-",
+			"dall-e-",
+			"gpt-image-",
+			"chatgpt-image-",
+			"text-embedding-",
+			"embedding-",
+			"omni-moderation-",
+			"text-moderation-",
+			"babbage-",
+			"davinci-",
+			"sora-",
+		} {
+			if strings.HasPrefix(low, skip) {
+				return false
+			}
+		}
+		if providerID == "openai" && (strings.Contains(low, "-transcribe") || strings.Contains(low, "-realtime")) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func parseModelsFromResponse(providerID string, body []byte) []string {
 	var out []string
 	seen := make(map[string]struct{})
-	add := func(id string) {
+	add := func(id string, meta map[string]any) {
 		id = strings.TrimSpace(strings.TrimPrefix(id, "models/"))
-		if id == "" {
+		if !shouldIncludeDiscoveredModel(providerID, id, meta) {
 			return
 		}
 		if _, ok := seen[id]; ok {
@@ -2482,29 +2976,50 @@ func parseModelsFromResponse(providerID string, body []byte) []string {
 		out = append(out, id)
 	}
 
-	if items, ok := raw["data"].([]any); ok {
-		for _, item := range items {
-			if m, ok := item.(map[string]any); ok {
-				if id, ok := m["id"].(string); ok {
-					add(id)
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err == nil {
+		if items, ok := raw["data"].([]any); ok {
+			for _, item := range items {
+				if m, ok := item.(map[string]any); ok {
+					if id, ok := m["id"].(string); ok {
+						add(id, m)
+					}
 				}
 			}
 		}
-	}
-	if items, ok := raw["models"].([]any); ok {
-		for _, item := range items {
-			if m, ok := item.(map[string]any); ok {
-				if name, ok := m["name"].(string); ok {
-					add(name)
-				} else if id, ok := m["id"].(string); ok {
-					add(id)
+		if items, ok := raw["models"].([]any); ok {
+			for _, item := range items {
+				switch v := item.(type) {
+				case map[string]any:
+					if name, ok := v["name"].(string); ok {
+						add(name, v)
+					} else if id, ok := v["id"].(string); ok {
+						add(id, v)
+					} else if mod, ok := v["model"].(string); ok {
+						add(mod, v)
+					}
+				case string:
+					add(v, nil)
 				}
 			}
 		}
+		return out
 	}
-	_ = providerID
-	if len(out) > 40 {
-		out = out[:40]
+
+	var list []any
+	if err := json.Unmarshal(body, &list); err == nil {
+		for _, item := range list {
+			switch v := item.(type) {
+			case map[string]any:
+				if id, ok := v["id"].(string); ok {
+					add(id, v)
+				} else if name, ok := v["name"].(string); ok {
+					add(name, v)
+				}
+			case string:
+				add(v, nil)
+			}
+		}
 	}
 	return out
 }

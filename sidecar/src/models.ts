@@ -12,11 +12,13 @@ import {
   createModels,
   createProvider,
   fauxAssistantMessage,
-  fauxText,
   fauxThinking,
   fauxToolCall,
 } from "@earendil-works/pi-ai";
+import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
+import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { createFauxCore } from "@earendil-works/pi-ai/providers/faux";
 import { googleProvider } from "@earendil-works/pi-ai/providers/google";
@@ -56,6 +58,10 @@ class InMemoryCredentialStore implements CredentialStore {
   setApiKeyDirect(providerId: string, apiKey: string): void {
     this.store.set(providerId, { type: "api_key", key: apiKey });
   }
+
+  deleteDirect(providerId: string): void {
+    this.store.delete(providerId);
+  }
 }
 
 function toPiProviderId(providerId: string): string {
@@ -72,6 +78,62 @@ function isMockOrEmptyKey(cfg: AgentProviderConfig): boolean {
   if (!k) return true;
   if (k.includes("-mock-")) return true;
   return false;
+}
+
+function isLocalHost(host: string): boolean {
+  const h = host.toLowerCase().trim();
+  return (
+    h === "localhost" ||
+    h === "127.0.0.1" ||
+    h === "::1" ||
+    h === "[::1]" ||
+    h === "0.0.0.0" ||
+    h.startsWith("10.") ||
+    h.startsWith("192.168.") ||
+    h.startsWith("172.")
+  );
+}
+
+function normalizeBaseUrl(raw: string, defaultScheme?: "http" | "https"): string {
+  let s = raw.trim();
+  if (!s) return "";
+  if (!s.startsWith("http://") && !s.startsWith("https://")) {
+    const hostPort = s.split("/", 1)[0] ?? "";
+    const host = hostPort.split(":", 1)[0] ?? "";
+    const scheme = defaultScheme ?? (isLocalHost(host) ? "http" : "https");
+    s = `${scheme}://${s}`;
+  }
+  s = s.replace(/\/+$/, "");
+  for (const suffix of ["/chat/completions", "/completions", "/messages", "/responses"]) {
+    if (s.endsWith(suffix)) {
+      s = s.slice(0, -suffix.length).replace(/\/+$/, "");
+      break;
+    }
+  }
+  return s;
+}
+
+function hasVersionPath(base: string): boolean {
+  return /\/v\d+(beta)?$/i.test(base);
+}
+
+function buildOpenAICompatModel(
+  id: string,
+  provider: string,
+  baseUrl: string,
+): Model<"openai-completions"> {
+  return {
+    id,
+    name: id,
+    api: "openai-completions",
+    provider,
+    baseUrl,
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 16_384,
+  };
 }
 
 function extractUserText(content: UserMessage["content"]): string {
@@ -459,6 +521,12 @@ export class ValetModelManager {
   private readonly localProvider: Provider;
   private providerConfigs: AgentProviderConfig[] = [];
   private getAvailableToolNames: () => ReadonlySet<string> = () => new Set();
+  private readonly initialProxyEnv = {
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+    http_proxy: process.env.http_proxy,
+    https_proxy: process.env.https_proxy,
+  };
 
   setAvailableToolProvider(fn: () => ReadonlySet<string>): void {
     this.getAvailableToolNames = fn;
@@ -467,7 +535,10 @@ export class ValetModelManager {
   constructor() {
     this.models = createModels({
       credentials: this.credStore,
-      identity: { attribution: { name: "Valet", url: "https://valet.local" } },
+      identity: {
+        userAgent: { custom: "Valet/0.1.0" },
+        attribution: { name: "Valet", url: "https://valet.local" },
+      },
     });
 
     this.fauxCore = createFauxCore({
@@ -517,6 +588,22 @@ export class ValetModelManager {
     this.models.setProvider(openrouterProvider());
   }
 
+  private applyProxyForProvider(cfg?: AgentProviderConfig): void {
+    const raw = cfg?.proxyUrl?.trim();
+    if (raw) {
+      const normalized = normalizeBaseUrl(raw, "http");
+      process.env.HTTP_PROXY = normalized;
+      process.env.HTTPS_PROXY = normalized;
+      process.env.http_proxy = normalized;
+      process.env.https_proxy = normalized;
+      return;
+    }
+    for (const [k, v] of Object.entries(this.initialProxyEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+
   /** Registers an explicit scripted response handler for deterministic testing. */
   setLocalStewardScript(
     steps: Parameters<ReturnType<typeof createFauxCore>["setResponses"]>[0],
@@ -524,38 +611,303 @@ export class ValetModelManager {
     this.fauxCore.setResponses(steps);
   }
 
-  syncProviders(configs: AgentProviderConfig[]): void {
+  syncProviders(configs: AgentProviderConfig[], activeProviderId?: string): void {
     this.providerConfigs = configs;
-    const baseFactories: Record<string, () => Provider> = {
-      anthropic: () => anthropicProvider() as Provider,
-      openai: () => openaiProvider() as Provider,
-      google: () => googleProvider() as Provider,
-      openrouter: () => openrouterProvider() as Provider,
-    };
+    const activeCfg =
+      (activeProviderId
+        ? configs.find((c) => c.id === activeProviderId)
+        : undefined) ?? configs.find((c) => c.connected);
+    this.applyProxyForProvider(activeCfg);
 
     for (const cfg of configs) {
       const piId = toPiProviderId(cfg.id);
-      if (cfg.apiKey && !cfg.apiKey.includes("-mock-")) {
-        this.credStore.setApiKeyDirect(piId, cfg.apiKey.trim());
+      const trimmedKey = cfg.apiKey?.trim() ?? "";
+      if (trimmedKey && !trimmedKey.includes("-mock-")) {
+        this.credStore.setApiKeyDirect(piId, trimmedKey);
+      } else if (cfg.id !== "ollama" && cfg.id !== "custom") {
+        this.credStore.deleteDirect(piId);
       }
 
-      if (baseFactories[piId]) {
-        const base = baseFactories[piId]!();
-        const customBase = cfg.baseUrl?.trim().replace(/\/+$/, "");
-        const customHeaders =
-          cfg.orgId?.trim() && piId === "openai"
-            ? { ...(base.headers ?? {}), "OpenAI-Organization": cfg.orgId.trim() }
-            : base.headers;
-
-        if ((customBase && customBase !== base.baseUrl) || cfg.orgId?.trim()) {
-          this.models.setProvider({
-            ...base,
-            baseUrl: customBase || base.baseUrl,
-            headers: customHeaders,
-          });
-        } else {
-          this.models.setProvider(base);
+      if (cfg.id === "openrouter") {
+        let normalizedBase = normalizeBaseUrl(
+          cfg.baseUrl || cfg.endpoint || "https://openrouter.ai/api/v1",
+          "https",
+        );
+        try {
+          const parsed = new URL(normalizedBase);
+          if (parsed.hostname.includes("openrouter.ai")) {
+            if (parsed.pathname === "" || parsed.pathname === "/") {
+              normalizedBase += "/api/v1";
+            } else if (parsed.pathname === "/api") {
+              normalizedBase += "/v1";
+            }
+          }
+        } catch {
+          // Keep normalizedBase as-is if URL parsing fails
         }
+
+        const base = openrouterProvider();
+        const baselineMap = new Map<string, Model<"openai-completions">>();
+        for (const m of base.getModels()) {
+          if (m.id.startsWith("~") || baselineMap.has(m.id)) continue;
+          baselineMap.set(m.id, {
+            ...m,
+            api: "openai-completions",
+            provider: "openrouter",
+            baseUrl: normalizedBase,
+          });
+        }
+
+        const merged: Model<"openai-completions">[] = [];
+        const seen = new Set<string>();
+        for (const rawId of cfg.models) {
+          const id = rawId.trim();
+          if (!id || id.startsWith("~") || seen.has(id)) continue;
+          seen.add(id);
+          merged.push(
+            baselineMap.get(id) ??
+              buildOpenAICompatModel(id, "openrouter", normalizedBase),
+          );
+        }
+        for (const [id, m] of baselineMap) {
+          if (!seen.has(id)) {
+            seen.add(id);
+            merged.push(m);
+          }
+        }
+
+        this.models.setProvider(
+          createProvider<"openai-completions">({
+            id: "openrouter",
+            name: cfg.name || "OpenRouter",
+            baseUrl: normalizedBase,
+            auth: {
+              apiKey: {
+                name: "OpenRouter API key",
+                resolve: async ({ credential }) => {
+                  const key =
+                    credential?.type === "api_key" && credential.key
+                      ? credential.key
+                      : process.env.OPENROUTER_API_KEY?.trim();
+                  if (!key) return undefined;
+                  return { auth: { apiKey: key, baseUrl: normalizedBase } };
+                },
+              },
+            },
+            models: merged,
+            api: openAICompletionsApi(),
+          }),
+        );
+        continue;
+      }
+
+      if (cfg.id === "anthropic") {
+        let normalizedBase = normalizeBaseUrl(
+          cfg.baseUrl || cfg.endpoint || "https://api.anthropic.com",
+          "https",
+        );
+        if (normalizedBase.endsWith("/v1")) {
+          normalizedBase = normalizedBase.slice(0, -3).replace(/\/+$/, "");
+        }
+
+        const base = anthropicProvider();
+        const baselineMap = new Map<string, Model<"anthropic-messages">>();
+        for (const m of base.getModels()) {
+          if (m.id.startsWith("~") || baselineMap.has(m.id)) continue;
+          baselineMap.set(m.id, {
+            ...m,
+            provider: "anthropic",
+            baseUrl: normalizedBase,
+          });
+        }
+
+        const merged: Model<"anthropic-messages">[] = [];
+        const seen = new Set<string>();
+        for (const rawId of cfg.models) {
+          const id = rawId.trim();
+          if (!id || id.startsWith("~") || seen.has(id)) continue;
+          seen.add(id);
+          merged.push(
+            baselineMap.get(id) ?? {
+              id,
+              name: id,
+              api: "anthropic-messages",
+              provider: "anthropic",
+              baseUrl: normalizedBase,
+              reasoning: true,
+              input: ["text", "image"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 200_000,
+              maxTokens: 16_384,
+            },
+          );
+        }
+        for (const [id, m] of baselineMap) {
+          if (!seen.has(id)) {
+            seen.add(id);
+            merged.push(m);
+          }
+        }
+
+        this.models.setProvider(
+          createProvider<"anthropic-messages">({
+            id: "anthropic",
+            name: cfg.name || base.name,
+            baseUrl: normalizedBase,
+            headers: base.headers,
+            auth: base.auth,
+            models: merged,
+            api: anthropicMessagesApi(),
+          }),
+        );
+        continue;
+      }
+
+      if (cfg.id === "gemini") {
+        let normalizedBase = normalizeBaseUrl(
+          cfg.baseUrl || cfg.endpoint || "https://generativelanguage.googleapis.com/v1beta",
+          "https",
+        );
+        if (!normalizedBase.endsWith("/v1beta") && !normalizedBase.endsWith("/v1")) {
+          normalizedBase = `${normalizedBase}/v1beta`;
+        }
+
+        const base = googleProvider();
+        const baselineMap = new Map<string, Model<"google-generative-ai">>();
+        for (const m of base.getModels()) {
+          if (m.id.startsWith("~") || baselineMap.has(m.id)) continue;
+          baselineMap.set(m.id, {
+            ...m,
+            provider: "google",
+            baseUrl: normalizedBase,
+          });
+        }
+
+        const merged: Model<"google-generative-ai">[] = [];
+        const seen = new Set<string>();
+        for (const rawId of cfg.models) {
+          const id = rawId.trim().replace(/^models\//, "");
+          if (!id || id.startsWith("~") || seen.has(id)) continue;
+          seen.add(id);
+          merged.push(
+            baselineMap.get(id) ?? {
+              id,
+              name: id,
+              api: "google-generative-ai",
+              provider: "google",
+              baseUrl: normalizedBase,
+              reasoning: true,
+              input: ["text", "image"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 1_048_576,
+              maxTokens: 65_536,
+            },
+          );
+        }
+        for (const [id, m] of baselineMap) {
+          if (!seen.has(id)) {
+            seen.add(id);
+            merged.push(m);
+          }
+        }
+
+        this.models.setProvider(
+          createProvider<"google-generative-ai">({
+            id: "google",
+            name: cfg.name || base.name,
+            baseUrl: normalizedBase,
+            headers: base.headers,
+            auth: base.auth,
+            models: merged,
+            api: googleGenerativeAIApi(),
+          }),
+        );
+        continue;
+      }
+
+      if (cfg.id === "openai") {
+        let normalizedBase = normalizeBaseUrl(
+          cfg.baseUrl || cfg.endpoint || "https://api.openai.com/v1",
+          "https",
+        );
+        if (!hasVersionPath(normalizedBase)) {
+          normalizedBase = `${normalizedBase}/v1`;
+        }
+        const base = openaiProvider();
+        const customHeaders = cfg.orgId?.trim()
+          ? { ...(base.headers ?? {}), "OpenAI-Organization": cfg.orgId.trim() }
+          : base.headers;
+        const isOfficial = normalizedBase === "https://api.openai.com/v1";
+
+        if (!isOfficial) {
+          const list =
+            cfg.models.length > 0 ? cfg.models : ["gpt-4.1", "gpt-4.1-mini"];
+          const compatModels: Model<"openai-completions">[] = [];
+          const seen = new Set<string>();
+          for (const rawId of list) {
+            const id = rawId.trim();
+            if (!id || id.startsWith("~") || seen.has(id)) continue;
+            seen.add(id);
+            compatModels.push(
+              buildOpenAICompatModel(id, "openai", normalizedBase),
+            );
+          }
+          this.models.setProvider(
+            createProvider<"openai-completions">({
+              id: "openai",
+              name: cfg.name || base.name,
+              baseUrl: normalizedBase,
+              headers: customHeaders,
+              auth: base.auth,
+              models: compatModels,
+              api: openAICompletionsApi(),
+            }),
+          );
+          continue;
+        }
+
+        const baselineMap = new Map<string, Model<"openai-responses">>();
+        for (const m of base.getModels()) {
+          if (m.id.startsWith("~") || baselineMap.has(m.id)) continue;
+          baselineMap.set(m.id, {
+            ...m,
+            provider: "openai",
+            baseUrl: normalizedBase,
+          });
+        }
+
+        const merged: Model<"openai-responses" | "openai-completions">[] = [];
+        const seen = new Set<string>();
+        for (const rawId of cfg.models) {
+          const id = rawId.trim();
+          if (!id || id.startsWith("~") || seen.has(id)) continue;
+          seen.add(id);
+          merged.push(
+            baselineMap.get(id) ??
+              buildOpenAICompatModel(id, "openai", normalizedBase),
+          );
+        }
+        for (const [id, m] of baselineMap) {
+          if (!seen.has(id)) {
+            seen.add(id);
+            merged.push(m);
+          }
+        }
+
+        this.models.setProvider(
+          createProvider<"openai-responses" | "openai-completions">({
+            id: "openai",
+            name: cfg.name || base.name,
+            baseUrl: normalizedBase,
+            headers: customHeaders,
+            auth: base.auth,
+            models: merged,
+            api: {
+              "openai-responses": openAIResponsesApi(),
+              "openai-completions": openAICompletionsApi(),
+            },
+          }),
+        );
         continue;
       }
 
@@ -564,30 +916,23 @@ export class ValetModelManager {
           cfg.id === "ollama"
             ? cfg.baseUrl || cfg.endpoint || "http://localhost:11434"
             : cfg.baseUrl || cfg.endpoint || "http://localhost:1234";
-        const withScheme =
-          rawBase.startsWith("http://") || rawBase.startsWith("https://")
-            ? rawBase
-            : `http://${rawBase}`;
-        const trimmed = withScheme.replace(/\/+$/, "");
-        const normalizedBase = trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
+        let normalizedBase = normalizeBaseUrl(
+          rawBase,
+          cfg.id === "ollama" ? "http" : undefined,
+        );
+        if (!hasVersionPath(normalizedBase)) {
+          normalizedBase = `${normalizedBase}/v1`;
+        }
         const dynamicModels: Model<"openai-completions">[] = (
           cfg.models.length > 0 ? cfg.models : ["custom-reasoning"]
-        ).map((id) => ({
-          id,
-          name: id,
-          api: "openai-completions",
-          provider: piId,
-          baseUrl: normalizedBase,
-          reasoning: true,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 128_000,
-          maxTokens: 16_384,
-        }));
+        )
+          .map((id) => id.trim())
+          .filter((id) => id.length > 0 && !id.startsWith("~"))
+          .map((id) => buildOpenAICompatModel(id, piId, normalizedBase));
 
         this.credStore.setApiKeyDirect(
           piId,
-          cfg.apiKey?.trim() || (cfg.id === "ollama" ? "ollama" : "custom"),
+          trimmedKey || (cfg.id === "ollama" ? "ollama" : "custom"),
         );
 
         this.models.setProvider(
@@ -603,7 +948,9 @@ export class ValetModelManager {
                     apiKey:
                       credential?.type === "api_key" && credential.key
                         ? credential.key
-                        : "ollama",
+                        : cfg.id === "ollama"
+                          ? "ollama"
+                          : "custom",
                     baseUrl: normalizedBase,
                   },
                 }),
@@ -636,7 +983,9 @@ export class ValetModelManager {
     }
 
     const piId = toPiProviderId(activeProvider.id);
-    const catalog = this.models.getModels(piId);
+    const catalog = this.models
+      .getModels(piId)
+      .filter((m) => !m.id.startsWith("~"));
     if (catalog.length === 0) {
       return {
         ref: { provider: "valet-local", modelId: "valet-steward-local" },
@@ -653,6 +1002,24 @@ export class ValetModelManager {
     }
 
     const normalized = requestedModelId.replace(/^[^/]+\//, "");
+    const normalizedExact = catalog.find((m) => m.id === normalized);
+    if (normalizedExact) {
+      return {
+        ref: { provider: piId, modelId: normalizedExact.id },
+        usingLocalFallback: false,
+      };
+    }
+
+    for (const configuredId of activeProvider.models) {
+      const configuredMatch = catalog.find((m) => m.id === configuredId);
+      if (configuredMatch) {
+        return {
+          ref: { provider: piId, modelId: configuredMatch.id },
+          usingLocalFallback: false,
+        };
+      }
+    }
+
     const prefixMatch = catalog.find(
       (m) =>
         m.id.startsWith(normalized) ||
@@ -677,8 +1044,14 @@ export class ValetModelManager {
     provider: AgentProviderConfig,
     requestedModel: string,
   ): Promise<{ ok: boolean; reply: string; latencyMs: number }> {
+    const trimmedModel = requestedModel.trim();
+    const candidateModels =
+      trimmedModel && !provider.models.includes(trimmedModel)
+        ? [trimmedModel, ...provider.models]
+        : provider.models;
     const candidate: AgentProviderConfig = {
       ...provider,
+      models: candidateModels,
       connected: true,
       verified: true,
     };
@@ -690,17 +1063,23 @@ export class ValetModelManager {
       };
     }
 
-    this.syncProviders([
-      ...this.providerConfigs.filter((p) => p.id !== candidate.id),
-      candidate,
-    ]);
+    this.syncProviders(
+      [
+        ...this.providerConfigs.filter((p) => p.id !== candidate.id),
+        candidate,
+      ],
+      candidate.id,
+    );
 
     const piId = toPiProviderId(candidate.id);
-    const catalog = this.models.getModels(piId);
+    const catalog = this.models
+      .getModels(piId)
+      .filter((m) => !m.id.startsWith("~"));
     const model =
-      catalog.find((m) => m.id === requestedModel) ??
-      catalog.find((m) => m.id.includes(requestedModel)) ??
-      catalog[0];
+      (trimmedModel
+        ? catalog.find((m) => m.id === trimmedModel) ??
+          catalog.find((m) => m.id.includes(trimmedModel))
+        : undefined) ?? catalog[0];
 
     if (!model) {
       return {
@@ -729,6 +1108,7 @@ export class ValetModelManager {
         .filter((b): b is { type: "text"; text: string } => b.type === "text")
         .map((b) => b.text)
         .join("\n")
+        .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "")
         .trim();
       const latencyMs = Math.max(1, Date.now() - start);
       if (msg.stopReason === "error" || msg.errorMessage) {

@@ -24,9 +24,12 @@ var hardBlockedPrefixes = []string{
 	"~/Library/Keychains",
 }
 
-// ExpandHome converts a leading "~/" or "~" into homeDir and cleans the resulting path.
+// ExpandHome converts a leading "~/" or "~" into homeDir and resolves relative paths against homeDir (or ~/Downloads for bare names).
 func ExpandHome(raw, homeDir string) string {
 	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
 	if homeDir == "" {
 		homeDir, _ = os.UserHomeDir()
 	}
@@ -36,7 +39,20 @@ func ExpandHome(raw, homeDir string) string {
 	if strings.HasPrefix(trimmed, "~/") {
 		return filepath.Clean(filepath.Join(homeDir, trimmed[2:]))
 	}
-	return filepath.Clean(trimmed)
+	if filepath.IsAbs(trimmed) {
+		return filepath.Clean(trimmed)
+	}
+	cand := filepath.Clean(filepath.Join(homeDir, trimmed))
+	if _, err := os.Lstat(cand); err == nil {
+		return cand
+	}
+	if !strings.ContainsAny(trimmed, "/\\") && homeDir != "" {
+		dlCand := filepath.Clean(filepath.Join(homeDir, "Downloads", trimmed))
+		if _, err := os.Lstat(dlCand); err == nil {
+			return dlCand
+		}
+	}
+	return cand
 }
 
 func hasPathPrefix(target, prefix string) bool {
@@ -132,7 +148,7 @@ func ScanDisk(homeDir string, protectedDirs []string, minLargeFileMB int, idleDa
 	if minLargeFileMB <= 0 {
 		minLargeFileMB = 512
 	}
-	if idleDays <= 0 {
+	if idleDays < 0 {
 		idleDays = 90
 	}
 
@@ -171,7 +187,10 @@ func ScanDisk(homeDir string, protectedDirs []string, minLargeFileMB int, idleDa
 
 	downloadsPath, err := ValidateTargetPath("~/Downloads", homeDir, protectedDirs)
 	if err == nil {
-		cutoff := time.Now().Add(-time.Duration(idleDays) * 24 * time.Hour)
+		var cutoff time.Time
+		if idleDays > 0 {
+			cutoff = time.Now().Add(-time.Duration(idleDays) * 24 * time.Hour)
+		}
 		if entries, err := os.ReadDir(downloadsPath); err == nil {
 			for i, entry := range entries {
 				if i > 400 || entry.IsDir() {
@@ -182,7 +201,7 @@ func ScanDisk(homeDir string, protectedDirs []string, minLargeFileMB int, idleDa
 					continue
 				}
 				sizeMB := float64(info.Size()) / (1024 * 1024)
-				if sizeMB >= float64(minLargeFileMB) && info.ModTime().Before(cutoff) {
+				if sizeMB >= float64(minLargeFileMB) && (idleDays == 0 || info.ModTime().Before(cutoff)) {
 					rel := "~/Downloads/" + entry.Name()
 					items = append(items, DiskCandidate{
 						Path:      rel,
@@ -241,6 +260,8 @@ func MoveItemsToTrash(
 	batchID = fmt.Sprintf("trash-%d", time.Now().UnixNano())
 	records := make([]TrashRecord, 0, len(paths))
 	var measuredBytes int64
+	realMoved := 0
+	var missing []string
 
 	for _, raw := range paths {
 		if strings.TrimSpace(raw) == "" {
@@ -250,9 +271,13 @@ func MoveItemsToTrash(
 		if vErr != nil {
 			return "", 0, 0, vErr
 		}
-		info, sErr := os.Stat(norm)
+		info, sErr := os.Lstat(norm)
 		if sErr != nil {
 			if errors.Is(sErr, os.ErrNotExist) {
+				if mover != nil {
+					missing = append(missing, norm)
+					continue
+				}
 				// Record demo/simulated path cleanly without failing on synthetic UI presets.
 				records = append(records, TrashRecord{
 					OriginalPath: norm,
@@ -287,6 +312,11 @@ func MoveItemsToTrash(
 			TrashPath:    dest,
 		})
 		movedCount++
+		realMoved++
+	}
+
+	if mover != nil && realMoved == 0 && len(missing) > 0 {
+		return "", 0, 0, fmt.Errorf("未找到可移入废纸篓的目标文件：%s", strings.Join(missing, "、"))
 	}
 
 	if len(records) > 0 && dataDir != "" {

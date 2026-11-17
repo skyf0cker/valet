@@ -19,6 +19,7 @@ import {
   createRegistry,
   defineDoc,
 } from "@earendil-works/pi-durable";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
   ToolPolicyRegistry,
@@ -53,6 +54,59 @@ const ValetThreadsDoc = defineDoc<{ map: Record<string, ConversationId> }>({
   checkpointWhen: () => false,
   initial: () => ({ map: {} }),
 });
+
+const TOOL_STATUS_LABELS: Record<string, string> = {
+  disk_scan: "正在扫描磁盘与缓存…",
+  disk_move_to_trash: "正在提交安全清理清单…",
+  disk_empty_trash: "正在检查废纸篓安全审计…",
+  app_scan_remnants: "正在排查应用卸载残留…",
+  app_trash_remnants: "正在提交残留清理清单…",
+  process_sample: "正在采样系统进程负载…",
+  process_terminate: "正在准备安全终止进程…",
+  log_summarize_crashes: "正在分析崩溃诊断日志…",
+  system_overview: "正在读取系统状态概览…",
+  memory_remember: "正在保存本地偏好记忆…",
+  plugin_draft_create: "正在起草本地插件规则…",
+};
+
+export function stripThinkTags(raw: string): {
+  cleanText: string;
+  hadThink: boolean;
+} {
+  if (!raw) return { cleanText: "", hadThink: false };
+  let hadThink = false;
+  let clean = raw.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, () => {
+    hadThink = true;
+    return "";
+  });
+  if (/<think(?:ing)?>/i.test(clean)) {
+    hadThink = true;
+    clean = clean.replace(/<think(?:ing)?>[\s\S]*$/i, "");
+  }
+  return {
+    cleanText: clean.replace(/^\s+/, ""),
+    hadThink,
+  };
+}
+
+export function summarizeStreamStatus(
+  steps: ChatStreamStep[],
+  hasPartialText: boolean,
+): string {
+  const runningStep = steps.find(
+    (s) => s.status === "running" || s.status === "pending",
+  );
+  if (runningStep) {
+    return (
+      TOOL_STATUS_LABELS[runningStep.name] ??
+      `正在调用工具 ${runningStep.name}…`
+    );
+  }
+  if (hasPartialText) {
+    return "正在生成回复…";
+  }
+  return "正在思考与分析…";
+}
 
 function formatHHMM(ts?: number): string {
   const d = ts ? new Date(ts) : new Date();
@@ -161,7 +215,10 @@ export class ValetDurableRuntime {
     }
 
     this.state = params.state;
-    this.models.syncProviders(params.state.providers);
+    this.models.syncProviders(
+      params.state.providers,
+      params.state.preferences.activeProviderId,
+    );
 
     const tracker = {
       recordInbox: (
@@ -219,7 +276,10 @@ export class ValetDurableRuntime {
       {
         models: this.models.models,
         registry: this.registry,
-        identity: { attribution: { name: "Valet", url: "https://valet.local" } },
+        identity: {
+          userAgent: { custom: "Valet/0.1.0" },
+          attribution: { name: "Valet", url: "https://valet.local" },
+        },
         settings: {
           toolExecution: "sequential",
           progress: {
@@ -281,7 +341,10 @@ export class ValetDurableRuntime {
 
   async syncState(nextState: ValetSyncState): Promise<{ ok: true }> {
     this.state = nextState;
-    this.models.syncProviders(nextState.providers);
+    this.models.syncProviders(
+      nextState.providers,
+      nextState.preferences.activeProviderId,
+    );
     this.syncPluginExtensions(nextState.plugins);
     await this.mcp.syncServers(
       nextState.mcpServers ?? [],
@@ -369,12 +432,72 @@ export class ValetDurableRuntime {
       BACKGROUND_CONTEXT,
     );
 
-    const attachSuffix =
+    const imageBlocks: Array<{ type: "image"; data: string; mimeType: string }> = [];
+    const fileExcerpts: string[] = [];
+    for (const att of req.attachments ?? []) {
+      if (att.kind === "image" || att.kind === "screen") {
+        let base64Data = "";
+        let mimeType = att.mimeType || "image/png";
+        if (att.dataUrl) {
+          const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(
+            att.dataUrl.trim(),
+          );
+          if (match?.[1] && match?.[2]) {
+            mimeType = match[1];
+            base64Data = match[2];
+          }
+        } else if (att.path && existsSync(att.path)) {
+          try {
+            const st = statSync(att.path);
+            if (st.isFile() && st.size > 0 && st.size <= 3.2 * 1024 * 1024) {
+              base64Data = readFileSync(att.path).toString("base64");
+              if (!att.mimeType) {
+                mimeType = /\.(jpe?g)$/i.test(att.path)
+                  ? "image/jpeg"
+                  : "image/png";
+              }
+            }
+          } catch {
+            // Ignore unreadable local image path
+          }
+        }
+        if (base64Data) {
+          imageBlocks.push({
+            type: "image",
+            data: base64Data,
+            mimeType,
+          });
+        }
+      } else if (att.kind === "file") {
+        let excerpt = att.textExcerpt?.trim() ?? "";
+        if (!excerpt && att.path && existsSync(att.path)) {
+          try {
+            const st = statSync(att.path);
+            if (st.isFile() && st.size > 0 && st.size <= 64 * 1024) {
+              excerpt = readFileSync(att.path, "utf8").slice(0, 12_000).trim();
+            }
+          } catch {
+            // Ignore unreadable file path
+          }
+        }
+        if (excerpt) {
+          fileExcerpts.push(`[文件内容 · ${att.name}]\n${excerpt.slice(0, 12_000)}`);
+        }
+      }
+    }
+
+    const attachSummary =
       req.attachments && req.attachments.length > 0
         ? `\n\n[附件上下文: ${req.attachments.map((a) => `${a.name}${a.meta ? ` (${a.meta})` : ""}`).join("、")}]`
         : "";
+    const excerptBlock =
+      fileExcerpts.length > 0 ? `\n\n${fileExcerpts.join("\n\n")}` : "";
     const mentionPrefix = mentionPlugin ? `@${mentionPlugin.name} ` : "";
-    const inputContent = `${mentionPrefix}${req.prompt}${attachSuffix}`;
+    const inputText = `${mentionPrefix}${req.prompt}${attachSummary}${excerptBlock}`;
+    const submitContent =
+      imageBlocks.length > 0
+        ? [{ type: "text" as const, text: inputText }, ...imageBlocks]
+        : inputText;
 
     this.turnSideEffects.set(conv.id, { inboxIds: [], timelineIds: [] });
 
@@ -389,15 +512,15 @@ export class ValetDurableRuntime {
         const live = call.value.docs["pi.live"] as LiveState | undefined;
         if (!live) return;
 
-        let thinkingText = "";
-        let partialText = "";
+        let rawPartialText = "";
         const partialMsg = live.generation?.message;
         if (partialMsg && Array.isArray(partialMsg.content)) {
           for (const block of partialMsg.content) {
-            if (block.type === "thinking") thinkingText += block.thinking;
-            else if (block.type === "text") partialText += block.text;
+            if (block.type === "text") rawPartialText += block.text;
           }
         }
+
+        const { cleanText: cleanPartialText } = stripThinkTags(rawPartialText);
 
         const steps: ChatStreamStep[] = (live.tools ?? []).map((slot) => ({
           id: slot.callId,
@@ -411,16 +534,21 @@ export class ValetDurableRuntime {
           detail: slot.output?.slice(0, 120),
         }));
 
+        const statusText = summarizeStreamStatus(
+          steps,
+          Boolean(cleanPartialText),
+        );
+
         const payload: ChatStreamPayload = {
           chatId: req.chatId,
           phase:
             steps.some((s) => s.status === "running" || s.status === "pending")
               ? "tools"
-              : partialText
+              : cleanPartialText
                 ? "streaming"
                 : "thinking",
-          partialText: partialText || undefined,
-          thinkingText: thinkingText || undefined,
+          partialText: cleanPartialText || undefined,
+          thinkingText: statusText,
           steps: steps.length > 0 ? steps : undefined,
         };
         this.bridge.notifyHost("host.chatStream", payload);
@@ -429,7 +557,7 @@ export class ValetDurableRuntime {
       const submission = await conv.submit(
         {
           type: "input",
-          content: inputContent,
+          content: submitContent,
           whenBusy: "followUp",
           requestId: req.requestId,
         },
@@ -450,6 +578,7 @@ export class ValetDurableRuntime {
               answerText += block.text;
             }
           }
+          answerText = stripThinkTags(answerText).cleanText.trim();
         }
       } else if (settled.status === "unanswered") {
         answerText = `本轮执行未完成（原因：${settled.reason ?? "aborted"}）。`;
