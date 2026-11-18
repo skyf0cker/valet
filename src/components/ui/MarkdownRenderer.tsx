@@ -14,7 +14,7 @@ const CodeBlockCard: React.FC<{ language: string; code: string }> = ({
   };
 
   return (
-    <div className="overflow-hidden rounded-[8px] border border-[var(--border-light)] bg-[var(--bg-code)]">
+    <div className="min-w-0 max-w-full overflow-hidden rounded-[8px] border border-[var(--border-light)] bg-[var(--bg-code)]">
       <div className="flex h-[28px] items-center justify-between border-b border-[var(--border-subtle)] px-3">
         <span className="font-mono text-[10px] uppercase tracking-[0.06em] text-[var(--ink-subtle)]">
           {language || "code"}
@@ -34,82 +34,660 @@ const CodeBlockCard: React.FC<{ language: string; code: string }> = ({
   );
 };
 
-function renderInline(text: string, keyPrefix = "in"): React.ReactNode[] {
-  const tokenRe =
-    /(`[^`\n]+`|\[[^\]]+\]\((?:https?:\/\/|mailto:)[^\s)]+\)|\*\*\*[^*\n]+\*\*\*|\*\*[^*\n]+\*\*|~~[^~\n]+~~|\*[^*\n]+\*)/g;
+// ---------------------------------------------------------------------------
+// Indentation helpers (spaces + 4-column tab stops)
+// ---------------------------------------------------------------------------
+
+function getIndentCols(line: string): number {
+  let cols = 0;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === " ") {
+      cols += 1;
+    } else if (ch === "\t") {
+      cols += 4 - (cols % 4);
+    } else {
+      break;
+    }
+  }
+  return cols;
+}
+
+function stripIndentCols(line: string, maxCols: number): string {
+  if (maxCols <= 0) return line;
+  let cols = 0;
+  let i = 0;
+  while (i < line.length && cols < maxCols) {
+    const ch = line[i];
+    if (ch === " ") {
+      cols += 1;
+      i++;
+    } else if (ch === "\t") {
+      const nextCols = cols + (4 - (cols % 4));
+      if (nextCols > maxCols) {
+        return " ".repeat(nextCols - maxCols) + line.slice(i + 1);
+      }
+      cols = nextCols;
+      i++;
+    } else {
+      break;
+    }
+  }
+  return line.slice(i);
+}
+
+// ---------------------------------------------------------------------------
+// Inline parser
+// ---------------------------------------------------------------------------
+
+const ESCAPABLE_CHARS = new Set([
+  "\\",
+  "`",
+  "*",
+  "_",
+  "{",
+  "}",
+  "[",
+  "]",
+  "(",
+  ")",
+  "#",
+  "+",
+  "-",
+  ".",
+  "!",
+  "|",
+  "~",
+  ">",
+]);
+
+function isEscapableChar(ch: string | undefined): boolean {
+  return ch !== undefined && ESCAPABLE_CHARS.has(ch);
+}
+
+function isWordChar(ch: string | undefined): boolean {
+  return ch !== undefined && /[A-Za-z0-9_]/.test(ch);
+}
+
+function isWhitespace(ch: string | undefined): boolean {
+  return ch === undefined || ch === "" || /\s/.test(ch);
+}
+
+function isSafeLinkUrl(url: string): boolean {
+  return /^(?:https?:\/\/|mailto:)/i.test(url);
+}
+
+function findInlineCodeSpanEnd(
+  text: string,
+  start: number
+): { contentStart: number; closeStart: number; closeEnd: number } | null {
+  let j = start;
+  while (j < text.length && text[j] === "`") j++;
+  const tickLen = j - start;
+  if (tickLen === 0) return null;
+
+  let k = j;
+  while (k < text.length) {
+    if (text[k] === "`") {
+      let m = k;
+      while (m < text.length && text[m] === "`") m++;
+      if (m - k === tickLen) {
+        return { contentStart: j, closeStart: k, closeEnd: m };
+      }
+      k = m;
+    } else {
+      k++;
+    }
+  }
+  return null;
+}
+
+function normalizeCodeSpanContent(raw: string): string {
+  const singleLine = raw.replace(/\r?\n/g, " ");
+  if (
+    singleLine.length >= 2 &&
+    singleLine.startsWith(" ") &&
+    singleLine.endsWith(" ") &&
+    /[^ ]/.test(singleLine)
+  ) {
+    return singleLine.slice(1, -1);
+  }
+  return singleLine;
+}
+
+function parseMarkdownLink(
+  text: string,
+  start: number
+): { label: string; href: string; end: number } | null {
+  if (text[start] !== "[") return null;
+
+  let k = start + 1;
+  let depth = 1;
+  while (k < text.length) {
+    const ch = text[k];
+    if (ch === "\\" && isEscapableChar(text[k + 1])) {
+      k += 2;
+      continue;
+    }
+    if (ch === "`") {
+      const span = findInlineCodeSpanEnd(text, k);
+      if (span) {
+        k = span.closeEnd;
+      } else {
+        while (k < text.length && text[k] === "`") k++;
+      }
+      continue;
+    }
+    if (ch === "[") {
+      depth++;
+    } else if (ch === "]") {
+      depth--;
+      if (depth === 0) break;
+    }
+    k++;
+  }
+
+  if (depth !== 0 || text[k + 1] !== "(") return null;
+
+  const label = text.slice(start + 1, k);
+  let p = k + 2;
+  while (p < text.length && (text[p] === " " || text[p] === "\t")) p++;
+
+  let href = "";
+  if (text[p] === "<") {
+    const angleStart = p + 1;
+    let q = angleStart;
+    while (q < text.length && text[q] !== ">" && text[q] !== "\n" && text[q] !== "<") {
+      if (text[q] === "\\" && q + 1 < text.length) {
+        q += 2;
+        continue;
+      }
+      q++;
+    }
+    if (text[q] !== ">") return null;
+    href = text.slice(angleStart, q).trim();
+    p = q + 1;
+  } else {
+    const destStart = p;
+    let parenDepth = 0;
+    while (p < text.length) {
+      const ch = text[p]!;
+      if (ch === "\\" && isEscapableChar(text[p + 1])) {
+        p += 2;
+        continue;
+      }
+      if (/\s/.test(ch)) break;
+      if (ch === "(") {
+        parenDepth++;
+      } else if (ch === ")") {
+        if (parenDepth === 0) break;
+        parenDepth--;
+      }
+      p++;
+    }
+    href = text.slice(destStart, p).replace(/\\([\\`*_{}[\]()#+\-.!|~>])/g, "$1");
+  }
+
+  // Optional whitespace and optional link title before closing ')'
+  while (p < text.length && (text[p] === " " || text[p] === "\t")) p++;
+  if (text[p] === '"' || text[p] === "'") {
+    const quote = text[p];
+    p++;
+    while (p < text.length && text[p] !== quote && text[p] !== "\n") {
+      if (text[p] === "\\" && p + 1 < text.length) {
+        p += 2;
+        continue;
+      }
+      p++;
+    }
+    if (text[p] !== quote) return null;
+    p++;
+    while (p < text.length && (text[p] === " " || text[p] === "\t")) p++;
+  }
+
+  if (text[p] !== ")" || !href || !isSafeLinkUrl(href)) return null;
+
+  return { label, href, end: p + 1 };
+}
+
+function scanAngleAutolink(
+  text: string,
+  start: number
+): { href: string; end: number } | null {
+  if (text[start] !== "<") return null;
+  const closeIdx = text.indexOf(">", start + 1);
+  if (closeIdx === -1) return null;
+  const inner = text.slice(start + 1, closeIdx);
+  if (!inner || inner.includes("<") || /\s/.test(inner)) return null;
+  if (!/^(?:https?:\/\/[^\s]+|mailto:[^\s@]+@[^\s@]+)$/i.test(inner)) return null;
+  return { href: inner, end: closeIdx + 1 };
+}
+
+function scanBareUrl(
+  text: string,
+  start: number
+): { href: string; end: number } | null {
+  if (
+    !text.startsWith("https://", start) &&
+    !text.startsWith("http://", start)
+  ) {
+    return null;
+  }
+  if (start > 0 && /[A-Za-z0-9]/.test(text[start - 1]!)) {
+    return null;
+  }
+
+  // Stop at whitespace, quotes, angle brackets, backticks, or CJK/fullwidth chars
+  let k = start;
+  while (k < text.length) {
+    const ch = text[k]!;
+    if (/[\s<>"'`\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]/.test(ch)) {
+      break;
+    }
+    k++;
+  }
+
+  let candidate = text.slice(start, k);
+  while (candidate.length > 0) {
+    const last = candidate[candidate.length - 1]!;
+    if (/[.,;:!?'"~*]/.test(last)) {
+      candidate = candidate.slice(0, -1);
+      continue;
+    }
+    if (last === ")" || last === "]" || last === "}") {
+      const open = last === ")" ? "(" : last === "]" ? "[" : "{";
+      let balance = 0;
+      for (let i = 0; i < candidate.length; i++) {
+        if (candidate[i] === open) balance++;
+        else if (candidate[i] === last) balance--;
+      }
+      if (balance < 0) {
+        candidate = candidate.slice(0, -1);
+        continue;
+      }
+    }
+    break;
+  }
+
+  if (!/^https?:\/\/[^\s/$.?#][^\s]*$/i.test(candidate)) {
+    return null;
+  }
+
+  return { href: candidate, end: start + candidate.length };
+}
+
+function canOpenDelimiter(
+  text: string,
+  runStart: number,
+  runEnd: number,
+  delimChar: "*" | "_" | "~"
+): boolean {
+  const prevChar = runStart > 0 ? text[runStart - 1] : "";
+  const nextChar = runEnd < text.length ? text[runEnd] : "";
+  if (isWhitespace(nextChar)) return false;
+  if (delimChar === "_" && isWordChar(prevChar) && isWordChar(nextChar)) {
+    return false;
+  }
+  return true;
+}
+
+function canCloseDelimiter(
+  text: string,
+  runStart: number,
+  runEnd: number,
+  delimChar: "*" | "_" | "~"
+): boolean {
+  const prevChar = runStart > 0 ? text[runStart - 1] : "";
+  const nextChar = runEnd < text.length ? text[runEnd] : "";
+  if (isWhitespace(prevChar)) return false;
+  if (delimChar === "_" && isWordChar(prevChar) && isWordChar(nextChar)) {
+    return false;
+  }
+  return true;
+}
+
+function skipInlineAtom(text: string, k: number): number | null {
+  const ch = text[k];
+  if (ch === "\\" && isEscapableChar(text[k + 1])) {
+    return k + 2;
+  }
+  if (ch === "`") {
+    const span = findInlineCodeSpanEnd(text, k);
+    if (span) return span.closeEnd;
+    let end = k;
+    while (end < text.length && text[end] === "`") end++;
+    return end;
+  }
+  if (ch === "[") {
+    const link = parseMarkdownLink(text, k);
+    if (link) return link.end;
+  }
+  return null;
+}
+
+function findClosingDelimiter(
+  text: string,
+  searchStart: number,
+  delimChar: "*" | "_" | "~",
+  delimLen: number
+): { closeStart: number; closeEnd: number } | null {
+  let k = searchStart;
+  while (k < text.length) {
+    const skipped = skipInlineAtom(text, k);
+    if (skipped !== null) {
+      k = skipped;
+      continue;
+    }
+    if (text[k] === delimChar) {
+      let m = k;
+      while (m < text.length && text[m] === delimChar) m++;
+      const runLen = m - k;
+
+      const matchesLen =
+        delimChar === "~"
+          ? runLen === 2
+          : runLen === delimLen || (delimLen < 3 && runLen === 3);
+
+      if (matchesLen && canCloseDelimiter(text, k, m, delimChar)) {
+        const closeStart = delimLen < 3 && runLen === 3 ? m - delimLen : k;
+        const closeEnd = closeStart + delimLen;
+        if (closeStart > searchStart) {
+          return { closeStart, closeEnd };
+        }
+      }
+      k = m;
+      continue;
+    }
+    k++;
+  }
+  return null;
+}
+
+function peekFirstClosingRunLen(
+  text: string,
+  searchStart: number,
+  delimChar: "*" | "_"
+): number | null {
+  let k = searchStart;
+  while (k < text.length) {
+    const skipped = skipInlineAtom(text, k);
+    if (skipped !== null) {
+      k = skipped;
+      continue;
+    }
+    if (text[k] === delimChar) {
+      let m = k;
+      while (m < text.length && text[m] === delimChar) m++;
+      const runLen = m - k;
+      if ((runLen === 1 || runLen === 2) && canCloseDelimiter(text, k, m, delimChar)) {
+        return runLen;
+      }
+      k = m;
+      continue;
+    }
+    k++;
+  }
+  return null;
+}
+
+function renderInline(
+  text: string,
+  keyPrefix = "in",
+  inLink = false
+): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
-  let lastIdx = 0;
-  let match: RegExpExecArray | null;
+  let plainBuf = "";
+  let i = 0;
   let idx = 0;
 
-  while ((match = tokenRe.exec(text)) !== null) {
-    if (match.index > lastIdx) {
-      nodes.push(text.slice(lastIdx, match.index));
+  const flushPlain = () => {
+    if (plainBuf) {
+      nodes.push(plainBuf);
+      plainBuf = "";
     }
-    const token = match[0];
-    const key = `${keyPrefix}-${idx++}`;
+  };
 
-    if (token.startsWith("`") && token.endsWith("`")) {
-      nodes.push(
-        <code
-          key={key}
-          className="rounded-[4px] bg-[var(--bg-muted)] px-1 py-0.5 font-mono text-[12px] font-semibold text-[var(--ink-strong)]"
-        >
-          {token.slice(1, -1)}
-        </code>
-      );
-    } else if (token.startsWith("[")) {
-      const linkMatch = /^\[([^\]]+)\]\(((?:https?:\/\/|mailto:)[^\s)]+)\)$/.exec(token);
-      if (linkMatch?.[1] && linkMatch?.[2]) {
+  while (i < text.length) {
+    const ch = text[i]!;
+
+    // 1. Backslash escape
+    if (ch === "\\" && isEscapableChar(text[i + 1])) {
+      plainBuf += text[i + 1]!;
+      i += 2;
+      continue;
+    }
+
+    // 2. Variable-length inline code span
+    if (ch === "`") {
+      const span = findInlineCodeSpanEnd(text, i);
+      if (span) {
+        flushPlain();
+        const key = `${keyPrefix}-${idx++}`;
+        nodes.push(
+          <code
+            key={key}
+            className="rounded-[4px] bg-[var(--bg-muted)] px-1 py-0.5 font-mono text-[12px] font-semibold text-[var(--ink-strong)]"
+          >
+            {normalizeCodeSpanContent(text.slice(span.contentStart, span.closeStart))}
+          </code>
+        );
+        i = span.closeEnd;
+      } else {
+        let j = i;
+        while (j < text.length && text[j] === "`") j++;
+        plainBuf += text.slice(i, j);
+        i = j;
+      }
+      continue;
+    }
+
+    // 3. Markdown link [label](href)
+    if (!inLink && ch === "[") {
+      const link = parseMarkdownLink(text, i);
+      if (link) {
+        flushPlain();
+        const key = `${keyPrefix}-${idx++}`;
         nodes.push(
           <a
             key={key}
-            href={linkMatch[2]}
+            href={link.href}
             target="_blank"
             rel="noopener noreferrer"
             className="text-[var(--ink-strong)] underline decoration-[var(--border-strong)] underline-offset-2 hover:opacity-80"
           >
-            {renderInline(linkMatch[1], `${key}-a`)}
+            {renderInline(link.label, `${key}-a`, true)}
           </a>
         );
-      } else {
-        nodes.push(token);
+        i = link.end;
+        continue;
       }
-    } else if (token.startsWith("***") && token.endsWith("***") && token.length > 6) {
-      nodes.push(
-        <strong key={key} className="font-semibold italic text-[var(--ink-strong)]">
-          {renderInline(token.slice(3, -3), `${key}-bi`)}
-        </strong>
-      );
-    } else if (token.startsWith("**") && token.endsWith("**") && token.length > 4) {
-      nodes.push(
-        <strong key={key} className="font-semibold text-[var(--ink-strong)]">
-          {renderInline(token.slice(2, -2), `${key}-b`)}
-        </strong>
-      );
-    } else if (token.startsWith("~~") && token.endsWith("~~") && token.length > 4) {
-      nodes.push(
-        <del key={key} className="text-[var(--ink-muted)] line-through">
-          {renderInline(token.slice(2, -2), `${key}-s`)}
-        </del>
-      );
-    } else if (token.startsWith("*") && token.endsWith("*") && token.length > 2) {
-      nodes.push(
-        <em key={key} className="italic">
-          {renderInline(token.slice(1, -1), `${key}-i`)}
-        </em>
-      );
-    } else {
-      nodes.push(token);
     }
 
-    lastIdx = tokenRe.lastIndex;
+    // 4. Angle-bracket autolink <https://...> / <mailto:...>
+    if (!inLink && ch === "<") {
+      const auto = scanAngleAutolink(text, i);
+      if (auto) {
+        flushPlain();
+        const key = `${keyPrefix}-${idx++}`;
+        nodes.push(
+          <a
+            key={key}
+            href={auto.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="break-all text-[var(--ink-strong)] underline decoration-[var(--border-strong)] underline-offset-2 hover:opacity-80"
+          >
+            {auto.href}
+          </a>
+        );
+        i = auto.end;
+        continue;
+      }
+    }
+
+    // 5. Bare URL autolink
+    if (!inLink && ch === "h") {
+      const bare = scanBareUrl(text, i);
+      if (bare) {
+        flushPlain();
+        const key = `${keyPrefix}-${idx++}`;
+        nodes.push(
+          <a
+            key={key}
+            href={bare.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="break-all text-[var(--ink-strong)] underline decoration-[var(--border-strong)] underline-offset-2 hover:opacity-80"
+          >
+            {bare.href}
+          </a>
+        );
+        i = bare.end;
+        continue;
+      }
+    }
+
+    // 6. Emphasis & strikethrough (*, _, ~~)
+    if (ch === "*" || ch === "_" || ch === "~") {
+      let runEnd = i;
+      while (runEnd < text.length && text[runEnd] === ch) runEnd++;
+      const runLen = runEnd - i;
+
+      if (ch === "~") {
+        if (runLen === 2 && canOpenDelimiter(text, i, runEnd, "~")) {
+          const match = findClosingDelimiter(text, runEnd, "~", 2);
+          if (match) {
+            flushPlain();
+            const key = `${keyPrefix}-${idx++}`;
+            nodes.push(
+              <del key={key} className="text-[var(--ink-muted)] line-through">
+                {renderInline(text.slice(runEnd, match.closeStart), `${key}-s`, inLink)}
+              </del>
+            );
+            i = match.closeEnd;
+            continue;
+          }
+        }
+        plainBuf += text.slice(i, runEnd);
+        i = runEnd;
+        continue;
+      }
+
+      if (runLen > 3 || !canOpenDelimiter(text, i, runEnd, ch)) {
+        plainBuf += text.slice(i, runEnd);
+        i = runEnd;
+        continue;
+      }
+
+      let matched = false;
+      const tryLengths: number[] =
+        runLen === 3
+          ? peekFirstClosingRunLen(text, runEnd, ch) === 2
+            ? [3, 1]
+            : [3, 2, 1]
+          : [runLen];
+
+      for (const tryLen of tryLengths) {
+        const openEnd = i + tryLen;
+        const match = findClosingDelimiter(text, openEnd, ch, tryLen);
+        if (!match) continue;
+
+        flushPlain();
+        const key = `${keyPrefix}-${idx++}`;
+        const inner = text.slice(openEnd, match.closeStart);
+        if (tryLen === 3) {
+          nodes.push(
+            <strong key={key} className="font-semibold italic text-[var(--ink-strong)]">
+              {renderInline(inner, `${key}-bi`, inLink)}
+            </strong>
+          );
+        } else if (tryLen === 2) {
+          nodes.push(
+            <strong key={key} className="font-semibold text-[var(--ink-strong)]">
+              {renderInline(inner, `${key}-b`, inLink)}
+            </strong>
+          );
+        } else {
+          nodes.push(
+            <em key={key} className="italic">
+              {renderInline(inner, `${key}-i`, inLink)}
+            </em>
+          );
+        }
+        i = match.closeEnd;
+        matched = true;
+        break;
+      }
+
+      if (matched) continue;
+
+      // Advance 1 char on unmatched runs so cases like **foo* still match inner *foo*
+      plainBuf += ch;
+      i += 1;
+      continue;
+    }
+
+    plainBuf += ch;
+    i++;
   }
 
-  if (lastIdx < text.length) {
-    nodes.push(text.slice(lastIdx));
-  }
+  flushPlain();
   return nodes;
+}
+
+// ---------------------------------------------------------------------------
+// Block matchers
+// ---------------------------------------------------------------------------
+
+function isHorizontalRule(line: string): boolean {
+  return /^\s{0,3}(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$/.test(line);
+}
+
+interface FenceOpen {
+  indentCols: number;
+  char: "`" | "~";
+  len: number;
+  lang: string;
+}
+
+function matchCodeFenceOpen(line: string): FenceOpen | null {
+  // Backtick info string cannot contain backticks (prevents matching inline ```foo```)
+  const btMatch = /^(\s*)(`{3,})([^`]*)$/.exec(line);
+  if (btMatch?.[2]) {
+    const lang = (btMatch[3] ?? "").trim().split(/\s+/)[0] ?? "";
+    return {
+      indentCols: getIndentCols(btMatch[1] ?? ""),
+      char: "`",
+      len: btMatch[2].length,
+      lang,
+    };
+  }
+  const tildeMatch = /^(\s*)(~{3,})(.*)$/.exec(line);
+  if (tildeMatch?.[2]) {
+    const lang = (tildeMatch[3] ?? "").trim().split(/\s+/)[0] ?? "";
+    return {
+      indentCols: getIndentCols(tildeMatch[1] ?? ""),
+      char: "~",
+      len: tildeMatch[2].length,
+      lang,
+    };
+  }
+  return null;
+}
+
+function isCodeFenceClose(line: string, char: "`" | "~", minLen: number): boolean {
+  const trimmed = line.trim();
+  if (trimmed.length < minLen) return false;
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed[i] !== char) return false;
+  }
+  return true;
+}
+
+function matchHeading(line: string): { level: number; content: string } | null {
+  const m = /^\s{0,3}(#{1,6})\s+(.+?)(?:\s+#+)?\s*$/.exec(line);
+  if (!m?.[1] || !m?.[2]) return null;
+  return { level: m[1].length, content: m[2] };
 }
 
 function splitTableRow(rawLine: string): string[] {
@@ -147,9 +725,11 @@ function splitTableRow(rawLine: string): string[] {
 
 function isTableDelimiterLine(line: string): boolean {
   const trimmed = line.trim();
-  if (!trimmed.includes("-")) return false;
-  return /^\|?(?:\s*:?-{2,}:?\s*\|)+\s*(?::?-{2,}:?\s*\|?)?$/.test(trimmed) ||
-    /^\|(?:\s*:?-{2,}:?\s*\|)+$/.test(trimmed);
+  if (!trimmed.includes("|") || !trimmed.includes("-")) return false;
+  return (
+    /^\|?(?:\s*:?-{1,}:?\s*\|)+\s*(?::?-{1,}:?\s*\|?)?$/.test(trimmed) ||
+    /^\|(?:\s*:?-{1,}:?\s*\|)+$/.test(trimmed)
+  );
 }
 
 function parseTableAlignments(delimiterLine: string): Array<"left" | "center" | "right"> {
@@ -163,13 +743,89 @@ function parseTableAlignments(delimiterLine: string): Array<"left" | "center" | 
   });
 }
 
-function isListLine(line: string): boolean {
-  return /^\s*(?:[-*+]|\d+\.)\s+/.test(line);
+interface ListMarker {
+  indent: number;
+  kind: "ordered" | "unordered";
+  delimiter: string;
+  orderNumber?: number;
+  contentIndent: number;
+  content: string;
+  taskChecked?: boolean;
 }
 
-function getIndent(line: string): number {
-  const m = /^(\s*)/.exec(line);
-  return m?.[1]?.length ?? 0;
+function parseTaskPrefix(rawContent: string): {
+  content: string;
+  taskChecked?: boolean;
+} {
+  const m = /^\[([ xX])\](?:\s+(.*)|$)$/.exec(rawContent);
+  if (!m?.[1]) return { content: rawContent };
+  return {
+    content: m[2] ?? "",
+    taskChecked: m[1].toLowerCase() === "x",
+  };
+}
+
+function parseListMarker(line: string): ListMarker | null {
+  if (isHorizontalRule(line)) return null;
+
+  const ordered = /^(\s*)(\d{1,9})([.)])(\s+)(.*)$/.exec(line);
+  if (ordered?.[2] && ordered[3] && ordered[4] !== undefined) {
+    const indent = getIndentCols(ordered[1] ?? "");
+    const markerWidth = ordered[2].length + 1;
+    const spaceCols = getIndentCols(ordered[4]);
+    const contentIndent =
+      spaceCols > 4 ? indent + markerWidth + 1 : indent + markerWidth + spaceCols;
+    const task = parseTaskPrefix(ordered[5] ?? "");
+    return {
+      indent,
+      kind: "ordered",
+      delimiter: ordered[3],
+      orderNumber: Number.parseInt(ordered[2], 10),
+      contentIndent,
+      content: task.content,
+      taskChecked: task.taskChecked,
+    };
+  }
+
+  const unordered = /^(\s*)([-*+])(\s+)(.*)$/.exec(line);
+  if (unordered?.[2] && unordered[3] !== undefined) {
+    const indent = getIndentCols(unordered[1] ?? "");
+    const markerWidth = 1;
+    const spaceCols = getIndentCols(unordered[3]);
+    const contentIndent =
+      spaceCols > 4 ? indent + markerWidth + 1 : indent + markerWidth + spaceCols;
+    const task = parseTaskPrefix(unordered[4] ?? "");
+    return {
+      indent,
+      kind: "unordered",
+      delimiter: unordered[2],
+      contentIndent,
+      content: task.content,
+      taskChecked: task.taskChecked,
+    };
+  }
+
+  return null;
+}
+
+function isCompatibleListMarker(first: ListMarker, candidate: ListMarker): boolean {
+  if (first.indent !== candidate.indent || first.kind !== candidate.kind) {
+    return false;
+  }
+  if (first.kind === "ordered") {
+    return first.delimiter === candidate.delimiter;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Recursive block & list renderers
+// ---------------------------------------------------------------------------
+
+interface ParsedListItem {
+  startIdx: number;
+  marker: ListMarker;
+  dedentedLines: string[];
 }
 
 function renderListBlock(
@@ -177,91 +833,175 @@ function renderListBlock(
   startIdx: number,
   keyPrefix: string
 ): { node: React.ReactNode; nextIdx: number } {
-  const firstLine = lines[startIdx] ?? "";
-  const baseIndent = getIndent(firstLine);
-  const isOrdered = /^\s*\d+\.\s+/.test(firstLine);
+  const firstMarker = parseListMarker(lines[startIdx] ?? "");
+  if (!firstMarker) {
+    return { node: null, nextIdx: startIdx + 1 };
+  }
 
-  const items: React.ReactNode[] = [];
+  const isOrdered = firstMarker.kind === "ordered";
+  const startNumber = firstMarker.orderNumber ?? 1;
+  let isLoose = false;
+  const parsedItems: ParsedListItem[] = [];
   let i = startIdx;
 
   while (i < lines.length) {
     const line = lines[i] ?? "";
-    if (!line.trim()) {
+    const marker = parseListMarker(line);
+    if (!marker || !isCompatibleListMarker(firstMarker, marker)) {
       break;
     }
-    const indent = getIndent(line);
-    if (indent < baseIndent) break;
 
-    if (indent > baseIndent && isListLine(line)) {
-      const sub = renderListBlock(lines, i, `${keyPrefix}-sub-${i}`);
-      if (items.length > 0) {
-        const lastIdx = items.length - 1;
-        items[lastIdx] = (
-          <li key={`${keyPrefix}-wrap-${i}`} className="flex flex-col gap-1">
-            {items[lastIdx]}
-            {sub.node}
-          </li>
-        );
-      } else {
-        items.push(<li key={`${keyPrefix}-orphan-${i}`}>{sub.node}</li>);
+    const itemStartIdx = i;
+    const rawContinuationLines: Array<{ text: string; inFence: boolean }> = [];
+    let activeFence = matchCodeFenceOpen(marker.content);
+    let j = i + 1;
+
+    while (j < lines.length) {
+      const cur = lines[j] ?? "";
+
+      if (activeFence) {
+        rawContinuationLines.push({ text: cur, inFence: true });
+        if (isCodeFenceClose(cur, activeFence.char, activeFence.len)) {
+          activeFence = null;
+        }
+        j++;
+        continue;
       }
-      i = sub.nextIdx;
-      continue;
-    }
 
-    const sameOrdered = /^\s*\d+\.\s+/.test(line);
-    const sameUnordered = /^\s*[-*+]\s+/.test(line);
-    if (indent === baseIndent && ((isOrdered && !sameOrdered) || (!isOrdered && !sameUnordered))) {
+      if (!cur.trim()) {
+        let k = j;
+        while (k < lines.length && !(lines[k] ?? "").trim()) {
+          k++;
+        }
+        if (k < lines.length && getIndentCols(lines[k] ?? "") > marker.indent) {
+          for (let b = j; b < k; b++) {
+            rawContinuationLines.push({ text: "", inFence: false });
+          }
+          isLoose = true;
+          j = k;
+          continue;
+        }
+        break;
+      }
+
+      if (getIndentCols(cur) > marker.indent) {
+        const openedFence = matchCodeFenceOpen(cur);
+        if (openedFence) {
+          activeFence = openedFence;
+        }
+        rawContinuationLines.push({ text: cur, inFence: false });
+        j++;
+        continue;
+      }
+
       break;
     }
 
-    const taskMatch = /^\s*[-*+]\s+\[([ xX])\]\s+(.*)$/.exec(line);
-    if (taskMatch) {
-      const checked = taskMatch[1]!.toLowerCase() === "x";
-      const content = taskMatch[2] ?? "";
-      items.push(
-        <li key={`${keyPrefix}-li-${i}`} className="flex items-start gap-2">
+    let minOuterIndent = Infinity;
+    for (const entry of rawContinuationLines) {
+      if (!entry.inFence && entry.text.trim()) {
+        minOuterIndent = Math.min(minOuterIndent, getIndentCols(entry.text));
+      }
+    }
+
+    const dedentCols =
+      minOuterIndent === Infinity
+        ? marker.contentIndent
+        : Math.min(marker.contentIndent, minOuterIndent);
+    const dedentedLines = rawContinuationLines.map((entry) =>
+      stripIndentCols(entry.text, dedentCols)
+    );
+
+    parsedItems.push({
+      startIdx: itemStartIdx,
+      marker,
+      dedentedLines,
+    });
+
+    i = j;
+
+    // Peek past blank lines to keep loose lists grouped in a single <ol>/<ul>
+    if (i < lines.length && !(lines[i] ?? "").trim()) {
+      let k = i;
+      while (k < lines.length && !(lines[k] ?? "").trim()) {
+        k++;
+      }
+      if (k < lines.length) {
+        const nextMarker = parseListMarker(lines[k] ?? "");
+        if (nextMarker && isCompatibleListMarker(firstMarker, nextMarker)) {
+          isLoose = true;
+          i = k;
+          continue;
+        }
+      }
+      break;
+    }
+  }
+
+  const hasTasks = parsedItems.some((item) => item.marker.taskChecked !== undefined);
+  const allTasks =
+    hasTasks && parsedItems.every((item) => item.marker.taskChecked !== undefined);
+
+  const items = parsedItems.map(({ startIdx: itemIdx, marker, dedentedLines }) => {
+    const itemKey = `${keyPrefix}-li-${itemIdx}`;
+    const isInlineOnly =
+      dedentedLines.length === 0 && matchCodeFenceOpen(marker.content) === null;
+
+    let bodyNode: React.ReactNode;
+    if (isInlineOnly) {
+      bodyNode = renderInline(marker.content, `${keyPrefix}-${itemIdx}`);
+    } else {
+      const itemLines = marker.content
+        ? [marker.content, ...dedentedLines]
+        : dedentedLines;
+      bodyNode = renderBlocks(itemLines.join("\n"), `${keyPrefix}-b-${itemIdx}`);
+    }
+
+    if (marker.taskChecked !== undefined) {
+      return (
+        <li
+          key={itemKey}
+          className={`${allTasks ? "" : "-ml-4 "}flex list-none items-start gap-2`}
+        >
           <span
+            aria-hidden="true"
             className={`mt-[3px] inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-[3px] border font-mono text-[9px] ${
-              checked
+              marker.taskChecked
                 ? "border-[var(--ink-primary)] bg-[var(--ink-primary)] text-[var(--ink-on-primary)]"
                 : "border-[var(--border-strong)] bg-transparent text-transparent"
             }`}
           >
-            {checked ? "✓" : ""}
+            {marker.taskChecked ? "✓" : ""}
           </span>
-          <span className="min-w-0 flex-1">{renderInline(content, `${keyPrefix}-${i}`)}</span>
+          <div className="min-w-0 flex-1 space-y-1.5">{bodyNode}</div>
         </li>
       );
-      i++;
-      continue;
     }
 
-    const orderedMatch = /^\s*\d+\.\s+(.*)$/.exec(line);
-    const unorderedMatch = /^\s*[-*+]\s+(.*)$/.exec(line);
-    const content = orderedMatch?.[1] ?? unorderedMatch?.[1] ?? line.trim();
-    items.push(
-      <li key={`${keyPrefix}-li-${i}`}>{renderInline(content, `${keyPrefix}-${i}`)}</li>
+    return (
+      <li
+        key={itemKey}
+        className={isInlineOnly ? "pl-0.5" : "pl-0.5 space-y-1.5"}
+      >
+        {bodyNode}
+      </li>
     );
-    i++;
-  }
+  });
 
   const ListTag = isOrdered ? "ol" : "ul";
-  const hasTasks = items.some(
-    (item) => React.isValidElement(item) && (item.props as { className?: string })?.className?.includes("items-start")
-  );
+  const spacingClass = isLoose ? "space-y-2" : "space-y-1";
+  const markerClass = allTasks
+    ? "list-none pl-1"
+    : isOrdered
+      ? "list-decimal pl-5"
+      : "list-disc pl-5";
 
   return {
     node: (
       <ListTag
         key={`${keyPrefix}-list-${startIdx}`}
-        className={`flex flex-col gap-1 ${
-          hasTasks
-            ? "list-none pl-1"
-            : isOrdered
-              ? "list-decimal pl-5"
-              : "list-disc pl-5"
-        }`}
+        start={isOrdered && startNumber !== 1 ? startNumber : undefined}
+        className={`min-w-0 ${markerClass} ${spacingClass}`}
       >
         {items}
       </ListTag>
@@ -285,36 +1025,31 @@ function renderBlocks(rawText: string, keyPrefix = "md"): React.ReactNode[] {
     }
 
     // 1. Fenced code block (``` or ~~~)
-    const fenceMatch = /^\s*(```+|~~~+)(.*)$/.exec(line);
-    if (fenceMatch?.[1]) {
-      const fence = fenceMatch[1];
-      const lang = (fenceMatch[2] ?? "").trim();
-      const fenceChar = fence[0]!;
-      const fenceLen = fence.length;
+    const fenceOpen = matchCodeFenceOpen(line);
+    if (fenceOpen) {
       const codeLines: string[] = [];
       i++;
       while (i < lines.length) {
         const cur = lines[i] ?? "";
-        const closeRe = new RegExp(`^\\s*\\${fenceChar}{${fenceLen},}\\s*$`);
-        if (closeRe.test(cur)) {
+        if (isCodeFenceClose(cur, fenceOpen.char, fenceOpen.len)) {
           i++;
           break;
         }
-        codeLines.push(cur);
+        codeLines.push(stripIndentCols(cur, fenceOpen.indentCols));
         i++;
       }
       blocks.push(
         <CodeBlockCard
           key={`${keyPrefix}-code-${i}`}
-          language={lang}
+          language={fenceOpen.lang}
           code={codeLines.join("\n")}
         />
       );
       continue;
     }
 
-    // 2. Horizontal rule
-    if (/^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line)) {
+    // 2. Horizontal rule (checked before list markers so --- / * * * never parse as lists)
+    if (isHorizontalRule(line)) {
       blocks.push(
         <hr
           key={`${keyPrefix}-hr-${i}`}
@@ -326,15 +1061,14 @@ function renderBlocks(rawText: string, keyPrefix = "md"): React.ReactNode[] {
     }
 
     // 3. Heading
-    const headingMatch = /^\s*(#{1,6})\s+(.+?)\s*#*$/.exec(line);
-    if (headingMatch?.[1] && headingMatch?.[2]) {
-      const level = headingMatch[1].length;
+    const heading = matchHeading(line);
+    if (heading) {
       const sizeClass =
-        level === 1
+        heading.level === 1
           ? "text-[16px] font-bold leading-[24px]"
-          : level === 2
+          : heading.level === 2
             ? "text-[15px] font-semibold leading-[22px]"
-            : level === 3
+            : heading.level === 3
               ? "text-[14px] font-semibold leading-[20px]"
               : "text-[13px] font-semibold leading-[19px]";
       blocks.push(
@@ -342,7 +1076,7 @@ function renderBlocks(rawText: string, keyPrefix = "md"): React.ReactNode[] {
           key={`${keyPrefix}-h-${i}`}
           className={`mt-1 text-[var(--ink-strong)] ${sizeClass}`}
         >
-          {renderInline(headingMatch[2], `${keyPrefix}-h-${i}`)}
+          {renderInline(heading.content, `${keyPrefix}-h-${i}`)}
         </div>
       );
       i++;
@@ -365,9 +1099,11 @@ function renderBlocks(rawText: string, keyPrefix = "md"): React.ReactNode[] {
         if (
           !rowTrim ||
           !rowLine.includes("|") ||
-          /^\s*(```+|~~~+)/.test(rowLine) ||
-          /^\s*#{1,6}\s+/.test(rowLine) ||
-          /^\s*>/.test(rowLine)
+          matchCodeFenceOpen(rowLine) !== null ||
+          isHorizontalRule(rowLine) ||
+          matchHeading(rowLine) !== null ||
+          /^\s{0,3}>/.test(rowLine) ||
+          parseListMarker(rowLine) !== null
         ) {
           break;
         }
@@ -380,7 +1116,7 @@ function renderBlocks(rawText: string, keyPrefix = "md"): React.ReactNode[] {
       blocks.push(
         <div
           key={`${keyPrefix}-tbl-${i}`}
-          className="overflow-x-auto rounded-[8px] border border-[var(--border-light)] bg-[var(--bg-surface)]"
+          className="min-w-0 max-w-full overflow-x-auto rounded-[8px] border border-[var(--border-light)] bg-[var(--bg-surface)]"
         >
           <table className="w-full border-collapse text-left text-[12.5px] leading-[18px]">
             <thead>
@@ -427,10 +1163,10 @@ function renderBlocks(rawText: string, keyPrefix = "md"): React.ReactNode[] {
     }
 
     // 5. Blockquote
-    if (/^\s*>/.test(line)) {
+    if (/^\s{0,3}>/.test(line)) {
       const quoteLines: string[] = [];
-      while (i < lines.length && /^\s*>/.test(lines[i] ?? "")) {
-        quoteLines.push((lines[i] ?? "").replace(/^\s*>\s?/, ""));
+      while (i < lines.length && /^\s{0,3}>/.test(lines[i] ?? "")) {
+        quoteLines.push((lines[i] ?? "").replace(/^\s{0,3}>\s?/, ""));
         i++;
       }
       blocks.push(
@@ -445,7 +1181,7 @@ function renderBlocks(rawText: string, keyPrefix = "md"): React.ReactNode[] {
     }
 
     // 6. List
-    if (isListLine(line)) {
+    if (parseListMarker(line) !== null) {
       const { node, nextIdx } = renderListBlock(lines, i, `${keyPrefix}-l-${i}`);
       blocks.push(node);
       i = nextIdx;
@@ -459,11 +1195,11 @@ function renderBlocks(rawText: string, keyPrefix = "md"): React.ReactNode[] {
       const pTrim = pLine.trim();
       if (
         !pTrim ||
-        /^\s*(```+|~~~+)/.test(pLine) ||
-        /^\s*(?:---+|\*\*\*+|___+)\s*$/.test(pLine) ||
-        /^\s*(#{1,6})\s+/.test(pLine) ||
-        /^\s*>/.test(pLine) ||
-        isListLine(pLine) ||
+        matchCodeFenceOpen(pLine) !== null ||
+        isHorizontalRule(pLine) ||
+        matchHeading(pLine) !== null ||
+        /^\s{0,3}>/.test(pLine) ||
+        parseListMarker(pLine) !== null ||
         (pLine.includes("|") &&
           i + 1 < lines.length &&
           isTableDelimiterLine(lines[i + 1] ?? ""))
@@ -493,7 +1229,7 @@ export const MarkdownRenderer: React.FC<{
 }> = ({ text, className = "" }) => {
   if (!text || !text.trim()) return null;
   return (
-    <div className={`flex flex-col gap-2 ${className}`.trim()}>
+    <div className={`flex min-w-0 flex-col gap-2 ${className}`.trim()}>
       {renderBlocks(text)}
     </div>
   );

@@ -16,6 +16,7 @@ import {
   MailIcon,
   UndoIcon,
 } from "../ui/Icons";
+import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { SlideOverDrawer } from "../ui/Modal";
 import { SegmentedControl } from "../ui/SegmentedControl";
 
@@ -192,9 +193,10 @@ export const InboxDetailDrawer: React.FC = () => {
                   <div className="font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--ink-subtle)]">
                     02 · 安全判断
                   </div>
-                  <p className="text-[13px] leading-[21px] text-[var(--ink-body)]">
-                    {item.reasoning}
-                  </p>
+                  <MarkdownRenderer
+                    text={item.reasoning}
+                    className="text-[13px] leading-[21px] text-[var(--ink-body)]"
+                  />
                 </section>
 
                 {isQuestion && (

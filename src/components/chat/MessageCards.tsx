@@ -324,9 +324,10 @@ export const PermissionAskCard: React.FC<{
       </div>
 
       {request.summary && (
-        <div className="text-[12.5px] leading-[18px] text-[var(--ink-body)] whitespace-pre-wrap">
-          {request.summary}
-        </div>
+        <MarkdownRenderer
+          text={request.summary}
+          className="text-[12.5px] leading-[18px] text-[var(--ink-body)]"
+        />
       )}
 
       {request.command && (
