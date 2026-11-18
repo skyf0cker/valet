@@ -231,6 +231,21 @@ export const TimelineRow: React.FC<TimelineRowProps> = ({
         onClick={(e) => e.stopPropagation()}
         className="flex shrink-0 items-start justify-end gap-1.5 pt-3.5 pr-2 lg:gap-2 lg:pt-[18px] lg:pr-3"
       >
+        <button
+          type="button"
+          onClick={onQuoteToChat}
+          title="引用到对话 (Chat)"
+          aria-label={`引用「${event.title}」到对话`}
+          className={`inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2 text-[11px] font-medium text-[var(--ink-secondary)] transition-all hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] ${
+            isSelected
+              ? "opacity-100"
+              : "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100"
+          }`}
+        >
+          <ChatQuoteIcon size={11.5} className="shrink-0 text-[var(--ink-muted)]" />
+          <span>引用</span>
+        </button>
+
         {event.status === "running" || event.status === "pending_confirm" ? (
           <StatusPill status={event.status} />
         ) : (
@@ -244,17 +259,6 @@ export const TimelineRow: React.FC<TimelineRowProps> = ({
             {compact ? "详情 →" : "查看详情 →"}
           </button>
         )}
-
-        <button
-          type="button"
-          onClick={onQuoteToChat}
-          title="引用到对话 (Chat)"
-          aria-label={`引用「${event.title}」到对话`}
-          className="inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2 text-[11px] font-medium text-[var(--ink-secondary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
-        >
-          <ChatQuoteIcon size={11.5} className="shrink-0 text-[var(--ink-muted)]" />
-          <span>引用</span>
-        </button>
       </div>
     </div>
   );

@@ -410,7 +410,7 @@ export const InboxView: React.FC = () => {
                   setFocusedIndex(idx);
                   selectInboxItem(item.id);
                 }}
-                className={`flex cursor-pointer transition-colors ${
+                className={`group flex cursor-pointer transition-colors ${
                   idx > 0 ? "border-t border-[var(--border-light)]" : ""
                 } ${
                   sidebarCollapsed ? "py-[11px]" : "py-[14px]"
@@ -600,10 +600,14 @@ export const InboxView: React.FC = () => {
                     onClick={() => quoteInboxItemToChat(item.id)}
                     title="引用到对话 (Q)"
                     aria-label={`引用「${item.title}」到对话`}
-                    className={`inline-flex cursor-pointer items-center gap-1 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] font-medium text-[var(--ink-secondary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] ${
+                    className={`inline-flex cursor-pointer items-center gap-1 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] font-medium text-[var(--ink-secondary)] transition-all hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] ${
                       sidebarCollapsed
                         ? "h-[26px] px-2 text-[11px]"
                         : "h-[28px] px-2.5 text-[12px]"
+                    } ${
+                      isSelected
+                        ? "opacity-100"
+                        : "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100"
                     }`}
                   >
                     <ChatQuoteIcon size={sidebarCollapsed ? 11.5 : 12.5} className="shrink-0 text-[var(--ink-muted)]" />
