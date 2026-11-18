@@ -164,6 +164,7 @@ class FakeHostBridge implements HostBridge {
   readonly writeCalls: Record<string, unknown>[] = [];
   readonly trashCalls: Record<string, unknown>[] = [];
   readonly killCalls: Record<string, unknown>[] = [];
+  readonly itemResolveCalls: Record<string, unknown>[] = [];
   readonly streamEvents: ChatStreamPayload[] = [];
   private streamListeners: Array<(payload: ChatStreamPayload) => void> = [];
 
@@ -252,6 +253,16 @@ class FakeHostBridge implements HostBridge {
           name: String(params.name ?? ""),
           signal: String(params.signal ?? "SIGTERM"),
           summary: `已终止进程 ${String(params.name ?? "")}`,
+        } as T;
+      }
+      case "host.item.resolve": {
+        this.itemResolveCalls.push(params);
+        return {
+          ok: true,
+          source: String(params.source ?? "inbox"),
+          id: String(params.id ?? ""),
+          action: String(params.action ?? "approve"),
+          summary: `已处理事项 ${String(params.id ?? "")} (${String(params.action ?? "approve")})`,
         } as T;
       }
       case "host.kernel.overview":
@@ -1551,6 +1562,195 @@ triggers:
       model: "claude-opus-4",
     });
     expect(bridge.bashCalls.length).toBe(4);
+    expect(bridge.queued.length).toBe(1);
+
+    await rt.close();
+  });
+
+  it("injects quoted inbox/timeline context cleanly, resolves items in foreground Chat, and blocks item_resolve in background turns", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-quote-"));
+    tempDirs.push(dir);
+    const bridge = new FakeHostBridge();
+    const state = makeBaseState(dir);
+    state.preferences.autonomyLevel = "full_access";
+
+    const rt = new ValetDurableRuntime(bridge);
+    await rt.init({ dbPath: join(dir, "pi-quote.sqlite"), state });
+
+    const quoteAttachment = {
+      id: "quote-inbox-inbox-quote-1",
+      kind: "inbox_item" as const,
+      refId: "inbox-quote-1",
+      badge: "收件箱",
+      name: "清理旧版磁盘安装包（4.2 GB）",
+      meta: "磁盘守卫 · disk.large_file · 待批准",
+      textExcerpt: [
+        "- 来源：收件箱待批/审批记录",
+        "- inboxId：inbox-quote-1",
+        "- 摘要：检测到长期闲置的磁盘镜像安装包，建议移入废纸篓。",
+        "- 判断依据：超过 90 天未访问且不在受保护目录中。",
+      ].join("\n"),
+    };
+
+    // (a) Questioning a quoted item injects [引用事项 ...] without mis-triggering /clean list_dir/trash_files
+    const askRes = await rt.sendChat({
+      chatId: "chat-quote-1",
+      prompt: "为什么建议清理这个文件？有风险吗？",
+      model: "claude-opus-4",
+      attachments: [quoteAttachment],
+      interactive: true,
+    });
+    expect(bridge.listCalls.length).toBe(0);
+    expect(bridge.trashCalls.length).toBe(0);
+    expect(bridge.itemResolveCalls.length).toBe(0);
+    expect(askRes.replyMessage.content).toContain("清理旧版磁盘安装包（4.2 GB）");
+    expect(askRes.replyMessage.content).toContain("inbox-quote-1");
+
+    // (b) Explicit approval instruction in foreground interactive Chat calls item_resolve -> host.item.resolve
+    const approveRes = await rt.sendChat({
+      chatId: "chat-quote-1",
+      prompt: "确认没有风险，请帮我直接批准执行",
+      model: "claude-opus-4",
+      attachments: [quoteAttachment],
+      interactive: true,
+    });
+    expect(bridge.itemResolveCalls.length).toBe(1);
+    expect(bridge.itemResolveCalls[0]?.source).toBe("inbox");
+    expect(bridge.itemResolveCalls[0]?.id).toBe("inbox-quote-1");
+    expect(bridge.itemResolveCalls[0]?.action).toBe("approve");
+    expect(approveRes.replyMessage.content).toContain("inbox-quote-1");
+
+    // (c) Non-interactive background turn attempting item_resolve is blocked by safety gate
+    let observedBlockedText = "";
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("item_resolve", {
+              source: "inbox",
+              id: "inbox-quote-1",
+              action: "approve",
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      (ctx) => {
+        const toolRes = ctx.messages.find((m) => m.role === "toolResult");
+        observedBlockedText = toolRes ? JSON.stringify(toolRes.content) : "";
+        return fauxAssistantMessage("后台任务无权自行审批收件箱事项。");
+      },
+    ]);
+
+    await rt.sendChat({
+      chatId: "event:disk-guard",
+      prompt: "后台尝试审批 inbox-quote-1",
+      model: "claude-opus-4",
+      interactive: false,
+    });
+    expect(observedBlockedText).toContain("安全边界拒绝");
+    expect(bridge.itemResolveCalls.length).toBe(1);
+
+    await rt.close();
+  });
+
+  it("queues background ask_user options with reversible7d=false and continues source chat via answerInboxQuestion without duplicate cards", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-ask-inbox-"));
+    tempDirs.push(dir);
+    const bridge = new FakeHostBridge();
+    const rt = new ValetDurableRuntime(bridge);
+    const state = makeBaseState(dir);
+    state.plugins.push({
+      id: "surge-doctor",
+      slug: "surge-doctor",
+      name: "Surge 诊断",
+      tagline: "Surge 日志诊断",
+      description: "Surge 诊断插件",
+      version: "1.0.0",
+      bundleId: "com.community.surge-doctor",
+      source: "community",
+      enabled: true,
+      installed: true,
+      events: [
+        {
+          id: "surge.error_detected",
+          description: "surge errors",
+          policy: "ask",
+          count24h: 0,
+        },
+      ],
+      config: {},
+      manifestYaml: "id: com.community.surge-doctor\nname: Surge 诊断\n",
+      skillMarkdown: "检查 Surge 日志并在需要修改配置时询问用户。",
+    });
+    await rt.init({ dbPath: join(dir, "pi.sqlite"), state });
+
+    const longQuestion =
+      "是否现在为 Surge 配置添加 ntp-server = time.apple.com 并重载？（修改 custom.conf 后将触发 surge-cli reload）";
+    const options = ["好，添加 ntp-server 并重载配置", "先不动，继续观察"];
+
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxThinking("检测到 NTP 异常，通过 ask_user 向用户确认是否修改 Surge 配置。"),
+            fauxToolCall("ask_user", {
+              question: longQuestion,
+              options,
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      () => fauxAssistantMessage("已提交确认问题至收件箱。"),
+    ]);
+
+    const evRes = await rt.dispatchPluginEvent({
+      pluginId: "surge-doctor",
+      eventCode: "surge.error_detected",
+      payload: { summary: "No NTP response" },
+    });
+    expect(evRes.queuedInboxIds).toEqual(["inbox-test-1"]);
+    expect(bridge.queued.length).toBe(1);
+
+    const queuedCard = bridge.queued[0]!;
+    expect(queuedCard.eventCode).toBe("user.question");
+    expect(queuedCard.reversible7d).toBe(false);
+    expect(queuedCard.options).toEqual(options);
+    expect(queuedCard.sourceChatId).toBe("event:surge-doctor");
+    expect(queuedCard.pluginId).toBe("surge-doctor");
+    expect(queuedCard.title).toContain("custom.conf");
+    expect(queuedCard.approveLabel).toBe(options[0]);
+
+    // Answering via answerInboxQuestion resumes the originating conversation without re-queuing ask_user
+    const ansRes = await rt.answerInboxQuestion({
+      inboxId: "inbox-test-1",
+      question: longQuestion,
+      answer: options[0]!,
+      sourceChatId: "event:surge-doctor",
+    });
+    expect(ansRes.ok).toBe(true);
+    expect(ansRes.resolvedChatId).toBe("event:surge-doctor");
+    expect(ansRes.queuedInboxIds).toEqual([]);
+    expect(ansRes.replyMessage.content).toContain(options[0]!);
+    expect(bridge.queued.length).toBe(1);
+
+    // Legacy fallback: omitting sourceChatId resolves event:surge-doctor by inboxId from ValetThreadsDoc
+    const legacyAnsRes = await rt.answerInboxQuestion({
+      inboxId: "inbox-test-1",
+      question: longQuestion,
+      answer: options[1]!,
+    });
+    expect(legacyAnsRes.ok).toBe(true);
+    expect(legacyAnsRes.resolvedChatId).toBe("event:surge-doctor");
+    expect(legacyAnsRes.replyMessage.content).toContain(options[1]!);
+    expect(bridge.queued.length).toBe(1);
+
+    // Calling executeApprovedTool with ask_user must never re-queue a duplicate question card
+    const guardRes = await rt.executeApprovedTool({
+      inboxId: "inbox-test-1",
+      toolName: "ask_user",
+      toolArgs: { question: longQuestion, options },
+    });
+    expect(guardRes.ok).toBe(true);
     expect(bridge.queued.length).toBe(1);
 
     await rt.close();

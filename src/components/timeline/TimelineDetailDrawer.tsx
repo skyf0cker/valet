@@ -1,8 +1,21 @@
 import React, { useMemo, useState } from "react";
 import { useValet } from "../../store/ValetContext";
+import {
+  getInboxQuestionOptions,
+  isFileCleanupTimelineEvent,
+  isQuestionInboxItem,
+} from "../../utils/inbox";
+import { findLinkedInboxItem } from "../../utils/timelineLinks";
 import { PluginTag, StatusPill } from "../ui/Badge";
 import { Checkbox } from "../ui/Checkbox";
-import { CloseIcon, UndoIcon } from "../ui/Icons";
+import {
+  ArrowUpRightIcon,
+  ChatQuoteIcon,
+  CloseIcon,
+  InboxIcon,
+  MailIcon,
+  UndoIcon,
+} from "../ui/Icons";
 import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { SlideOverDrawer } from "../ui/Modal";
 import { SegmentedControl } from "../ui/SegmentedControl";
@@ -12,12 +25,16 @@ type DrawerTab = "overview" | "chain" | "logs";
 export const TimelineDetailDrawer: React.FC = () => {
   const {
     state,
+    setActiveView,
+    selectInboxItem,
     selectTimelineEvent,
     toggleTimelineActionItem,
     executeTimelineEventActions,
+    answerInboxQuestion,
     ignoreTimelineEvent,
     restoreTimelineEvent,
     fixPluginAuth,
+    quoteTimelineEventToChat,
     pushToast,
   } = useValet();
 
@@ -31,6 +48,31 @@ export const TimelineDetailDrawer: React.FC = () => {
         : null,
     [state.selectedTimelineEventId, state.timelineEvents]
   );
+
+  const linkedInboxItem = useMemo(
+    () => (event ? findLinkedInboxItem(event, state.inboxItems) : null),
+    [event, state.inboxItems]
+  );
+
+  const isQuestion = Boolean(
+    event &&
+      (event.eventCode === "user.question" ||
+        Array.isArray(event.payload?.options) ||
+        (linkedInboxItem && isQuestionInboxItem(linkedInboxItem)))
+  );
+  const questionOptions = useMemo(() => {
+    if (linkedInboxItem) {
+      const fromInbox = getInboxQuestionOptions(linkedInboxItem);
+      if (fromInbox.length > 0) return fromInbox;
+    }
+    if (Array.isArray(event?.payload?.options)) {
+      return event.payload.options
+        .map((x) => (typeof x === "string" ? x.trim() : ""))
+        .filter(Boolean);
+    }
+    return [];
+  }, [event, linkedInboxItem]);
+  const isFileCleanup = Boolean(event && isFileCleanupTimelineEvent(event));
 
   const visibleItems = useMemo(() => {
     if (!event) return [];
@@ -98,6 +140,22 @@ export const TimelineDetailDrawer: React.FC = () => {
                 <span className="font-mono text-[10px] text-[var(--ink-subtle)]">
                   {event.eventCode}
                 </span>
+                {linkedInboxItem && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      selectTimelineEvent(null);
+                      setActiveView("inbox");
+                      selectInboxItem(linkedInboxItem.id);
+                    }}
+                    title={`在收件箱中查看：${linkedInboxItem.title}`}
+                    className="inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2 text-[10.5px] font-medium text-[var(--ink-secondary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                  >
+                    <InboxIcon size={10.5} className="shrink-0 text-[var(--ink-muted)]" />
+                    <span>收件箱事项</span>
+                    <ArrowUpRightIcon size={10} className="shrink-0 text-[var(--ink-muted)]" />
+                  </button>
+                )}
               </div>
               <h3 className="font-[family-name:var(--font-serif-zh)] text-[26px] font-normal leading-[36px] tracking-[-0.01em] text-[var(--ink-strong)]">
                 {event.title}
@@ -274,57 +332,113 @@ export const TimelineDetailDrawer: React.FC = () => {
           </div>
 
           {/* Sticky Footer */}
-          <div className="flex shrink-0 items-center gap-2 border-t border-[var(--border-light)] px-7 py-4">
-            <UndoIcon size={14} className="shrink-0 text-[var(--ink-muted)]" />
-            <span className="flex-1 text-[12px] text-[var(--ink-muted)]">
-              {event.canRestore || event.actionItems.some((i) => i.sizeMB > 0)
-                ? "移入废纸篓 · 7 天内可一键还原"
-                : "所有敏感变更均受收件箱安全策略保护"}
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-[var(--border-light)] px-7 py-4">
+            {isQuestion ? (
+              <MailIcon size={14} className="shrink-0 text-[var(--ink-muted)]" />
+            ) : (
+              <UndoIcon size={14} className="shrink-0 text-[var(--ink-muted)]" />
+            )}
+            <span className="min-w-[140px] flex-1 truncate text-[12px] text-[var(--ink-muted)]">
+              {isQuestion
+                ? event.status === "pending_confirm"
+                  ? "选择方案后，Valet 将按你的决定继续执行"
+                  : "用户选择已处理完成"
+                : isFileCleanup
+                  ? "移入废纸篓 · 7 天内可一键还原"
+                  : "所有敏感变更均受收件箱安全策略保护"}
             </span>
 
-            {event.status === "pending_confirm" && (
-              <>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => quoteTimelineEventToChat(event.id)}
+                className="inline-flex h-[34px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-3 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+              >
+                <ChatQuoteIcon size={13.5} className="shrink-0 text-[var(--ink-muted)]" />
+                <span>引用到对话</span>
+              </button>
+
+              {event.status === "pending_confirm" &&
+                (linkedInboxItem &&
+                linkedInboxItem.status === "pending" &&
+                isQuestion &&
+                questionOptions.length > 0 ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => ignoreTimelineEvent(event.id)}
+                      className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                    >
+                      忽略
+                    </button>
+                    {questionOptions.slice(1).map((opt) => (
+                      <button
+                        key={opt}
+                        type="button"
+                        onClick={() => answerInboxQuestion(linkedInboxItem.id, opt)}
+                        className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                      >
+                        {opt}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        answerInboxQuestion(linkedInboxItem.id, questionOptions[0]!)
+                      }
+                      className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] bg-[var(--ink-primary)] px-3.5 text-[13px] font-semibold text-[var(--ink-on-primary)]"
+                    >
+                      {questionOptions[0]}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => ignoreTimelineEvent(event.id)}
+                      className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                    >
+                      忽略
+                    </button>
+                    <button
+                      type="button"
+                      disabled={event.actionItems.length > 0 && selectedCount === 0}
+                      onClick={() => executeTimelineEventActions(event.id)}
+                      className={`inline-flex h-[34px] items-center rounded-[8px] bg-[var(--ink-primary)] px-3.5 text-[13px] font-semibold text-[var(--ink-on-primary)] ${
+                        event.actionItems.length > 0 && selectedCount === 0
+                          ? "cursor-not-allowed opacity-40"
+                          : "cursor-pointer"
+                      }`}
+                    >
+                      {isFileCleanup
+                        ? `清理 ${selectedSizeMB > 0 ? `${selectedSizeGB} GB` : `${selectedCount} 项`}`
+                        : "批准执行"}
+                    </button>
+                  </>
+                ))}
+
+              {event.status === "failed" && event.authFixPluginId && (
                 <button
                   type="button"
-                  onClick={() => ignoreTimelineEvent(event.id)}
+                  onClick={() => {
+                    if (event.authFixPluginId) fixPluginAuth(event.authFixPluginId);
+                  }}
+                  className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] bg-[var(--ink-primary)] px-4 text-[13px] font-semibold text-[var(--ink-on-primary)]"
+                >
+                  重新授权并重试
+                </button>
+              )}
+
+              {event.status === "completed" && event.canRestore && !event.restored && (
+                <button
+                  type="button"
+                  onClick={() => restoreTimelineEvent(event.id)}
                   className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
                 >
-                  忽略
+                  一键还原
                 </button>
-                <button
-                  type="button"
-                  disabled={selectedCount === 0}
-                  onClick={() => executeTimelineEventActions(event.id)}
-                  className={`inline-flex h-[34px] items-center rounded-[8px] bg-[var(--ink-primary)] px-3.5 text-[13px] font-semibold text-[var(--ink-on-primary)] ${
-                    selectedCount === 0 ? "cursor-not-allowed opacity-40" : "cursor-pointer"
-                  }`}
-                >
-                  清理 {selectedSizeMB > 0 ? `${selectedSizeGB} GB` : `${selectedCount} 项`}
-                </button>
-              </>
-            )}
-
-            {event.status === "failed" && event.authFixPluginId && (
-              <button
-                type="button"
-                onClick={() => {
-                  if (event.authFixPluginId) fixPluginAuth(event.authFixPluginId);
-                }}
-                className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] bg-[var(--ink-primary)] px-4 text-[13px] font-semibold text-[var(--ink-on-primary)]"
-              >
-                重新授权并重试
-              </button>
-            )}
-
-            {event.status === "completed" && event.canRestore && !event.restored && (
-              <button
-                type="button"
-                onClick={() => restoreTimelineEvent(event.id)}
-                className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
-              >
-                一键还原
-              </button>
-            )}
+              )}
+            </div>
           </div>
         </>
       )}

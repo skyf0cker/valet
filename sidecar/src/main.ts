@@ -1,6 +1,7 @@
 import { connect, type Socket } from "node:net";
 import { createInterface } from "node:readline";
 import type {
+  AnswerInboxQuestionRequest,
   DispatchPluginEventRequest,
   ExecuteApprovedToolRequest,
   HostBridge,
@@ -149,6 +150,10 @@ class StdioJsonRpcServer implements HostBridge {
       case "tool.executeApproved":
         return this.runtime.executeApprovedTool(
           params as unknown as ExecuteApprovedToolRequest,
+        );
+      case "inbox.answerQuestion":
+        return this.runtime.answerInboxQuestion(
+          params as unknown as AnswerInboxQuestionRequest,
         );
       case "agent.inspect":
         return this.runtime.inspect();

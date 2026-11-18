@@ -86,6 +86,8 @@ export interface ValetPreferences {
   thresholds: MonitoringThresholds;
   cleanupPolicy: CleanupPolicySettings;
   pluginRuntime: PluginRuntimeSettings;
+  appearance?: "light" | "dark" | "auto";
+  darkTheme?: "obsidian" | "espresso" | "chronometer";
   busyMessagePolicy?: "queue" | "steer";
   heartbeat?: {
     enabled: boolean;
@@ -175,7 +177,8 @@ export interface MemoryEntry {
 
 export interface ChatAttachment {
   id: string;
-  kind: "image" | "file" | "screen";
+  kind: "image" | "file" | "screen" | "timeline_event" | "inbox_item";
+  refId?: string;
   name: string;
   meta?: string;
   badge?: string;
@@ -312,6 +315,8 @@ export interface QueueApprovalParams {
   dismissLabel: string;
   toolName: string;
   toolArgs: Record<string, unknown>;
+  options?: string[];
+  sourceChatId?: string;
   actionItems: Array<{
     id: string;
     label: string;
@@ -410,6 +415,23 @@ export interface ExecuteApprovedToolRequest {
   toolName: string;
   toolArgs: Record<string, unknown>;
   checkedPaths?: string[];
+}
+
+export interface AnswerInboxQuestionRequest {
+  inboxId: string;
+  question: string;
+  answer: string;
+  sourceChatId?: string;
+}
+
+export interface AnswerInboxQuestionResponse {
+  ok: boolean;
+  resolvedChatId: string;
+  replyMessage: ChatMessage;
+  queuedInboxIds: string[];
+  timelineEventIds: string[];
+  usageCostDelta: number;
+  providerUsed: string;
 }
 
 /** Bridge interface allowing durable tools & hooks to invoke Go host capabilities. */

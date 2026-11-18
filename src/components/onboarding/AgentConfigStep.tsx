@@ -14,7 +14,7 @@ const AUTONOMY_OPTIONS: Array<{ value: AutonomyLevel; label: string }> = [
 
 const AUTONOMY_HINT: Record<AutonomyLevel, string> = {
   always_ask: "Valet 每执行一个非只读动作前都会弹窗等待你确认。",
-  auto_review: "默认开启 Auto Review：只读操作直通，其余由 Jev System One 或审查小模型自动评估放行或询问。",
+  auto_review: "默认开启 Auto Review：常规本地编辑与可逆清理自动放行，仅拦截不可逆删除、凭据外传或持久化篡改等高危操作。",
   full_access: "安全红线内自动执行并记录时间线，高危越界目录与禁用应用仍受保护。",
 };
 

@@ -10,12 +10,15 @@ import { isMyGo } from "mygo-runtime";
 import { Valet } from "../../mygo";
 import { useValet } from "../../store/ValetContext";
 import type { AutonomyLevel, ChatAttachment, PluginState } from "../../types/valet";
+import { isQuoteAttachment } from "../../utils/chatQuotes";
 import {
   ArrowRightIcon,
   ArrowUpIcon,
   CheckIcon,
   ChevronDownIcon,
+  ClockIcon,
   CloseIcon,
+  InboxIcon,
   MicIcon,
   PaperclipIcon,
   PencilIcon,
@@ -27,6 +30,8 @@ import {
   TrashIcon,
 } from "../ui/Icons";
 import { SelectMenu } from "../ui/SelectMenu";
+
+let lastConsumedQuoteTick = 0;
 
 interface ChatComposerProps {
   chatId: string;
@@ -58,7 +63,7 @@ const AUTONOMY_OPTIONS: Array<{
   desc: string;
 }> = [
   { value: "always_ask", label: "每个都询问", desc: "所有非只读操作均先请求确认" },
-  { value: "auto_review", label: "Auto Review", desc: "Jev / 小模型审查低风险自动放行" },
+  { value: "auto_review", label: "Auto Review", desc: "常规操作直通，仅拦截高危操作" },
   { value: "full_access", label: "Full Access", desc: "安全边界内自动执行并记录时间线" },
 ];
 
@@ -177,6 +182,9 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
     state,
     sidebarCollapsed,
     queuedMessages,
+    composerQuoteSignal,
+    getComposerDraft,
+    setComposerDraft,
     removeQueuedMessage,
     sendQueuedMessageNow,
     setAutonomyLevel,
@@ -188,9 +196,11 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
 
   const [queueCollapsed, setQueueCollapsed] = useState(false);
 
-  const [text, setText] = useState("");
-  const [cursorPos, setCursorPos] = useState(0);
-  const [mentionPluginId, setMentionPluginId] = useState<string>("");
+  const [text, setText] = useState(() => getComposerDraft(chatId).text);
+  const [cursorPos, setCursorPos] = useState(() => getComposerDraft(chatId).text.length);
+  const [mentionPluginId, setMentionPluginId] = useState<string>(
+    () => getComposerDraft(chatId).mentionPluginId
+  );
   const [manualPluginMenu, setManualPluginMenu] = useState(false);
   const [addContextOpen, setAddContextOpen] = useState(false);
   const [autonomyMenuOpen, setAutonomyMenuOpen] = useState(false);
@@ -198,7 +208,9 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
   const [dismissedSlash, setDismissedSlash] = useState(false);
   const [slashMenuIdx, setSlashMenuIdx] = useState(0);
   const [pluginMenuIdx, setPluginMenuIdx] = useState(0);
-  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [attachments, setAttachments] = useState<ChatAttachment[]>(
+    () => getComposerDraft(chatId).attachments
+  );
   const [capturingScreen, setCapturingScreen] = useState(false);
   const [recording, setRecording] = useState(false);
   const [recordingSec, setRecordingSec] = useState(0);
@@ -211,8 +223,47 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const isComposingRef = useRef(false);
   const compositionEndedAtRef = useRef(0);
+  const syncedChatIdRef = useRef<string>(chatId);
   const [pluginPopoverStyle, setPluginPopoverStyle] = useState<React.CSSProperties>({});
   const [slashPopoverStyle, setSlashPopoverStyle] = useState<React.CSSProperties>({});
+
+  useEffect(() => {
+    if (syncedChatIdRef.current !== chatId) {
+      syncedChatIdRef.current = chatId;
+      const draft = getComposerDraft(chatId);
+      setText(draft.text);
+      setCursorPos(draft.text.length);
+      setAttachments(draft.attachments);
+      setMentionPluginId(draft.mentionPluginId);
+      return;
+    }
+    setComposerDraft(chatId, { text, attachments, mentionPluginId });
+  }, [attachments, chatId, getComposerDraft, mentionPluginId, setComposerDraft, text]);
+
+  useEffect(() => {
+    if (
+      !composerQuoteSignal ||
+      composerQuoteSignal.chatId !== chatId ||
+      composerQuoteSignal.tick === lastConsumedQuoteTick
+    ) {
+      return;
+    }
+    lastConsumedQuoteTick = composerQuoteSignal.tick;
+    const draft = getComposerDraft(chatId);
+    setText(draft.text);
+    setCursorPos(draft.text.length);
+    setAttachments(draft.attachments);
+    setMentionPluginId(draft.mentionPluginId);
+    const raf = window.requestAnimationFrame(() => {
+      const ta = textareaRef.current;
+      if (ta) {
+        ta.focus();
+        const pos = draft.text.length;
+        ta.setSelectionRange(pos, pos);
+      }
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [chatId, composerQuoteSignal, getComposerDraft]);
 
   useEffect(() => {
     if (!recording) {
@@ -454,13 +505,20 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
   const handleSubmit = async () => {
     const trimmed = text.trim();
     if (!trimmed && attachments.length === 0) return;
-    const finalPrompt = trimmed || "请帮我分析附加的屏幕截图或文件内容";
+    const hasQuoteOnly =
+      !trimmed && attachments.length > 0 && attachments.every(isQuoteAttachment);
+    const finalPrompt =
+      trimmed ||
+      (hasQuoteOnly
+        ? "请帮我详细分析这个事项的触发原因、潜在风险，并给出处理建议"
+        : "请帮我分析附加的屏幕截图或文件内容");
     const sentAttachments = [...attachments];
 
     setText("");
     setCursorPos(0);
     setAttachments([]);
     setManualPluginMenu(false);
+    setComposerDraft(chatId, { text: "", attachments: [], mentionPluginId });
     await onSend({
       prompt: finalPrompt,
       mentionPlugin,
@@ -862,11 +920,24 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
                       @{item.mentionPlugin.name}
                     </span>
                   )}
-                  {item.attachments.length > 0 && (
-                    <span className="shrink-0 rounded-[6px] bg-[var(--bg-hover)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-muted)]">
-                      {item.attachments.length} 附件
-                    </span>
-                  )}
+                  {(() => {
+                    const quoteCount = item.attachments.filter(isQuoteAttachment).length;
+                    const fileCount = item.attachments.length - quoteCount;
+                    return (
+                      <>
+                        {quoteCount > 0 && (
+                          <span className="shrink-0 rounded-[6px] bg-[var(--bg-hover)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-muted)]">
+                            {quoteCount} 引用
+                          </span>
+                        )}
+                        {fileCount > 0 && (
+                          <span className="shrink-0 rounded-[6px] bg-[var(--bg-hover)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-muted)]">
+                            {fileCount} 附件
+                          </span>
+                        )}
+                      </>
+                    );
+                  })()}
                   <div className="flex shrink-0 items-center gap-0.5">
                     <button
                       type="button"
@@ -936,7 +1007,48 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
         {attachments.length > 0 && (
           <div className="flex flex-wrap items-center gap-2 px-1 pt-0.5">
             {attachments.map((att) =>
-              att.kind === "image" || att.kind === "screen" ? (
+              isQuoteAttachment(att) ? (
+                <div
+                  key={att.id}
+                  title={att.meta ? `${att.name} · ${att.meta}` : att.name}
+                  className={`relative flex max-w-[300px] items-center gap-2 overflow-hidden rounded-[8px] border border-[var(--border-card)] bg-[var(--bg-subtle)] pr-2 pl-2.5 shadow-[inset_3px_0_0_var(--ink-primary)] ${
+                    sidebarCollapsed ? "h-[38px]" : "h-[44px]"
+                  }`}
+                >
+                  <div className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-primary)]">
+                    {att.kind === "inbox_item" ? (
+                      <InboxIcon size={11.5} />
+                    ) : (
+                      <ClockIcon size={11.5} />
+                    )}
+                  </div>
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <div className="flex items-center gap-1.5">
+                      <span className="shrink-0 font-mono text-[9.5px] font-medium text-[var(--ink-muted)]">
+                        {att.badge ?? (att.kind === "inbox_item" ? "收件箱" : "时间线")}
+                      </span>
+                      <span className="truncate text-[11.5px] font-medium leading-[15px] text-[var(--ink-strong)]">
+                        {att.name}
+                      </span>
+                    </div>
+                    {att.meta && (
+                      <span className="truncate font-mono text-[9.5px] leading-[12px] text-[var(--ink-subtle)]">
+                        {att.meta}
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAttachments((prev) => prev.filter((a) => a.id !== att.id))
+                    }
+                    aria-label={`移除引用 ${att.name}`}
+                    className="ml-0.5 shrink-0 cursor-pointer rounded px-1 py-0.5 text-[10px] text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ) : att.kind === "image" || att.kind === "screen" ? (
                 <div
                   key={att.id}
                   title={att.name}
@@ -1144,7 +1256,9 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
                 ? busyPolicy === "steer"
                   ? "正在执行… 输入发送即可实时引导，或点击右侧停止"
                   : "正在执行… 继续输入将加入待发送队列，或点击右侧停止"
-                : "给 Valet 发消息，@ 指定插件，/ 调用动作…"
+                : attachments.some(isQuoteAttachment)
+                  ? "针对引用的事项提问明确（如原因、影响），或直接输入处理指令…"
+                  : "给 Valet 发消息，@ 指定插件，/ 调用动作…"
             }
             className={`max-h-28 w-full resize-none bg-transparent text-[var(--ink-body)] outline-none placeholder:text-[var(--ink-subtle)] ${
               sidebarCollapsed ? "text-[12.5px] leading-[19px]" : "text-[14px] leading-[22px]"

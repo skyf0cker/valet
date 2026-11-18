@@ -14,6 +14,7 @@ import type {
   PluginState,
   TimelineEvent,
 } from "../types/valet";
+import { isQuoteAttachment } from "../utils/chatQuotes";
 
 export interface ProviderVerifyResult {
   ok: boolean;
@@ -33,6 +34,11 @@ export interface SimulatedChatOutcome {
   replyMessage: ChatMessage;
   createdEvent?: TimelineEvent;
   createdInboxItem?: InboxApprovalItem;
+  resolvedQuotes?: Array<{
+    kind: "inbox_item" | "timeline_event";
+    refId: string;
+    action: "approve" | "dismiss" | "restore";
+  }>;
 }
 
 export interface ValetService {
@@ -127,16 +133,30 @@ export class MockValetService implements ValetService {
   async testAutoReview(cfg: AutoReviewConfig): Promise<TestMessageResult> {
     await delay(260);
     const hasJev = Boolean(cfg.jevApiKey.trim());
+    const lowerEndpoint = cfg.jevEndpoint.trim().toLowerCase().replace(/\/+$/, "");
+    const isGoogle =
+      lowerEndpoint.includes("googleapis.com") ||
+      lowerEndpoint.endsWith("/decisions") ||
+      (!lowerEndpoint.includes("openrouter.ai") &&
+        cfg.jevModel
+          .trim()
+          .toLowerCase()
+          .replace(/^(models|google)\//, "")
+          .startsWith("gemini-decision"));
     if (cfg.engine === "jev" && !hasJev) {
       return {
         ok: false,
         latencyMs: 0,
-        reply: "请先输入 Jev API Key 后再测试 Jev System One。",
+        reply: isGoogle
+          ? "请先输入 Google Gemini API Key 后再测试 Google Decisions。"
+          : "请先输入 Jev API Key 后再测试 Jev System One。",
       };
     }
     const modeLabel =
       cfg.engine !== "llm" && hasJev
-        ? `Jev System One (${cfg.jevModel || "jev-latest"})`
+        ? isGoogle
+          ? `Google Decisions (${cfg.jevModel || "gemini-decision-1"})`
+          : `Jev System One (${cfg.jevModel || "jev-latest"})`
         : `审查小模型 (${cfg.fallbackModel || "同快速模型"})`;
     return {
       ok: true,
@@ -156,6 +176,78 @@ export class MockValetService implements ValetService {
     const trimmed = params.prompt.trim();
     const lower = trimmed.toLowerCase();
     const nowTime = formatNowHHMM();
+
+    const quoteAttachments = params.attachments.filter(isQuoteAttachment);
+    if (quoteAttachments.length > 0 && !lower.startsWith("/")) {
+      const wantsRestore = lower.includes("还原") || lower.includes("恢复");
+      const wantsDismiss =
+        lower.includes("忽略") ||
+        lower.includes("保留") ||
+        lower.includes("不处理") ||
+        lower.includes("取消");
+      const wantsApprove =
+        lower.includes("批准") ||
+        lower.includes("确认执行") ||
+        lower.includes("直接清理") ||
+        lower.includes("帮我处理") ||
+        lower.includes("移入废纸篓") ||
+        lower.includes("执行清理") ||
+        lower.includes("同意");
+
+      const action: "approve" | "dismiss" | "restore" | null = wantsRestore
+        ? "restore"
+        : wantsDismiss
+          ? "dismiss"
+          : wantsApprove
+            ? "approve"
+            : null;
+
+      if (action) {
+        const resolvedQuotes = quoteAttachments
+          .filter((q): q is ChatAttachment & { kind: "inbox_item" | "timeline_event"; refId: string } =>
+            Boolean(q.refId)
+          )
+          .map((q) => ({
+            kind: q.kind,
+            refId: q.refId,
+            action,
+          }));
+        const actionLabel =
+          action === "approve"
+            ? "批准并执行"
+            : action === "dismiss"
+              ? "忽略保留"
+              : "从废纸篓还原";
+        return {
+          replyMessage: {
+            id: makeId("msg"),
+            role: "assistant",
+            metaLabel: `${params.model} · 事项处理`,
+            createdAt: nowTime,
+            content: `已根据你的指令对引用的 ${quoteAttachments.length} 个事项执行「${actionLabel}」：${quoteAttachments.map((q) => `**${q.name}**`).join("、")}。收件箱与时间线状态已同步更新。`,
+          },
+          resolvedQuotes,
+        };
+      }
+
+      const detailBlocks = quoteAttachments.map((q) => {
+        const excerptPreview = (q.textExcerpt ?? "")
+          .split("\n")
+          .filter((l) => l.startsWith("- "))
+          .slice(0, 5)
+          .join("\n");
+        return `### ${q.badge ?? "引用事项"} · ${q.name}\n${q.meta ? `> ${q.meta}\n\n` : ""}${excerptPreview}`;
+      });
+      return {
+        replyMessage: {
+          id: makeId("msg"),
+          role: "assistant",
+          metaLabel: `${params.model} · 事项解析`,
+          createdAt: nowTime,
+          content: `已读取你引用的事项上下文：\n\n${detailBlocks.join("\n\n")}\n\n针对你的问题「${trimmed}」：从事件判断依据与载荷来看，该事项已经过插件策略过滤与安全路径保护校验。你可以继续追问具体子项的风险与影响，或直接回复 **“批准执行”** / **“忽略保留”** / **“还原”** 由我代为处理。`,
+        },
+      };
+    }
 
     if (lower.startsWith("/clean") || lower.includes("大文件") || lower.includes("清理")) {
       const evt: TimelineEvent = {

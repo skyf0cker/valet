@@ -1,4 +1,5 @@
 import React, { useMemo, useRef, useState } from "react";
+import { DARK_THEME_OPTIONS, getDarkThemeMeta, normalizeDarkTheme } from "../../constants/themes";
 import { valetService } from "../../services/valetService";
 import { useValet } from "../../store/ValetContext";
 import type {
@@ -11,7 +12,7 @@ import type {
 import { SidebarToggleButton } from "../Sidebar";
 import { Kbd } from "../ui/Badge";
 import { Checkbox } from "../ui/Checkbox";
-import { BowtieSvg, SearchIcon } from "../ui/Icons";
+import { BowtieSvg, CheckIcon, SearchIcon } from "../ui/Icons";
 import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { Modal } from "../ui/Modal";
 import { SegmentedControl } from "../ui/SegmentedControl";
@@ -38,15 +39,15 @@ const SECTIONS: SectionMeta[] = [
     id: "general",
     title: "通用",
     group: "Agent",
-    subtitle: "启动、菜单栏驻留、外观与运行中消息发送策略",
-    keywords: "通用 启动 外观 深色 浅色 自动 语言 消息 引导 排队",
+    subtitle: "启动、菜单栏驻留、浅色/深色多主题配色与运行中消息发送策略",
+    keywords: "通用 启动 外观 深色 浅色 自动 语言 消息 引导 排队 主题 配色 午夜黑曜石 暖岩黑胡桃 深松怀表 obsidian espresso chronometer theme",
   },
   {
     id: "models",
     title: "模型与服务商",
     group: "Agent",
     subtitle: "密钥安全存于 macOS 钥匙串，控制主/快/视觉模型、Auto Review 审查模型与每日预算",
-    keywords: "模型 服务商 anthropic openai ollama gemini api key 花费 预算 jev system one auto review 审查 小模型",
+    keywords: "模型 服务商 anthropic openai ollama gemini api key 花费 预算 jev system one auto review 审查 小模型 google decisions gemini-decision-1",
   },
   {
     id: "persona",
@@ -277,17 +278,38 @@ export const SettingsView: React.FC = () => {
     ...fallbackModelPool.map((m) => ({ value: m, label: m })),
   ];
   const openRouterProv = state.providers.find((p) => p.id === "openrouter");
+  const geminiProv = state.providers.find((p) => p.id === "gemini");
+  const lowerJevEndpoint = autoReview.jevEndpoint
+    .trim()
+    .toLowerCase()
+    .replace(/\/+$/, "");
+  const isGoogleDecisions =
+    lowerJevEndpoint.includes("googleapis.com") ||
+    lowerJevEndpoint.endsWith("/decisions") ||
+    (!lowerJevEndpoint.includes("openrouter.ai") &&
+      autoReview.jevModel
+        .trim()
+        .toLowerCase()
+        .replace(/^(models|google)\//, "")
+        .startsWith("gemini-decision"));
   const hasJevKeyConfigured =
     Boolean(autoReview.jevApiKey.trim()) ||
-    (autoReview.jevEndpoint.toLowerCase().includes("openrouter.ai") &&
-      Boolean(openRouterProv?.apiKey?.trim()));
+    (lowerJevEndpoint.includes("openrouter.ai") &&
+      Boolean(openRouterProv?.apiKey?.trim())) ||
+    (isGoogleDecisions && Boolean(geminiProv?.apiKey?.trim()));
   const activeReviewEngineSummary =
     autoReview.engine === "jev"
       ? hasJevKeyConfigured
-        ? `Jev System One · ${autoReview.jevModel}`
-        : "仅 Jev System One（尚未填写 Key，暂转人工确认）"
+        ? isGoogleDecisions
+          ? `Google Decisions · ${autoReview.jevModel || "gemini-decision-1"}`
+          : `Jev System One · ${autoReview.jevModel}`
+        : isGoogleDecisions
+          ? "仅 Google Decisions（尚未填写 Key，暂转人工确认）"
+          : "仅 Jev System One（尚未填写 Key，暂转人工确认）"
       : autoReview.engine === "auto" && hasJevKeyConfigured
-        ? `Jev System One · ${autoReview.jevModel}`
+        ? isGoogleDecisions
+          ? `Google Decisions · ${autoReview.jevModel || "gemini-decision-1"}`
+          : `Jev System One · ${autoReview.jevModel}`
         : `审查小模型 · ${
             autoReview.fallbackModel === "同快速模型"
               ? preferences.models.fast
@@ -896,59 +918,231 @@ export const SettingsView: React.FC = () => {
           </div>
         );
 
-      case "general":
+      case "general": {
+        const activeDarkTheme = normalizeDarkTheme(preferences.darkTheme);
+        const activeDarkMeta = getDarkThemeMeta(activeDarkTheme);
         return (
-          <SettingsSectionCard noHeader>
-            <SettingRow first label="登录时自动启动">
-              <Switch
-                checked={preferences.launchAtLogin}
-                onChange={(v) => updatePreferences({ launchAtLogin: v })}
-                ariaLabel="登录时自动启动"
-              />
-            </SettingRow>
-            <SettingRow label="在菜单栏显示图标">
-              <Switch
-                checked={preferences.showMenuBarIcon}
-                onChange={(v) => updatePreferences({ showMenuBarIcon: v })}
-                ariaLabel="在菜单栏显示图标"
-              />
-            </SettingRow>
-            <SettingRow label="外观">
-              <SegmentedControl<AppearanceMode>
-                value={preferences.appearance}
-                onChange={(v) => updatePreferences({ appearance: v })}
-                options={[
-                  { value: "light", label: "浅色" },
-                  { value: "dark", label: "深色" },
-                  { value: "auto", label: "自动" },
-                ]}
-              />
-            </SettingRow>
-            <SettingRow label="语言">
-              <SelectMenu
-                value={preferences.language}
-                onChange={(v) => updatePreferences({ language: v })}
-                options={[
-                  { value: "简体中文", label: "简体中文" },
-                  { value: "English", label: "English" },
-                ]}
-              />
-            </SettingRow>
-            <SettingRow
-              label="运行中发送新消息"
-              description="排队等待：先进入待发送队列依次执行；实时引导：立即注入当前轮次调整方向"
-            >
-              <SegmentedControl<"queue" | "steer">
-                value={preferences.busyMessagePolicy ?? "queue"}
-                onChange={(v) => updatePreferences({ busyMessagePolicy: v })}
-                options={[
-                  { value: "queue", label: "排队等待" },
-                  { value: "steer", label: "实时引导" },
-                ]}
-              />
-            </SettingRow>
-          </SettingsSectionCard>
+          <div className="flex flex-col gap-5">
+            <div className="flex flex-col gap-2">
+              <SettingGroupHeader title="外观与主题" />
+              <SettingsSectionCard noHeader>
+                <SettingRow
+                  first
+                  label="外观模式"
+                  description="跟随系统日夜自动切换，或固定使用浅色 / 深色界面"
+                >
+                  <SegmentedControl<AppearanceMode>
+                    value={preferences.appearance}
+                    onChange={(v) => updatePreferences({ appearance: v })}
+                    options={[
+                      { value: "light", label: "浅色" },
+                      { value: "dark", label: "深色" },
+                      { value: "auto", label: "自动" },
+                    ]}
+                  />
+                </SettingRow>
+
+                <div className="border-t border-[var(--border-light)] px-4 py-3.5">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-[13px] font-medium leading-[16px] text-[var(--ink-strong)]">
+                        深色主题风格
+                      </span>
+                      <span className="text-[11px] leading-[14px] text-[var(--ink-subtle)]">
+                        深色与自动夜间模式下生效，点击卡片可立即切换预览
+                      </span>
+                    </div>
+                    <span className="font-mono text-[10.5px] text-[var(--ink-muted)]">
+                      {activeDarkMeta.enName}
+                    </span>
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                    {DARK_THEME_OPTIONS.map((opt) => {
+                      const selected = activeDarkTheme === opt.id;
+                      const p = opt.preview;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => {
+                            const isCurrentlyDark =
+                              document.documentElement.dataset.theme === "dark";
+                            if (!isCurrentlyDark) {
+                              updatePreferences({ darkTheme: opt.id, appearance: "dark" });
+                              pushToast(`已切换至深色 · ${opt.name}`);
+                            } else {
+                              updatePreferences({ darkTheme: opt.id });
+                              pushToast(`已切换深色主题 · ${opt.name}`);
+                            }
+                          }}
+                          className={`group flex cursor-pointer flex-col overflow-hidden rounded-[10px] p-2.5 text-left transition-all ${
+                            selected
+                              ? "border-[1.5px] border-[var(--ink-primary)] bg-[var(--bg-subtle)]/60"
+                              : "border border-[var(--border-control)] bg-[var(--bg-canvas)] hover:border-[var(--border-strong)]"
+                          }`}
+                        >
+                          {/* Miniature Valet UI swatch preview */}
+                          <div
+                            className="flex h-[62px] w-full overflow-hidden rounded-[7px] border"
+                            style={{
+                              backgroundColor: p.canvas,
+                              borderColor: p.border,
+                            }}
+                          >
+                            {/* Mini recessed sidebar */}
+                            <div
+                              className="flex w-[30%] shrink-0 flex-col gap-1 border-r p-1.5"
+                              style={{
+                                backgroundColor: p.sidebar,
+                                borderRightColor: p.border,
+                              }}
+                            >
+                              <div className="flex items-center gap-1 px-0.5">
+                                <span
+                                  className="h-1.5 w-1.5 rounded-full"
+                                  style={{ backgroundColor: p.accent }}
+                                />
+                                <span
+                                  className="h-1 w-5 rounded-full opacity-55"
+                                  style={{ backgroundColor: p.muted }}
+                                />
+                              </div>
+                              <div
+                                className="mt-0.5 h-2.5 w-full rounded-[3px] border"
+                                style={{
+                                  backgroundColor: p.navPill,
+                                  borderColor: p.border,
+                                }}
+                              />
+                              <div
+                                className="mx-0.5 h-1.5 w-3/4 rounded-full opacity-35"
+                                style={{ backgroundColor: p.muted }}
+                              />
+                              <div
+                                className="mx-0.5 h-1.5 w-2/3 rounded-full opacity-25"
+                                style={{ backgroundColor: p.muted }}
+                              />
+                            </div>
+
+                            {/* Mini lifted canvas */}
+                            <div className="flex min-w-0 flex-1 flex-col justify-between p-1.5">
+                              <div className="flex items-center justify-between gap-1.5 px-0.5">
+                                <div
+                                  className="h-2 w-10 rounded-full opacity-90"
+                                  style={{ backgroundColor: p.ink }}
+                                />
+                                <div
+                                  className="h-2.5 w-5 rounded-[3px]"
+                                  style={{ backgroundColor: p.ctaBg }}
+                                />
+                              </div>
+                              <div
+                                className="flex items-center justify-between rounded-[4px] border px-1.5 py-1"
+                                style={{
+                                  backgroundColor: p.surface,
+                                  borderColor: p.border,
+                                }}
+                              >
+                                <div className="flex flex-col gap-0.5">
+                                  <div
+                                    className="h-1 w-8 rounded-full opacity-80"
+                                    style={{ backgroundColor: p.ink }}
+                                  />
+                                  <div
+                                    className="h-1 w-5 rounded-full opacity-45"
+                                    style={{ backgroundColor: p.muted }}
+                                  />
+                                </div>
+                                <div
+                                  className="flex h-2.5 w-4 items-center justify-end rounded-full p-[1.5px]"
+                                  style={{ backgroundColor: p.switchTrack }}
+                                >
+                                  <span
+                                    className="h-[7px] w-[7px] rounded-full"
+                                    style={{ backgroundColor: p.ctaBg }}
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Label & check indicator */}
+                          <div className="mt-2.5 flex items-start justify-between gap-2 px-0.5">
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate text-[12.5px] font-semibold leading-[16px] text-[var(--ink-strong)]">
+                                {opt.name}
+                              </div>
+                              <div className="mt-0.5 truncate font-mono text-[10px] leading-[13px] text-[var(--ink-subtle)]">
+                                {opt.enName}
+                              </div>
+                              <div className="mt-0.5 truncate text-[11px] leading-[14px] text-[var(--ink-muted)]">
+                                {opt.tagline}
+                              </div>
+                            </div>
+                            <span
+                              className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors ${
+                                selected
+                                  ? "border-[var(--ink-primary)] bg-[var(--ink-primary)] text-[var(--ink-on-primary)]"
+                                  : "border-[var(--border-control)] bg-transparent text-transparent"
+                              }`}
+                            >
+                              <CheckIcon size={9} strokeWidth={3.2} />
+                            </span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </SettingsSectionCard>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <SettingGroupHeader title="系统与会话" />
+              <SettingsSectionCard noHeader>
+                <SettingRow first label="登录时自动启动">
+                  <Switch
+                    checked={preferences.launchAtLogin}
+                    onChange={(v) => updatePreferences({ launchAtLogin: v })}
+                    ariaLabel="登录时自动启动"
+                  />
+                </SettingRow>
+                <SettingRow label="在菜单栏显示图标">
+                  <Switch
+                    checked={preferences.showMenuBarIcon}
+                    onChange={(v) => updatePreferences({ showMenuBarIcon: v })}
+                    ariaLabel="在菜单栏显示图标"
+                  />
+                </SettingRow>
+                <SettingRow label="语言">
+                  <SelectMenu
+                    value={preferences.language}
+                    onChange={(v) => updatePreferences({ language: v })}
+                    options={[
+                      { value: "简体中文", label: "简体中文" },
+                      { value: "English", label: "English" },
+                    ]}
+                  />
+                </SettingRow>
+                <SettingRow
+                  label="运行中发送新消息"
+                  description="排队等待：先进入待发送队列依次执行；实时引导：立即注入当前轮次调整方向"
+                >
+                  <SegmentedControl<"queue" | "steer">
+                    value={preferences.busyMessagePolicy ?? "queue"}
+                    onChange={(v) => updatePreferences({ busyMessagePolicy: v })}
+                    options={[
+                      { value: "queue", label: "排队等待" },
+                      { value: "steer", label: "实时引导" },
+                    ]}
+                  />
+                </SettingRow>
+              </SettingsSectionCard>
+            </div>
+          </div>
         );
+      }
 
       case "models":
         return (
@@ -1255,7 +1449,7 @@ export const SettingsView: React.FC = () => {
                     审查决策引擎
                   </span>
                   <span className="text-[11px] text-[var(--ink-muted)]">
-                    在「Auto Review」模式下决定是否自动放行敏感或非纯只读操作
+                    参考 Claude Code Auto Mode：常规本地操作自动放行，仅拦截不可逆破坏、凭据外传等高危操作
                   </span>
                 </div>
                 <SegmentedControl<"auto" | "jev" | "llm">
@@ -1263,8 +1457,8 @@ export const SettingsView: React.FC = () => {
                   value={autoReview.engine}
                   onChange={(engine) => updateAutoReview({ engine })}
                   options={[
-                    { value: "auto", label: "自动（优先 Jev）" },
-                    { value: "jev", label: "仅 Jev System One" },
+                    { value: "auto", label: "自动（优先 Jev / Decision）" },
+                    { value: "jev", label: "仅决策模型 (Jev / Google)" },
                     { value: "llm", label: "仅审查小模型" },
                   ]}
                 />
@@ -1274,9 +1468,11 @@ export const SettingsView: React.FC = () => {
                 <div className="flex flex-col gap-3 border-t border-[var(--border-light)] bg-[var(--bg-subtle)] px-4 py-3.5">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <span className="text-[12px] font-semibold text-[var(--ink-strong)]">
-                      Jev System One 决策模型（/v1/systemone）
+                      {isGoogleDecisions
+                        ? "Google Gemini Decisions 决策模型（/v1beta/decisions）"
+                        : "Jev System One 决策模型（/v1/systemone）"}
                     </span>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
                         onClick={() =>
@@ -1303,6 +1499,19 @@ export const SettingsView: React.FC = () => {
                       </button>
                       <button
                         type="button"
+                        onClick={() =>
+                          updateAutoReview({
+                            jevEndpoint:
+                              "https://generativelanguage.googleapis.com/v1beta/decisions",
+                            jevModel: "gemini-decision-1",
+                          })
+                        }
+                        className="cursor-pointer rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2 py-0.5 text-[10.5px] text-[var(--ink-secondary)] hover:text-[var(--ink-strong)]"
+                      >
+                        Google AI Studio
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => setShowJevKey((v) => !v)}
                         className="cursor-pointer text-[11px] text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
                       >
@@ -1313,7 +1522,7 @@ export const SettingsView: React.FC = () => {
 
                   <label className="flex flex-col gap-1">
                     <span className="text-[11px] text-[var(--ink-muted)]">
-                      Jev API Key（写入 macOS 钥匙串；OpenRouter 端点留空时自动复用上方 OpenRouter Key）
+                      决策模型 API Key（写入 macOS 钥匙串；Google / OpenRouter 端点留空时自动复用上方对应服务商 Key）
                     </span>
                     <input
                       type={showJevKey ? "text" : "password"}
@@ -1328,9 +1537,11 @@ export const SettingsView: React.FC = () => {
                         })
                       }
                       placeholder={
-                        autoReview.jevEndpoint.toLowerCase().includes("openrouter.ai")
-                          ? "sk-or-...（留空将复用 OpenRouter 服务商 Key）"
-                          : "ts-...（留空则自动回退至下方审查小模型）"
+                        isGoogleDecisions
+                          ? "AIza...（留空将复用 Google Gemini 服务商 Key）"
+                          : lowerJevEndpoint.includes("openrouter.ai")
+                            ? "sk-or-...（留空将复用 OpenRouter 服务商 Key）"
+                            : "ts-...（留空则自动回退至下方审查小模型）"
                       }
                       className="h-[32px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
                     />
@@ -1339,7 +1550,7 @@ export const SettingsView: React.FC = () => {
                   <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
                     <label className="flex flex-col gap-1">
                       <span className="text-[11px] text-[var(--ink-muted)]">
-                        System One Endpoint
+                        {isGoogleDecisions ? "Decisions Endpoint" : "System One Endpoint"}
                       </span>
                       <input
                         type="text"
@@ -1347,14 +1558,18 @@ export const SettingsView: React.FC = () => {
                         onChange={(e) =>
                           updateAutoReview({ jevEndpoint: e.target.value, jevVerified: false })
                         }
-                        placeholder="https://api.typesafe.ai/v1/systemone"
+                        placeholder={
+                          isGoogleDecisions
+                            ? "https://generativelanguage.googleapis.com/v1beta/decisions"
+                            : "https://api.typesafe.ai/v1/systemone"
+                        }
                         className="h-[30px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[11px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
                       />
                     </label>
 
                     <label className="flex flex-col gap-1">
                       <span className="text-[11px] text-[var(--ink-muted)]">
-                        Jev 模型 ID
+                        决策模型 ID
                       </span>
                       <input
                         type="text"
@@ -1362,7 +1577,7 @@ export const SettingsView: React.FC = () => {
                         onChange={(e) =>
                           updateAutoReview({ jevModel: e.target.value, jevVerified: false })
                         }
-                        placeholder="jev-latest 或 typesafe/jev-1.14"
+                        placeholder="gemini-decision-1 / jev-latest / typesafe/jev-1.14"
                         className="h-[30px] rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-2.5 font-mono text-[11px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
                       />
                     </label>
@@ -1376,7 +1591,7 @@ export const SettingsView: React.FC = () => {
                     label="审查小模型服务商"
                     description={
                       autoReview.engine === "auto"
-                        ? "未配置 Jev 时作为回退审查模型"
+                        ? "未配置决策模型时作为回退审查模型"
                         : "用于快速评估权限风险"
                     }
                     tinted
@@ -1538,7 +1753,7 @@ export const SettingsView: React.FC = () => {
                       ? "除纯只读探测工具外，其余工具与终端命令都会请求确认。"
                       : preferences.autonomyLevel === "full_access"
                         ? "仅拦截系统硬红线（sudo / 钥匙串 / 受保护目录）与全局开关；其余全自动放行。"
-                        : `当前由「${activeReviewEngineSummary}」智能判断风险（未配置有效凭据时自动降级人工确认）。`}
+                        : `常规本地操作自动放行，仅由「${activeReviewEngineSummary}」拦截高危操作（连续 3 次或累计 20 次拦截自动熔断转人工确认）。`}
                   </span>
                   {preferences.autonomyLevel === "auto_review" && (
                     <button

@@ -110,6 +110,25 @@ type ExecuteApprovedResponse struct {
 	Output string `json:"output"`
 }
 
+// AnswerInboxQuestionRequest forwards a user's Inbox question selection back to Sidecar to continue execution.
+type AnswerInboxQuestionRequest struct {
+	InboxID      string `json:"inboxId"`
+	Question     string `json:"question"`
+	Answer       string `json:"answer"`
+	SourceChatID string `json:"sourceChatId,omitempty"`
+}
+
+// AnswerInboxQuestionResponse summarizes the follow-up agent turn after an Inbox question is answered.
+type AnswerInboxQuestionResponse struct {
+	OK               bool              `json:"ok"`
+	ResolvedChatID   string            `json:"resolvedChatId"`
+	ReplyMessage     types.ChatMessage `json:"replyMessage"`
+	QueuedInboxIDs   []string          `json:"queuedInboxIds"`
+	TimelineEventIDs []string          `json:"timelineEventIds"`
+	UsageCostDelta   float64           `json:"usageCostDelta"`
+	ProviderUsed     string            `json:"providerUsed"`
+}
+
 // QueueApprovalRequest is sent by Sidecar's beforeTool safety hook to queue an Inbox card.
 type QueueApprovalRequest struct {
 	PluginID      string                     `json:"pluginId"`
@@ -127,6 +146,8 @@ type QueueApprovalRequest struct {
 	DismissLabel  string                     `json:"dismissLabel"`
 	ToolName      string                     `json:"toolName"`
 	ToolArgs      map[string]any             `json:"toolArgs"`
+	Options       []string                   `json:"options,omitempty"`
+	SourceChatID  string                     `json:"sourceChatId,omitempty"`
 	ActionItems   []types.TimelineActionItem `json:"actionItems"`
 }
 

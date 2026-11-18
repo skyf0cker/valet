@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useValet } from "../store/ValetContext";
+import { getDarkThemeMeta } from "../constants/themes";
 import type { AppView } from "../types/valet";
 import { DutyPulse } from "./ui/DutyPulse";
 import {
@@ -164,7 +165,11 @@ export const Sidebar: React.FC = () => {
   const toggleAppearanceQuick = () => {
     const next = resolvedDark ? "light" : "dark";
     updatePreferences({ appearance: next });
-    pushToast(next === "dark" ? "已切换深色模式" : "已切换浅色模式");
+    pushToast(
+      next === "dark"
+        ? `已切换深色模式 · ${getDarkThemeMeta(state.preferences.darkTheme).name}`
+        : "已切换浅色模式"
+    );
   };
 
   const navItems: Array<{
@@ -251,7 +256,7 @@ export const Sidebar: React.FC = () => {
             ) : (
               <span
                 className={`h-[5px] w-[5px] shrink-0 rounded-full ${
-                  state.isPaused ? "bg-[var(--amber-icon)]" : "bg-[var(--ink-primary)]"
+                  state.isPaused ? "bg-[var(--amber-icon)]" : "bg-[var(--duty-dot)]"
                 }`}
               />
             )}
@@ -271,10 +276,10 @@ export const Sidebar: React.FC = () => {
                 type="button"
                 onClick={() => setActiveView(item.id)}
                 title={`${item.label}${item.shortcut ? ` (${item.shortcut})` : ""}`}
-                className={`relative flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-[9px] transition-colors ${
+                className={`relative flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-[9px] border transition-colors ${
                   active
-                    ? "bg-[var(--ink-primary)] text-[var(--ink-on-primary)]"
-                    : "text-[var(--ink-primary)] hover:bg-[var(--bg-hover)]/70"
+                    ? "border-[var(--nav-active-border)] bg-[var(--nav-active-bg)] text-[var(--nav-active-fg)]"
+                    : "border-transparent text-[var(--ink-nav)] hover:bg-[var(--bg-hover)]/70 hover:text-[var(--ink-strong)]"
                 }`}
               >
                 {item.icon}
@@ -321,10 +326,10 @@ export const Sidebar: React.FC = () => {
             onClick={() => setActiveView("settings")}
             title="设置"
             aria-label="打开设置"
-            className={`flex h-7 w-7 cursor-pointer items-center justify-center rounded-[7px] transition-colors ${
+            className={`flex h-7 w-7 cursor-pointer items-center justify-center rounded-[7px] border transition-colors ${
               state.activeView === "settings"
-                ? "bg-[var(--ink-primary)] text-[var(--ink-on-primary)]"
-                : "text-[var(--ink-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
+                ? "border-[var(--nav-active-border)] bg-[var(--nav-active-bg)] text-[var(--nav-active-fg)]"
+                : "border-transparent text-[var(--ink-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
             }`}
           >
             <SettingsIcon size={14} />
@@ -332,7 +337,7 @@ export const Sidebar: React.FC = () => {
 
           <div
             title={preferences.userNickname || "dd"}
-            className="mt-0.5 flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full bg-[var(--ink-primary)] text-[10px] font-semibold text-[var(--ink-on-primary)]"
+            className="mt-0.5 flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border border-[var(--avatar-border)] bg-[var(--avatar-bg)] text-[10px] font-semibold text-[var(--avatar-fg)]"
           >
             {userInitial}
           </div>
@@ -440,10 +445,10 @@ export const Sidebar: React.FC = () => {
               type="button"
               onClick={() => setActiveView(item.id)}
               title={item.shortcut ? `${item.label} (${item.shortcut})` : item.label}
-              className={`flex h-[34px] w-full cursor-pointer items-center gap-2.5 rounded-[8px] px-2.5 text-left transition-colors ${
+              className={`flex h-[34px] w-full cursor-pointer items-center gap-2.5 rounded-[8px] border px-2.5 text-left transition-colors ${
                 active
-                  ? "bg-[var(--ink-primary)] text-[var(--ink-on-primary)]"
-                  : "text-[var(--ink-nav)] hover:bg-[var(--bg-hover)]/65 hover:text-[var(--ink-strong)]"
+                  ? "border-[var(--nav-active-border)] bg-[var(--nav-active-bg)] text-[var(--nav-active-fg)]"
+                  : "border-transparent text-[var(--ink-nav)] hover:bg-[var(--bg-hover)]/65 hover:text-[var(--ink-strong)]"
               }`}
             >
               <span className="shrink-0">{item.icon}</span>
@@ -458,7 +463,9 @@ export const Sidebar: React.FC = () => {
                 <span
                   className={`inline-flex h-[18px] min-w-[20px] items-center justify-center rounded-full px-1.5 font-sans text-[11px] font-semibold leading-[14px] ${
                     active
-                      ? "bg-[var(--ink-on-primary)]/16 text-[var(--ink-on-primary)]"
+                      ? item.badgeTone === "amber"
+                        ? "border border-[var(--nav-active-amber-border)] bg-[var(--nav-active-amber-bg)] text-[var(--nav-active-amber-fg)]"
+                        : "bg-[var(--nav-active-badge-bg)] text-[var(--nav-active-fg)]"
                       : item.badgeTone === "amber"
                         ? "border border-[var(--amber-pill)] bg-[var(--amber-bg)] text-[var(--amber-text)]"
                         : "bg-[var(--bg-hover)] text-[var(--ink-body)]"
@@ -569,7 +576,7 @@ export const Sidebar: React.FC = () => {
 
       {/* Bottom user, pause & settings bar */}
       <div className="flex items-center gap-2 border-t border-[var(--border-base)] px-1.5 pt-2.5">
-        <div className="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full bg-[var(--ink-primary)] text-[10px] font-semibold text-[var(--ink-on-primary)]">
+        <div className="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border border-[var(--avatar-border)] bg-[var(--avatar-bg)] text-[10px] font-semibold text-[var(--avatar-fg)]">
           {userInitial}
         </div>
         <div className="min-w-0 flex-1">
@@ -596,10 +603,10 @@ export const Sidebar: React.FC = () => {
             onClick={() => setActiveView("settings")}
             title="设置"
             aria-label="打开设置"
-            className={`flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-[6px] transition-colors ${
+            className={`flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-[6px] border transition-colors ${
               state.activeView === "settings"
-                ? "bg-[var(--ink-primary)] text-[var(--ink-on-primary)]"
-                : "text-[var(--ink-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
+                ? "border-[var(--nav-active-border)] bg-[var(--nav-active-bg)] text-[var(--nav-active-fg)]"
+                : "border-transparent text-[var(--ink-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
             }`}
           >
             <SettingsIcon size={14} />

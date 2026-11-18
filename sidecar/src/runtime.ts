@@ -36,6 +36,8 @@ import { createStewardCoreExtension } from "./extensions/steward-core.ts";
 import { McpClientManager } from "./mcp.ts";
 import { ValetModelManager } from "./models.ts";
 import type {
+  AnswerInboxQuestionRequest,
+  AnswerInboxQuestionResponse,
   ChatMessage,
   ChatStreamPayload,
   ChatStreamStep,
@@ -84,6 +86,7 @@ const TOOL_STATUS_LABELS: Record<string, string> = {
   plugin_configure: "正在更新插件策略与配置…",
   plugin_trigger: "正在注入插件测试事件…",
   plugin_remove: "正在卸载/移除插件…",
+  item_resolve: "正在处理引用的事项…",
 };
 
 export function stripThinkTags(raw: string): {
@@ -183,6 +186,10 @@ function humanizeToolStepLabel(
       return args?.eventId ? `触发测试 · ${String(args.eventId)}` : "触发插件事件";
     case "plugin_remove":
       return args?.id ? `移除插件 · ${String(args.id)}` : "移除插件";
+    case "item_resolve":
+      return args?.id
+        ? `处理事项 · ${String(args.id)}`
+        : "处理引用的事项";
     default:
       return name.replace(/^(plugin_|mcp_)/, "").replace(/_/g, " ");
   }
@@ -569,7 +576,19 @@ export class ValetDurableRuntime {
 
     const imageBlocks: Array<{ type: "image"; data: string; mimeType: string }> = [];
     const fileExcerpts: string[] = [];
+    const quoteExcerpts: string[] = [];
+    const nonQuoteAttachments: typeof req.attachments = [];
     for (const att of req.attachments ?? []) {
+      if (att.kind === "inbox_item" || att.kind === "timeline_event") {
+        const kindLabel = att.kind === "inbox_item" ? "收件箱事项" : "时间线事件";
+        const idTag = att.refId ? ` id=${att.refId}` : "";
+        const quoteBody = (att.textExcerpt?.trim() || att.meta || "").slice(0, 12_000);
+        quoteExcerpts.push(
+          `[引用事项 · ${kindLabel}${idTag} · ${att.name}]${quoteBody ? `\n${quoteBody}` : ""}`,
+        );
+        continue;
+      }
+      nonQuoteAttachments.push(att);
       if (att.kind === "image" || att.kind === "screen") {
         let base64Data = "";
         let mimeType = att.mimeType || "image/png";
@@ -622,13 +641,17 @@ export class ValetDurableRuntime {
     }
 
     const attachSummary =
-      req.attachments && req.attachments.length > 0
-        ? `\n\n[附件上下文: ${req.attachments.map((a) => `${a.name}${a.meta ? ` (${a.meta})` : ""}`).join("、")}]`
+      nonQuoteAttachments.length > 0
+        ? `\n\n[附件上下文: ${nonQuoteAttachments.map((a) => `${a.name}${a.meta ? ` (${a.meta})` : ""}`).join("、")}]`
         : "";
     const excerptBlock =
       fileExcerpts.length > 0 ? `\n\n${fileExcerpts.join("\n\n")}` : "";
+    const quoteBlock =
+      quoteExcerpts.length > 0
+        ? `\n\n${quoteExcerpts.join("\n\n")}\n\n[引用事项交互说明]\n以上是用户从收件箱或时间线引用的具体事项详情。若用户在提问或核实细节，请直接结合以上载荷、判断依据与只读探测工具解答；若用户明确指示批准、执行（含指定部分子项）、忽略或还原该事项，请调用 \`item_resolve\` 工具完成处理。`
+        : "";
     const mentionPrefix = mentionPlugin ? `@${mentionPlugin.name} ` : "";
-    const inputText = `${mentionPrefix}${req.prompt}${attachSummary}${excerptBlock}`;
+    const inputText = `${mentionPrefix}${req.prompt}${attachSummary}${excerptBlock}${quoteBlock}`;
     const submitContent =
       imageBlocks.length > 0
         ? [{ type: "text" as const, text: inputText }, ...imageBlocks]
@@ -784,6 +807,8 @@ export class ValetDurableRuntime {
             : "thinking";
         emitStream();
       });
+
+      this.permissionCoordinator.recordUserIntent(req.chatId, req.prompt);
 
       const submission = await conv.submit(
         {
@@ -1010,13 +1035,16 @@ export class ValetDurableRuntime {
     ok: boolean;
     output: string;
   }> {
-    const conv = await this.ensureConversation(`approved:${req.inboxId}`);
     const effectiveToolName =
       req.toolName === "disk_move_to_trash" || req.toolName === "app_trash_remnants"
         ? "trash_files"
         : req.toolName === "process_terminate"
           ? "kill_process"
           : req.toolName;
+    if (effectiveToolName === "ask_user") {
+      return { ok: true, output: "已记录你的确认回复。" };
+    }
+    const conv = await this.ensureConversation(`approved:${req.inboxId}`);
     const snap = this.registry.snapshot();
     const matched = snap.tools().find((entry) => entry.tool.name === effectiveToolName);
     if (!matched) {
@@ -1105,6 +1133,74 @@ export class ValetDurableRuntime {
     );
 
     return resultPromise;
+  }
+
+  private async resolveQuestionSourceChatId(
+    inboxId: string,
+    explicitChatId?: string,
+  ): Promise<string> {
+    if (explicitChatId?.trim()) {
+      return explicitChatId.trim();
+    }
+    const harness = this.requireHarness();
+    const threads = await harness.snapshot(ValetThreadsDoc, BACKGROUND_CONTEXT);
+    for (const [chatId, convId] of Object.entries(threads?.map ?? {})) {
+      if (chatId.startsWith("approved:")) continue;
+      const conv = await harness.conversation(convId, BACKGROUND_CONTEXT);
+      if (!conv) continue;
+      const { items } = await conv.entries(
+        { order: "descending" },
+        25,
+        undefined,
+        BACKGROUND_CONTEXT,
+      );
+      for (const entry of items) {
+        if (!ToolResultEntry.is(entry)) continue;
+        const toolMsg = entry.model?.[0] as ToolResultMessage | undefined;
+        if (!toolMsg) continue;
+        const det = toolMsg.details as
+          | { queued?: { inboxId?: string } }
+          | undefined;
+        if (det?.queued?.inboxId === inboxId) {
+          return chatId;
+        }
+        const text = (toolMsg.content ?? [])
+          .map((b) => (b.type === "text" ? b.text : ""))
+          .join("\n");
+        if (inboxId && text.includes(inboxId)) {
+          return chatId;
+        }
+      }
+    }
+    return "heartbeat:system";
+  }
+
+  async answerInboxQuestion(
+    req: AnswerInboxQuestionRequest,
+  ): Promise<AnswerInboxQuestionResponse> {
+    const resolvedChatId = await this.resolveQuestionSourceChatId(
+      req.inboxId,
+      req.sourceChatId,
+    );
+    const model =
+      resolvedChatId.startsWith("event:") ||
+      resolvedChatId.startsWith("heartbeat:")
+        ? this.state.preferences.models.fast ||
+          this.state.preferences.models.primary
+        : this.state.preferences.models.primary ||
+          this.state.preferences.models.fast;
+    const prompt = `[INBOX_ANSWER inbox=${req.inboxId}] 用户在收件箱对问题「${req.question}」作出了选择：「${req.answer}」。请严格按用户的这一决定继续处理后续步骤（若用户选择暂不处理、取消或继续观察，仅简短确认即可，不要执行任何修改；也不要再次调用 ask_user 重复提交相同的问题）。`;
+    const res = await this.sendChat({
+      chatId: resolvedChatId,
+      prompt,
+      model,
+      interactive: false,
+    });
+    return {
+      ok: true,
+      resolvedChatId,
+      ...res,
+    };
   }
 
   async inspect(): Promise<Record<string, unknown>> {

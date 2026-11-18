@@ -1,8 +1,21 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useValet } from "../../store/ValetContext";
-import { PluginTag } from "../ui/Badge";
+import {
+  getInboxQuestionOptions,
+  isQuestionInboxItem,
+  isReversibleTrashInboxItem,
+} from "../../utils/inbox";
+import { findLinkedTimelineEvent } from "../../utils/timelineLinks";
+import { PluginTag, StatusPill } from "../ui/Badge";
 import { Checkbox } from "../ui/Checkbox";
-import { CloseIcon, UndoIcon } from "../ui/Icons";
+import {
+  ArrowUpRightIcon,
+  ChatQuoteIcon,
+  ClockIcon,
+  CloseIcon,
+  MailIcon,
+  UndoIcon,
+} from "../ui/Icons";
 import { SlideOverDrawer } from "../ui/Modal";
 import { SegmentedControl } from "../ui/SegmentedControl";
 
@@ -14,13 +27,17 @@ export const InboxDetailDrawer: React.FC = () => {
     selectInboxItem,
     toggleInboxActionItem,
     approveInboxItem,
+    answerInboxQuestion,
     dismissInboxItem,
     restoreApprovedInboxItem,
+    quoteInboxItemToChat,
+    openInboxItemInTimeline,
     pushToast,
   } = useValet();
 
   const [tab, setTab] = useState<DrawerTab>("overview");
   const [expandedItems, setExpandedItems] = useState(false);
+  const [customReply, setCustomReply] = useState("");
 
   const item = useMemo(
     () =>
@@ -28,6 +45,22 @@ export const InboxDetailDrawer: React.FC = () => {
         ? state.inboxItems.find((i) => i.id === state.selectedInboxItemId) ?? null
         : null,
     [state.inboxItems, state.selectedInboxItemId]
+  );
+
+  useEffect(() => {
+    setCustomReply("");
+  }, [item?.id]);
+
+  const questionOptions = useMemo(
+    () => (item ? getInboxQuestionOptions(item) : []),
+    [item]
+  );
+  const isQuestion = Boolean(item && isQuestionInboxItem(item));
+  const isTrashReversible = Boolean(item && isReversibleTrashInboxItem(item));
+
+  const linkedEvent = useMemo(
+    () => (item ? findLinkedTimelineEvent(item, state.timelineEvents) : null),
+    [item, state.timelineEvents]
   );
 
   const visibleItems = useMemo(() => {
@@ -87,11 +120,11 @@ export const InboxDetailDrawer: React.FC = () => {
               <div className="flex flex-wrap items-center gap-2">
                 {item.status === "pending" ? (
                   <span className="inline-flex h-[24px] shrink-0 items-center rounded-full border border-[var(--amber-pill)] px-[9px] text-[11px] font-medium text-[var(--amber-text)]">
-                    待你批准
+                    {isQuestion ? "待你选择" : "待你批准"}
                   </span>
                 ) : item.status === "approved" ? (
                   <span className="inline-flex h-[24px] shrink-0 items-center rounded-full border border-[var(--border-control)] px-[9px] text-[11px] font-medium text-[var(--ink-muted)]">
-                    {item.restored ? "已还原" : "已批准"}
+                    {item.restored ? "已还原" : isQuestion ? "已回复" : "已批准"}
                   </span>
                 ) : (
                   <span className="inline-flex h-[24px] shrink-0 items-center rounded-full border border-[var(--border-control)] px-[9px] text-[11px] font-medium text-[var(--ink-subtle)]">
@@ -112,6 +145,36 @@ export const InboxDetailDrawer: React.FC = () => {
               <h3 className="font-[family-name:var(--font-serif-zh)] text-[24px] font-normal leading-[34px] tracking-[-0.01em] text-[var(--ink-strong)]">
                 {item.title}
               </h3>
+
+              {linkedEvent && (
+                <button
+                  type="button"
+                  onClick={() => openInboxItemInTimeline(item.id)}
+                  className="group mt-1 flex w-full cursor-pointer items-center gap-2.5 rounded-[10px] border border-[var(--border-card)] bg-[var(--bg-subtle)] px-3 py-2 text-left transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]/65"
+                >
+                  <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[6px] border border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-primary)]">
+                    <ClockIcon size={12.5} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-mono text-[10px] font-medium text-[var(--ink-muted)]">
+                        关联时间线 · {linkedEvent.timeLabel}
+                      </span>
+                      <span className="truncate font-mono text-[10px] text-[var(--ink-subtle)]">
+                        {linkedEvent.eventCode}
+                      </span>
+                    </div>
+                    <div className="truncate text-[12.5px] font-medium text-[var(--ink-strong)]">
+                      {linkedEvent.title}
+                    </div>
+                  </div>
+                  <StatusPill status={linkedEvent.status} pendingLabel="待确认" />
+                  <span className="inline-flex shrink-0 items-center gap-0.5 text-[11.5px] font-medium text-[var(--ink-primary)]">
+                    <span>跳转</span>
+                    <ArrowUpRightIcon size={12} />
+                  </span>
+                </button>
+              )}
             </div>
 
             {tab === "overview" && (
@@ -133,6 +196,77 @@ export const InboxDetailDrawer: React.FC = () => {
                     {item.reasoning}
                   </p>
                 </section>
+
+                {isQuestion && (
+                  <section className="flex flex-col gap-2.5">
+                    <div className="font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--ink-subtle)]">
+                      {item.status === "pending" ? "03 · 选择处理方案" : "03 · 你的回复"}
+                    </div>
+
+                    {item.status === "pending" ? (
+                      <>
+                        {questionOptions.length > 0 && (
+                          <div className="flex flex-col gap-2">
+                            {questionOptions.map((opt, idx) => (
+                              <button
+                                key={opt}
+                                type="button"
+                                onClick={() => answerInboxQuestion(item.id, opt)}
+                                className={`flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] border px-3.5 py-2.5 text-left text-[13px] transition-colors ${
+                                  idx === 0
+                                    ? "border-[var(--ink-primary)] bg-[var(--ink-primary)]/5 font-medium text-[var(--ink-strong)] hover:bg-[var(--ink-primary)]/10"
+                                    : "border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-strong)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)]"
+                                }`}
+                              >
+                                <span>{opt}</span>
+                                <span className="shrink-0 font-mono text-[11px] text-[var(--ink-muted)]">
+                                  选择 →
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+
+                        <div className="flex items-center gap-2 pt-0.5">
+                          <input
+                            type="text"
+                            value={customReply}
+                            onChange={(e) => setCustomReply(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && customReply.trim()) {
+                                e.preventDefault();
+                                answerInboxQuestion(item.id, customReply.trim());
+                              }
+                            }}
+                            placeholder="或输入自定义回复 / 补充指示…"
+                            autoCorrect="off"
+                            autoCapitalize="off"
+                            spellCheck={false}
+                            className="h-[34px] min-w-0 flex-1 rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 text-[12.5px] text-[var(--ink-strong)] placeholder:text-[var(--ink-subtle)] focus:border-[var(--ink-primary)] focus:outline-none"
+                          />
+                          <button
+                            type="button"
+                            disabled={!customReply.trim()}
+                            onClick={() => answerInboxQuestion(item.id, customReply.trim())}
+                            className={`inline-flex h-[34px] shrink-0 items-center rounded-[8px] border border-[var(--border-control)] px-3 text-[12.5px] font-medium text-[var(--ink-strong)] ${
+                              customReply.trim()
+                                ? "cursor-pointer hover:bg-[var(--bg-subtle)]"
+                                : "cursor-not-allowed opacity-40"
+                            }`}
+                          >
+                            发送回复
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="rounded-[9px] border border-[var(--border-base)] bg-[var(--bg-subtle)] px-3.5 py-2.5 text-[13px] text-[var(--ink-strong)]">
+                        {item.status === "dismissed"
+                          ? "已忽略，未作回复"
+                          : item.selectedOption || item.approveLabel}
+                      </div>
+                    )}
+                  </section>
+                )}
 
                 {item.actionItems.length > 0 && (
                   <section className="flex flex-col gap-1">
@@ -290,49 +424,113 @@ export const InboxDetailDrawer: React.FC = () => {
           </div>
 
           {/* Footer */}
-          <div className="flex shrink-0 items-center gap-2 border-t border-[var(--border-light)] px-7 py-4">
-            <UndoIcon size={14} className="shrink-0 text-[var(--ink-muted)]" />
-            <span className="flex-1 text-[12px] text-[var(--ink-muted)]">
-              {item.reversible7d
-                ? "移入废纸篓 · 7 天内可一键还原"
-                : item.warningTag === "外发消息"
-                  ? "外发草稿默认拦截 · 经批准后才发送"
-                  : "敏感系统操作 · 执行后不可撤销"}
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-[var(--border-light)] px-7 py-4">
+            {isQuestion ? (
+              <MailIcon size={14} className="shrink-0 text-[var(--ink-muted)]" />
+            ) : (
+              <UndoIcon size={14} className="shrink-0 text-[var(--ink-muted)]" />
+            )}
+            <span className="min-w-[140px] flex-1 truncate text-[12px] text-[var(--ink-muted)]">
+              {isQuestion
+                ? item.status === "pending"
+                  ? "选择方案后，Valet 将按你的决定继续执行"
+                  : item.status === "approved"
+                    ? `已回复：${item.selectedOption || item.approveLabel}`
+                    : "已忽略该问题，未执行操作"
+                : isTrashReversible
+                  ? "移入废纸篓 · 7 天内可一键还原"
+                  : item.warningTag === "外发消息"
+                    ? "外发草稿默认拦截 · 经批准后才发送"
+                    : "敏感系统操作 · 执行后不可撤销"}
             </span>
 
-            {item.status === "pending" && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => dismissInboxItem(item.id)}
-                  className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
-                >
-                  {item.dismissLabel}
-                </button>
-                <button
-                  type="button"
-                  disabled={item.actionItems.length > 0 && selectedCount === 0}
-                  onClick={() => approveInboxItem(item.id)}
-                  className={`inline-flex h-[34px] items-center rounded-[8px] bg-[var(--ink-primary)] px-3.5 text-[13px] font-semibold text-[var(--ink-on-primary)] ${
-                    item.actionItems.length > 0 && selectedCount === 0
-                      ? "cursor-not-allowed opacity-40"
-                      : "cursor-pointer"
-                  }`}
-                >
-                  {item.approveLabel}
-                </button>
-              </>
-            )}
-
-            {item.status === "approved" && item.reversible7d && !item.restored && (
+            <div className="flex flex-wrap items-center justify-end gap-2">
               <button
                 type="button"
-                onClick={() => restoreApprovedInboxItem(item.id)}
-                className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                onClick={() => quoteInboxItemToChat(item.id)}
+                className="inline-flex h-[34px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-3 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
               >
-                一键还原
+                <ChatQuoteIcon size={13.5} className="shrink-0 text-[var(--ink-muted)]" />
+                <span>引用到对话</span>
               </button>
-            )}
+
+              {item.status === "pending" && isQuestion && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => dismissInboxItem(item.id)}
+                    className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                  >
+                    {item.dismissLabel || "忽略"}
+                  </button>
+                  {questionOptions.length > 0 && questionOptions.length <= 3 ? (
+                    <>
+                      {questionOptions.slice(1).map((opt) => (
+                        <button
+                          key={opt}
+                          type="button"
+                          onClick={() => answerInboxQuestion(item.id, opt)}
+                          className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                        >
+                          {opt}
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() => answerInboxQuestion(item.id, questionOptions[0]!)}
+                        className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] bg-[var(--ink-primary)] px-3.5 text-[13px] font-semibold text-[var(--ink-on-primary)]"
+                      >
+                        {questionOptions[0]}
+                      </button>
+                    </>
+                  ) : questionOptions.length === 0 ? (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        answerInboxQuestion(item.id, customReply.trim() || "确认")
+                      }
+                      className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] bg-[var(--ink-primary)] px-3.5 text-[13px] font-semibold text-[var(--ink-on-primary)]"
+                    >
+                      发送回复
+                    </button>
+                  ) : null}
+                </>
+              )}
+
+              {item.status === "pending" && !isQuestion && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => dismissInboxItem(item.id)}
+                    className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                  >
+                    {item.dismissLabel}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={item.actionItems.length > 0 && selectedCount === 0}
+                    onClick={() => approveInboxItem(item.id)}
+                    className={`inline-flex h-[34px] items-center rounded-[8px] bg-[var(--ink-primary)] px-3.5 text-[13px] font-semibold text-[var(--ink-on-primary)] ${
+                      item.actionItems.length > 0 && selectedCount === 0
+                        ? "cursor-not-allowed opacity-40"
+                        : "cursor-pointer"
+                    }`}
+                  >
+                    {item.approveLabel}
+                  </button>
+                </>
+              )}
+
+              {item.status === "approved" && isTrashReversible && !item.restored && (
+                <button
+                  type="button"
+                  onClick={() => restoreApprovedInboxItem(item.id)}
+                  className="inline-flex h-[34px] cursor-pointer items-center rounded-[8px] border border-[var(--border-control)] px-3.5 text-[13px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                >
+                  一键还原
+                </button>
+              )}
+            </div>
           </div>
         </>
       )}

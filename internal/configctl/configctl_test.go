@@ -47,6 +47,13 @@ func TestSchemaAndGet(t *testing.T) {
 	if scalar != snap.Preferences.Appearance {
 		t.Fatalf("expected %q, got %#v", snap.Preferences.Appearance, scalar)
 	}
+	darkThemeVal, err := configctl.Get(snap.Preferences, "darkTheme")
+	if err != nil {
+		t.Fatalf("Get darkTheme failed: %v", err)
+	}
+	if darkThemeVal != "obsidian" {
+		t.Fatalf("expected darkTheme=\"obsidian\", got %#v", darkThemeVal)
+	}
 
 	if _, err := configctl.Get(snap.Preferences, "nonexistent.key.xyz"); err == nil {
 		t.Fatal("expected error for unknown key/section")
@@ -58,18 +65,20 @@ func TestApplyUpdatesAndValidation(t *testing.T) {
 
 	// 1. Scalar, enum, int range, float & heartbeat initialization
 	changes, err := configctl.ApplyUpdates(&snap, map[string]string{
-		"appearance":           "dark",
-		"dailySpendLimit":      "45.5",
-		"maxStepsPerTask":      "40",
+		"appearance":            "dark",
+		"darkTheme":             "espresso",
+		"dailySpendLimit":       "45.5",
+		"maxStepsPerTask":       "40",
 		"heartbeat.intervalMin": "15",
 	})
 	if err != nil {
 		t.Fatalf("ApplyUpdates failed: %v", err)
 	}
-	if len(changes) != 4 {
-		t.Fatalf("expected 4 ChangeRecords, got %d", len(changes))
+	if len(changes) != 5 {
+		t.Fatalf("expected 5 ChangeRecords, got %d", len(changes))
 	}
-	if snap.Preferences.Appearance != "dark" || snap.Preferences.DailySpendLimit != 45.5 ||
+	if snap.Preferences.Appearance != "dark" || snap.Preferences.DarkTheme != "espresso" ||
+		snap.Preferences.DailySpendLimit != 45.5 ||
 		snap.Preferences.MaxStepsPerTask != 40 || snap.Preferences.Heartbeat.IntervalMin != 15 {
 		t.Fatalf("preferences not updated as expected: %+v", snap.Preferences)
 	}
@@ -182,6 +191,11 @@ func TestApplyUpdatesAndValidation(t *testing.T) {
 	}
 	if snap.Preferences.Appearance != beforeAppearance {
 		t.Fatal("expected failed ApplyUpdates batch with unknown key not to mutate Appearance")
+	}
+	if _, err := configctl.ApplyUpdates(&snap, map[string]string{
+		"darkTheme": "neon",
+	}); err == nil {
+		t.Fatal("expected validation error for unsupported darkTheme")
 	}
 }
 

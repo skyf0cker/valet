@@ -256,6 +256,26 @@ func normalizeLoadedSnapshot(s *types.ValetSnapshot) {
 	if s.InboxItems == nil {
 		s.InboxItems = []types.InboxApprovalItem{}
 	}
+	for i := range s.InboxItems {
+		it := &s.InboxItems[i]
+		if it.EventCode == "user.question" || it.ToolName == "ask_user" {
+			it.Reversible7d = false
+			if len(it.Options) == 0 {
+				if opts := extractStoreStringSlice(it.ToolArgs["options"]); len(opts) > 0 {
+					it.Options = opts
+				} else if opts := extractStoreStringSlice(it.Payload["options"]); len(opts) > 0 {
+					it.Options = opts
+				}
+			}
+			if strings.TrimSpace(it.SourceChatID) == "" {
+				if cid, ok := it.ToolArgs["sourceChatId"].(string); ok && strings.TrimSpace(cid) != "" {
+					it.SourceChatID = strings.TrimSpace(cid)
+				} else if cid, ok := it.Payload["sourceChatId"].(string); ok && strings.TrimSpace(cid) != "" {
+					it.SourceChatID = strings.TrimSpace(cid)
+				}
+			}
+		}
+	}
 	if s.TimelineEvents == nil {
 		s.TimelineEvents = []types.TimelineEvent{}
 	}
@@ -315,6 +335,7 @@ func normalizeLoadedSnapshot(s *types.ValetSnapshot) {
 	if s.Preferences.BusyMessagePolicy != "steer" && s.Preferences.BusyMessagePolicy != "queue" {
 		s.Preferences.BusyMessagePolicy = "queue"
 	}
+	s.Preferences.DarkTheme = types.NormalizeDarkTheme(s.Preferences.DarkTheme)
 	if !s.Preferences.Heartbeat.Initialized {
 		def := DefaultHeartbeatConfig()
 		s.Preferences.Heartbeat.Enabled = true
@@ -420,4 +441,29 @@ func cloneSnapshot(src types.ValetSnapshot) types.ValetSnapshot {
 		return src
 	}
 	return out
+}
+
+func extractStoreStringSlice(raw any) []string {
+	switch v := raw.(type) {
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if t := strings.TrimSpace(item); t != "" {
+				out = append(out, t)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				if t := strings.TrimSpace(s); t != "" {
+					out = append(out, t)
+				}
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }

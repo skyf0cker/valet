@@ -198,6 +198,7 @@ func (s *Service) handleCtrlStatus(w http.ResponseWriter, _ *http.Request) {
 		"models":           snap.Preferences.Models,
 		"autonomyLevel":    snap.Preferences.AutonomyLevel,
 		"appearance":       snap.Preferences.Appearance,
+		"darkTheme":        snap.Preferences.DarkTheme,
 		"systemMetrics":    snap.SystemMetrics,
 		"counts": map[string]int{
 			"pluginsTotal":       len(snap.Plugins),

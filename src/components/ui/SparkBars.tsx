@@ -31,7 +31,7 @@ export const SparkBars: React.FC<SparkBarsProps> = ({
         const bgClass = muted
           ? "bg-[var(--bg-track)]"
           : isPeak
-            ? "bg-[var(--ink-primary)]"
+            ? "bg-[var(--spark-bar-peak)]"
             : isHigh
               ? "bg-[var(--spark-bar-active)]"
               : val <= 2

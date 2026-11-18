@@ -54,6 +54,7 @@ valet skill list
 | `launchAtLogin` | `true` \| `false` | 开机自启 |
 | `showMenuBarIcon` | `true` \| `false` | 菜单栏图标驻留 |
 | `appearance` | `light` \| `dark` \| `auto` | 外观主题（浅色/深色/跟随系统） |
+| `darkTheme` | `obsidian` \| `espresso` \| `chronometer` | 深色主题配色（午夜黑曜石 / 暖岩黑胡桃 / 深松怀表） |
 | `language` | `string` | 界面语言（如 `简体中文`、`English`） |
 | `busyMessagePolicy` | `queue` \| `steer` | 运行中发消息策略（排队 / 立即插话） |
 
@@ -106,7 +107,7 @@ valet skill list
 
 ### 5. 高敏感安全护栏（**受安全门控保护，修改将强制进入收件箱审批**）
 - `autonomyLevel`（`always_ask` | `auto_review` | `full_access`）
-- `autoReview.engine`（`auto` | `jev` | `llm`）/ `autoReview.jevEndpoint` / `autoReview.jevModel` / `autoReview.fallbackProviderId` / `autoReview.fallbackModel`
+- `autoReview.engine`（`auto` | `jev` | `llm`）/ `autoReview.jevEndpoint` / `autoReview.jevModel` / `autoReview.fallbackProviderId` / `autoReview.fallbackModel`（其中 `jevEndpoint` / `jevModel` 支持 TypeSafe Jev `/v1/systemone`、OpenRouter，以及 Google Decisions `https://generativelanguage.googleapis.com/v1beta/decisions` + `gemini-decision-1`）
 - `confirmChecklist.deleteOrOverwrite` / `sendMessageOrEmail` / `paymentOrSubscription` / `runTerminalCommand` / `modifySystemSettings`
 - `cleanupPolicy.deleteMethod` / `restoreRetentionDays` / `protectedDirs` / `autoScanAfterUninstall`
 - `blockedApps`

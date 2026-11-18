@@ -185,11 +185,37 @@ function buildLocalStewardMessage(
 
   const userMsg = lastUserIdx >= 0 ? (msgs[lastUserIdx] as UserMessage) : undefined;
   const prompt = userMsg ? extractUserText(userMsg.content).trim() : "";
-  const lower = prompt.toLowerCase();
+  let rawUserPrompt = prompt;
+  for (const marker of ["\n\n[附件上下文:", "\n\n[引用事项"]) {
+    const idx = rawUserPrompt.indexOf(marker);
+    if (idx >= 0) {
+      rawUserPrompt = rawUserPrompt.slice(0, idx);
+    }
+  }
+  rawUserPrompt = rawUserPrompt.trim();
+  const lower = rawUserPrompt.toLowerCase();
+  const quoteMatch = prompt.match(
+    /\[引用事项 · (收件箱事项|时间线事件)(?: id=([^\s·\]]+))? · ([^\]]+)\]/,
+  );
+  const quoteSource = quoteMatch
+    ? quoteMatch[1] === "收件箱事项"
+      ? "inbox"
+      : "timeline"
+    : undefined;
+  const quoteId = quoteMatch?.[2]?.trim() ?? "";
+  const quoteTitle = quoteMatch?.[3]?.trim() ?? "";
   const sinceUser = lastUserIdx >= 0 ? msgs.slice(lastUserIdx + 1) : msgs;
   const toolResults = sinceUser.filter(
     (m): m is ToolResultMessage => m.role === "toolResult",
   );
+
+  if (prompt.startsWith("[INBOX_ANSWER ")) {
+    const ansMatch = prompt.match(/作出了选择：「([\s\S]*?)」/);
+    const chosen = ansMatch?.[1]?.trim() || "已确认";
+    return fauxAssistantMessage(
+      `已收到你在收件箱中的选择「${chosen}」，并按该决定完成后续处理。`,
+    );
+  }
 
   // Event-driven trigger turns from Host / Sensors / Webhooks / Crons
   if (prompt.startsWith("[EVENT_TRIGGER ")) {
@@ -273,6 +299,55 @@ function buildLocalStewardMessage(
     lower.includes("选一个");
 
   if (toolResults.length === 0) {
+    if (quoteMatch && !lower.startsWith("/")) {
+      const wantsRestore = lower.includes("还原") || lower.includes("恢复");
+      const wantsDismiss =
+        lower.includes("忽略") ||
+        lower.includes("保留") ||
+        lower.includes("不处理") ||
+        lower.includes("取消");
+      const wantsApprove =
+        lower.includes("批准") ||
+        lower.includes("确认执行") ||
+        lower.includes("直接清理") ||
+        lower.includes("帮我处理") ||
+        lower.includes("移入废纸篓") ||
+        lower.includes("执行清理") ||
+        lower.includes("同意");
+
+      if (quoteSource && quoteId && (wantsRestore || wantsDismiss || wantsApprove)) {
+        const action = wantsRestore
+          ? "restore"
+          : wantsDismiss
+            ? quoteSource === "inbox"
+              ? "dismiss"
+              : "ignore"
+            : quoteSource === "inbox"
+              ? "approve"
+              : "execute";
+        return fauxAssistantMessage(
+          [
+            fauxThinking(`根据用户针对引用事项「${quoteTitle}」的指令，调用 item_resolve 执行 ${action}。`),
+            fauxToolCall("item_resolve", {
+              source: quoteSource,
+              id: quoteId,
+              action,
+              reason: rawUserPrompt,
+            }),
+          ],
+          { stopReason: "toolUse" },
+        );
+      }
+
+      return fauxAssistantMessage(
+        [
+          fauxThinking(`用户引用了${quoteMatch[1]}「${quoteTitle}」，先获取系统状态以结合上下文回答。`),
+          fauxToolCall("system_overview", {}),
+        ],
+        { stopReason: "toolUse" },
+      );
+    }
+
     if (isSelfConfigIntent) {
       return fauxAssistantMessage(
         [
@@ -332,7 +407,7 @@ function buildLocalStewardMessage(
         [
           fauxThinking("将用户明确的偏好习惯写入本地持久化记忆。"),
           fauxToolCall("memory_remember", {
-            content: prompt.replace(/^记住[：:\s]*/, "") || prompt,
+            content: rawUserPrompt.replace(/^记住[：:\s]*/, "") || rawUserPrompt,
             source: "对话学习",
           }),
         ],
@@ -438,6 +513,40 @@ function buildLocalStewardMessage(
 
   if (latest?.toolName === "ask_user") {
     return fauxAssistantMessage(`已收到你的选择：${rawText}`);
+  }
+
+  if (latest?.toolName === "item_resolve") {
+    if (rawText.includes("USER_DENIED")) {
+      return fauxAssistantMessage(
+        `已尊重你的决定，暂未改动引用事项「${quoteTitle || quoteId}」。`,
+      );
+    }
+    if (latest.isError) {
+      return fauxAssistantMessage(
+        `未能处理引用事项「${quoteTitle || quoteId}」：${rawText}`,
+      );
+    }
+    return fauxAssistantMessage(
+      `已完成针对引用事项「${quoteTitle || quoteId}」的处理：${rawText}`,
+    );
+  }
+
+  if (quoteMatch && !lower.startsWith("/")) {
+    const excerptStart = prompt.indexOf("[引用事项 ·");
+    const excerptEnd = prompt.indexOf("\n\n[引用事项交互说明]");
+    const quoteSection =
+      excerptStart >= 0
+        ? prompt.slice(excerptStart, excerptEnd >= 0 ? excerptEnd : undefined)
+        : "";
+    const snippetLines = quoteSection
+      .split("\n")
+      .slice(1, 7)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .join("\n");
+    return fauxAssistantMessage(
+      `已读取你引用的${quoteMatch[1]} **「${quoteTitle}」**${quoteId ? `（\`${quoteId}\`）` : ""} 的完整上下文：\n\n${snippetLines ? `${snippetLines}\n\n` : ""}你可以继续针对该事项的触发原因、安全影响或子项细节追问；如需直接处置，请直接回复**“批准执行”**、**“忽略保留”**或**“还原”**（当前处于本地回退模式，配置云端大模型后可进行更深入的自由推理与细粒度勾选）。`,
+    );
   }
 
   if (isSelfConfigIntent) {
@@ -1119,6 +1228,33 @@ export class ValetModelManager {
     }
   }
 
+  private resolveReviewProvider(
+    state: ValetSyncState,
+    overrideCfg?: Partial<AutoReviewConfig>,
+  ): AgentProviderConfig | undefined {
+    const ar = overrideCfg ?? state.preferences.autoReview;
+    const requestedProviderId =
+      ar?.fallbackProviderId && ar.fallbackProviderId !== "active"
+        ? ar.fallbackProviderId.trim()
+        : "";
+    return (
+      (requestedProviderId
+        ? this.providerConfigs.find((p) => p.id === requestedProviderId) ??
+          state.providers.find((p) => p.id === requestedProviderId)
+        : undefined) ??
+      this.providerConfigs.find((p) => p.id === state.preferences.activeProviderId) ??
+      state.providers.find((p) => p.id === state.preferences.activeProviderId)
+    );
+  }
+
+  hasLiveReviewModel(
+    state: ValetSyncState,
+    overrideCfg?: Partial<AutoReviewConfig>,
+  ): boolean {
+    const targetProvider = this.resolveReviewProvider(state, overrideCfg);
+    return Boolean(targetProvider && !isMockOrEmptyKey(targetProvider));
+  }
+
   /**
    * Resolves whether a live non-mock small LLM is available for Auto Review fallback
    * and executes a single structured review prompt without using `valet-local`.
@@ -1136,17 +1272,7 @@ export class ValetModelManager {
     error?: string;
   }> {
     const ar = overrideCfg ?? state.preferences.autoReview;
-    const requestedProviderId =
-      ar?.fallbackProviderId && ar.fallbackProviderId !== "active"
-        ? ar.fallbackProviderId.trim()
-        : "";
-    const targetProvider =
-      (requestedProviderId
-        ? this.providerConfigs.find((p) => p.id === requestedProviderId) ??
-          state.providers.find((p) => p.id === requestedProviderId)
-        : undefined) ??
-      this.providerConfigs.find((p) => p.id === state.preferences.activeProviderId) ??
-      state.providers.find((p) => p.id === state.preferences.activeProviderId);
+    const targetProvider = this.resolveReviewProvider(state, overrideCfg);
 
     if (!targetProvider || isMockOrEmptyKey(targetProvider)) {
       return {

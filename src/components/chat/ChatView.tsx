@@ -1,7 +1,8 @@
 import React, { useEffect, useRef } from "react";
 import { useValet } from "../../store/ValetContext";
+import { isQuoteAttachment } from "../../utils/chatQuotes";
 import { SidebarToggleButton } from "../Sidebar";
-import { BowtieSvg, PlusIcon } from "../ui/Icons";
+import { BowtieSvg, ClockIcon, InboxIcon, PlusIcon } from "../ui/Icons";
 import { SelectMenu } from "../ui/SelectMenu";
 import { ChatComposer } from "./ChatComposer";
 import {
@@ -27,6 +28,8 @@ export const ChatView: React.FC = () => {
     installPluginDraft,
     setActiveView,
     selectTimelineEvent,
+    selectInboxItem,
+    pushToast,
   } = useValet();
 
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -124,7 +127,65 @@ export const ChatView: React.FC = () => {
                   {msg.attachments && msg.attachments.length > 0 && (
                     <div className="flex flex-wrap justify-end gap-1.5">
                       {msg.attachments.map((att) =>
-                        att.dataUrl ? (
+                        isQuoteAttachment(att) ? (
+                          <button
+                            key={att.id}
+                            type="button"
+                            onClick={() => {
+                              if (att.kind === "inbox_item") {
+                                const targetId =
+                                  att.refId ?? att.id.replace(/^quote-inbox-/, "");
+                                const exists = state.inboxItems.some(
+                                  (it) => it.id === targetId
+                                );
+                                if (!exists) {
+                                  pushToast("该事项已被清理或归档");
+                                  return;
+                                }
+                                setActiveView("inbox");
+                                selectInboxItem(targetId);
+                              } else {
+                                const targetId =
+                                  att.refId ?? att.id.replace(/^quote-timeline-/, "");
+                                const exists = state.timelineEvents.some(
+                                  (ev) => ev.id === targetId
+                                );
+                                if (!exists) {
+                                  pushToast("该事项已被清理或归档");
+                                  return;
+                                }
+                                setActiveView("timeline");
+                                selectTimelineEvent(targetId);
+                              }
+                            }}
+                            title="点击回看原事项详情"
+                            className="flex max-w-[320px] cursor-pointer items-center gap-2 overflow-hidden rounded-[8px] border border-[var(--border-card)] bg-[var(--bg-subtle)] px-2.5 py-1.5 text-left shadow-[inset_3px_0_0_var(--ink-primary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]/65"
+                          >
+                            <div className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-primary)]">
+                              {att.kind === "inbox_item" ? (
+                                <InboxIcon size={11.5} />
+                              ) : (
+                                <ClockIcon size={11.5} />
+                              )}
+                            </div>
+                            <div className="flex min-w-0 flex-1 flex-col">
+                              <div className="flex items-center gap-1.5">
+                                <span className="shrink-0 font-mono text-[9.5px] font-medium text-[var(--ink-muted)]">
+                                  {att.badge ??
+                                    (att.kind === "inbox_item" ? "收件箱" : "时间线")}
+                                </span>
+                                <span className="truncate text-[11.5px] font-medium text-[var(--ink-strong)]">
+                                  {att.name}
+                                </span>
+                              </div>
+                              {att.meta && (
+                                <span className="truncate font-mono text-[9.5px] text-[var(--ink-subtle)]">
+                                  {att.meta}
+                                </span>
+                              )}
+                            </div>
+                          </button>
+                        ) : att.dataUrl ? (
                           <div
                             key={att.id}
                             className="flex items-center gap-2 overflow-hidden rounded-[8px] border border-[var(--border-card)] bg-[var(--bg-subtle)] p-1 pr-2.5"

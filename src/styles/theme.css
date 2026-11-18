@@ -66,13 +66,36 @@
   --danger-border: #FECACA;
 
   /* Switch & bar tokens */
+  --switch-on-bg: #0A0A0A;
   --switch-off-bg: #DADADA;
   --switch-thumb-on: #FFFFFF;
   --switch-thumb-off: #FFFFFF;
+  --spark-bar-peak: #0A0A0A;
   --spark-bar-muted: #CFCFCF;
   --spark-bar-active: #6B6B6B;
 
-  /* Developer Banner (Light = inverted ink, Dark = #161616 card) */
+  /* Navigation, Avatar, Duty, Badge & Repair semantic tokens */
+  --nav-active-bg: #0A0A0A;
+  --nav-active-border: transparent;
+  --nav-active-fg: #FFFFFF;
+  --nav-active-badge-bg: rgba(255, 255, 255, 0.16);
+  --nav-active-amber-bg: rgba(255, 255, 255, 0.16);
+  --nav-active-amber-border: transparent;
+  --nav-active-amber-fg: #FFFFFF;
+  --avatar-bg: #0A0A0A;
+  --avatar-border: transparent;
+  --avatar-fg: #FFFFFF;
+  --duty-dot: #0A0A0A;
+  --duty-halo: rgba(10, 10, 10, 0.10);
+  --duty-ring: rgba(10, 10, 10, 0.40);
+  --core-badge-bg: #0A0A0A;
+  --core-badge-border: transparent;
+  --core-badge-fg: #FFFFFF;
+  --repair-btn-bg: #FFFFFF;
+  --repair-btn-border: #0A0A0A;
+  --repair-btn-fg: #000000;
+
+  /* Developer Banner (Light = inverted ink, Dark = elevated card) */
   --banner-bg: #0A0A0A;
   --banner-border: transparent;
   --banner-fg: #FFFFFF;
@@ -95,82 +118,280 @@
   --shadow-segment: 0 1px 2px rgba(0, 0, 0, 0.12);
 }
 
+/* Default Dark & Midnight Tuxedo (午夜黑曜石) */
 [data-theme="dark"] {
   color-scheme: dark;
 
-  /* Neutral Obsidian / Graphite Surfaces (exact Paper 16-20 Dark tokens) */
-  --bg-canvas: #0E0E0E;
-  --bg-sidebar: #131313;
-  --bg-sub-sidebar: #111111;
-  --bg-surface: #161616;
-  --bg-subtle: #1C1C1C;
-  --bg-muted: #222222;
-  --bg-hover: #262626;
-  --bg-card-hover: #171717;
-  --bg-elevated: #181818;
-  --bg-segment-active: #2E2E2E;
-  --bg-code: #141414;
-  --bg-track: #282828;
+  /* Surfaces (recessed sidebar + lifted slate canvas) */
+  --bg-sidebar: #0B0D12;
+  --bg-sub-sidebar: #0E1118;
+  --bg-canvas: #131720;
+  --bg-surface: #181E2A;
+  --bg-subtle: #191F2B;
+  --bg-muted: #202736;
+  --bg-hover: #222A3A;
+  --bg-card-hover: #171D28;
+  --bg-elevated: #1E2533;
+  --bg-segment-active: #2A3346;
+  --bg-code: #0F131B;
+  --bg-track: #222B3B;
 
   /* Brand & Plugin Icon Badges */
-  --brand-icon-bg: #1E1E1E;
-  --brand-icon-border: #303030;
-  --brand-icon-fg: #F5F5F5;
+  --brand-icon-bg: #1E2533;
+  --brand-icon-border: rgba(205, 222, 255, 0.15);
+  --brand-icon-fg: #F4F7FC;
 
   /* Ink */
-  --ink-primary: #F2F2F2;
-  --ink-strong: #F5F5F5;
-  --ink-body: #D4D4D4;
-  --ink-secondary: #C8C8C8;
-  --ink-nav: #D4D4D4;
-  --ink-muted: #8A8A8A;
-  --ink-subtle: #6E6E6E;
-  --ink-faint: #555555;
-  --ink-on-primary: #0A0A0A;
-  --ink-on-primary-muted: rgba(10, 10, 10, 0.6);
+  --ink-primary: #EEF3FC;
+  --ink-strong: #F4F7FC;
+  --ink-body: #DCE3F0;
+  --ink-secondary: #A5B1C4;
+  --ink-nav: #C7D0E0;
+  --ink-muted: #7D899E;
+  --ink-subtle: #5C677B;
+  --ink-faint: #465063;
+  --ink-on-primary: #0B0E14;
+  --ink-on-primary-muted: rgba(11, 14, 20, 0.6);
 
-  /* Borders */
-  --border-faint: #1A1A1A;
-  --border-subtle: #1F1F1F;
-  --border-light: #222222;
-  --border-base: #222222;
-  --border-card: #262626;
-  --border-control: #303030;
-  --border-strong: #3A3A3A;
-  --border-dash: #444444;
+  /* Specular hairline borders */
+  --border-faint: rgba(205, 222, 255, 0.05);
+  --border-subtle: rgba(205, 222, 255, 0.07);
+  --border-light: rgba(205, 222, 255, 0.07);
+  --border-base: rgba(205, 222, 255, 0.09);
+  --border-card: rgba(205, 222, 255, 0.10);
+  --border-control: rgba(205, 222, 255, 0.15);
+  --border-strong: rgba(205, 222, 255, 0.20);
+  --border-dash: rgba(205, 222, 255, 0.22);
+
+  /* Navigation, Avatar, Duty, Badge & Repair semantic tokens */
+  --nav-active-bg: #1B2232;
+  --nav-active-border: rgba(205, 222, 255, 0.15);
+  --nav-active-fg: #F4F7FC;
+  --nav-active-badge-bg: rgba(205, 222, 255, 0.12);
+  --nav-active-amber-bg: rgba(245, 186, 84, 0.09);
+  --nav-active-amber-border: rgba(245, 186, 84, 0.32);
+  --nav-active-amber-fg: #F5BE62;
+  --avatar-bg: #1E2533;
+  --avatar-border: rgba(205, 222, 255, 0.15);
+  --avatar-fg: #F4F7FC;
+  --duty-dot: #82ACFF;
+  --duty-halo: rgba(130, 172, 255, 0.18);
+  --duty-ring: rgba(130, 172, 255, 0.45);
+  --core-badge-bg: rgba(166, 194, 255, 0.12);
+  --core-badge-border: rgba(166, 194, 255, 0.25);
+  --core-badge-fg: #DCE6FA;
+  --repair-btn-bg: rgba(224, 79, 68, 0.10);
+  --repair-btn-border: rgba(242, 114, 105, 0.42);
+  --repair-btn-fg: #F27269;
 
   /* Status accents */
-  --amber-text: #F0B44C;
-  --amber-icon: #E59928;
-  --amber-warn: #E59928;
-  --amber-bg: #1F1910;
-  --amber-border: #4A3516;
-  --amber-pill: #5C4119;
-  --amber-divider: #382A14;
+  --amber-text: #F5BE62;
+  --amber-icon: #EEA83B;
+  --amber-warn: #EEA83B;
+  --amber-bg: rgba(245, 186, 84, 0.07);
+  --amber-border: rgba(245, 186, 84, 0.22);
+  --amber-pill: rgba(245, 186, 84, 0.32);
+  --amber-divider: rgba(245, 186, 84, 0.14);
 
-  --danger: #E04F44;
-  --danger-bg: #261413;
-  --danger-border: #562421;
+  --danger: #F27269;
+  --danger-bg: rgba(224, 79, 68, 0.10);
+  --danger-border: rgba(242, 114, 105, 0.32);
 
   /* Switch & bar tokens */
-  --switch-off-bg: #303030;
-  --switch-thumb-on: #0A0A0A;
-  --switch-thumb-off: #B8B8B8;
-  --spark-bar-muted: #333333;
-  --spark-bar-active: #8A8A8A;
+  --switch-on-bg: #3D527A;
+  --switch-off-bg: #252E40;
+  --switch-thumb-on: #F5F8FF;
+  --switch-thumb-off: #9DA8BC;
+  --spark-bar-peak: #DCE6FA;
+  --spark-bar-muted: #283142;
+  --spark-bar-active: #697B9C;
 
-  /* Developer Banner (exact Paper 19 Dark tokens) */
-  --banner-bg: #161616;
-  --banner-border: #2C2C2C;
-  --banner-fg: #F5F5F5;
-  --banner-muted: #9E9E9E;
-  --banner-btn-bg: #F2F2F2;
-  --banner-btn-fg: #0A0A0A;
+  /* Developer Banner */
+  --banner-bg: #181E2A;
+  --banner-border: rgba(205, 222, 255, 0.10);
+  --banner-fg: #F4F7FC;
+  --banner-muted: #97A3B8;
+  --banner-btn-bg: #EEF3FC;
+  --banner-btn-fg: #0B0E14;
 
   --shadow-drawer: -32px 0 64px -24px rgba(0, 0, 0, 0.72);
   --shadow-composer: 0 16px 40px -20px rgba(0, 0, 0, 0.65);
   --shadow-popover: 0 18px 48px -16px rgba(0, 0, 0, 0.7);
   --shadow-segment: 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
+/* Savile Espresso (暖岩黑胡桃) */
+[data-theme="dark"][data-dark-palette="espresso"] {
+  --bg-sidebar: #0D0C0A;
+  --bg-sub-sidebar: #110F0D;
+  --bg-canvas: #161412;
+  --bg-surface: #1C1916;
+  --bg-subtle: #1D1A17;
+  --bg-muted: #25201C;
+  --bg-hover: #27231E;
+  --bg-card-hover: #1B1815;
+  --bg-elevated: #231F1B;
+  --bg-segment-active: #302A24;
+  --bg-code: #12100E;
+  --bg-track: #29241F;
+
+  --brand-icon-bg: #231F1B;
+  --brand-icon-border: rgba(255, 238, 210, 0.15);
+  --brand-icon-fg: #F6F2EA;
+
+  --ink-primary: #F3EDE2;
+  --ink-strong: #F6F2EA;
+  --ink-body: #E4DDD2;
+  --ink-secondary: #B0A79A;
+  --ink-nav: #CFC7BA;
+  --ink-muted: #8A8175;
+  --ink-subtle: #696156;
+  --ink-faint: #524B42;
+  --ink-on-primary: #12100D;
+  --ink-on-primary-muted: rgba(18, 16, 13, 0.6);
+
+  --border-faint: rgba(255, 238, 210, 0.05);
+  --border-subtle: rgba(255, 238, 210, 0.07);
+  --border-light: rgba(255, 238, 210, 0.07);
+  --border-base: rgba(255, 238, 210, 0.09);
+  --border-card: rgba(255, 238, 210, 0.10);
+  --border-control: rgba(255, 238, 210, 0.15);
+  --border-strong: rgba(255, 238, 210, 0.20);
+  --border-dash: rgba(255, 238, 210, 0.22);
+
+  --nav-active-bg: #211D19;
+  --nav-active-border: rgba(255, 238, 210, 0.15);
+  --nav-active-fg: #F6F2EA;
+  --nav-active-badge-bg: rgba(255, 238, 210, 0.12);
+  --nav-active-amber-bg: rgba(232, 173, 80, 0.10);
+  --nav-active-amber-border: rgba(232, 173, 80, 0.34);
+  --nav-active-amber-fg: #EDB458;
+  --avatar-bg: #231F1B;
+  --avatar-border: rgba(255, 238, 210, 0.15);
+  --avatar-fg: #F6F2EA;
+  --duty-dot: #E8AD50;
+  --duty-halo: rgba(232, 173, 80, 0.18);
+  --duty-ring: rgba(232, 173, 80, 0.45);
+  --core-badge-bg: rgba(232, 173, 80, 0.13);
+  --core-badge-border: rgba(232, 173, 80, 0.28);
+  --core-badge-fg: #F0D9B5;
+  --repair-btn-bg: rgba(224, 79, 68, 0.10);
+  --repair-btn-border: rgba(242, 114, 105, 0.42);
+  --repair-btn-fg: #F0756A;
+
+  --amber-text: #EDB458;
+  --amber-icon: #E8AD50;
+  --amber-warn: #E8AD50;
+  --amber-bg: rgba(232, 173, 80, 0.08);
+  --amber-border: rgba(232, 173, 80, 0.24);
+  --amber-pill: rgba(232, 173, 80, 0.34);
+  --amber-divider: rgba(232, 173, 80, 0.15);
+
+  --danger: #F0756A;
+  --danger-bg: rgba(224, 79, 68, 0.10);
+  --danger-border: rgba(242, 114, 105, 0.32);
+
+  --switch-on-bg: #9A7032;
+  --switch-off-bg: #2D2722;
+  --switch-thumb-on: #FAF6EE;
+  --switch-thumb-off: #A89F91;
+  --spark-bar-peak: #E8AD50;
+  --spark-bar-muted: #2E2924;
+  --spark-bar-active: #8C7D6B;
+
+  --banner-bg: #1C1916;
+  --banner-border: rgba(255, 238, 210, 0.10);
+  --banner-fg: #F6F2EA;
+  --banner-muted: #A39A8C;
+  --banner-btn-bg: #F3EDE2;
+  --banner-btn-fg: #12100D;
+}
+
+/* Nocturnal Chronometer (深松怀表) */
+[data-theme="dark"][data-dark-palette="chronometer"] {
+  --bg-sidebar: #090D0C;
+  --bg-sub-sidebar: #0C1210;
+  --bg-canvas: #111715;
+  --bg-surface: #151E1B;
+  --bg-subtle: #161F1C;
+  --bg-muted: #1C2723;
+  --bg-hover: #1E2B26;
+  --bg-card-hover: #141D1A;
+  --bg-elevated: #1B2622;
+  --bg-segment-active: #24332E;
+  --bg-code: #0D1311;
+  --bg-track: #1F2C27;
+
+  --brand-icon-bg: #1B2622;
+  --brand-icon-border: rgba(192, 240, 218, 0.15);
+  --brand-icon-fg: #F0F6F3;
+
+  --ink-primary: #EAF3EE;
+  --ink-strong: #F0F6F3;
+  --ink-body: #D7E5DF;
+  --ink-secondary: #9FB3AA;
+  --ink-nav: #C2D3CB;
+  --ink-muted: #788D84;
+  --ink-subtle: #586C63;
+  --ink-faint: #43544D;
+  --ink-on-primary: #0A110E;
+  --ink-on-primary-muted: rgba(10, 17, 14, 0.6);
+
+  --border-faint: rgba(192, 240, 218, 0.05);
+  --border-subtle: rgba(192, 240, 218, 0.07);
+  --border-light: rgba(192, 240, 218, 0.07);
+  --border-base: rgba(192, 240, 218, 0.09);
+  --border-card: rgba(192, 240, 218, 0.10);
+  --border-control: rgba(192, 240, 218, 0.15);
+  --border-strong: rgba(192, 240, 218, 0.20);
+  --border-dash: rgba(192, 240, 218, 0.22);
+
+  --nav-active-bg: #18231F;
+  --nav-active-border: rgba(192, 240, 218, 0.15);
+  --nav-active-fg: #F0F6F3;
+  --nav-active-badge-bg: rgba(192, 240, 218, 0.12);
+  --nav-active-amber-bg: rgba(232, 173, 76, 0.09);
+  --nav-active-amber-border: rgba(232, 173, 76, 0.32);
+  --nav-active-amber-fg: #ECAE52;
+  --avatar-bg: #1B2622;
+  --avatar-border: rgba(192, 240, 218, 0.15);
+  --avatar-fg: #F0F6F3;
+  --duty-dot: #55CA90;
+  --duty-halo: rgba(85, 202, 144, 0.18);
+  --duty-ring: rgba(85, 202, 144, 0.45);
+  --core-badge-bg: rgba(85, 202, 144, 0.12);
+  --core-badge-border: rgba(85, 202, 144, 0.26);
+  --core-badge-fg: #C7EEDB;
+  --repair-btn-bg: rgba(224, 79, 68, 0.10);
+  --repair-btn-border: rgba(242, 114, 105, 0.42);
+  --repair-btn-fg: #F27269;
+
+  --amber-text: #ECAE52;
+  --amber-icon: #E5A443;
+  --amber-warn: #E5A443;
+  --amber-bg: rgba(232, 173, 76, 0.07);
+  --amber-border: rgba(232, 173, 76, 0.22);
+  --amber-pill: rgba(232, 173, 76, 0.32);
+  --amber-divider: rgba(232, 173, 76, 0.14);
+
+  --danger: #F27269;
+  --danger-bg: rgba(224, 79, 68, 0.10);
+  --danger-border: rgba(242, 114, 105, 0.32);
+
+  --switch-on-bg: #2B6E51;
+  --switch-off-bg: #21302B;
+  --switch-thumb-on: #F2F9F5;
+  --switch-thumb-off: #98ACA3;
+  --spark-bar-peak: #63CF99;
+  --spark-bar-muted: #22302B;
+  --spark-bar-active: #5B7D6F;
+
+  --banner-bg: #151E1B;
+  --banner-border: rgba(192, 240, 218, 0.10);
+  --banner-fg: #F0F6F3;
+  --banner-muted: #92A79E;
+  --banner-btn-bg: #EAF3EE;
+  --banner-btn-fg: #0A110E;
 }
 
 html,

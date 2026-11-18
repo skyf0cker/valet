@@ -58,6 +58,7 @@ export interface AutomationRule {
 export interface ChatAttachment {
   id: string;
   kind: string;
+  refId?: string;
   name: string;
   meta?: string;
   badge?: string;
@@ -157,6 +158,9 @@ export interface InboxApprovalItem {
   logs: LogLine[];
   toolName?: string;
   toolArgs?: Record<string, unknown>;
+  options?: string[];
+  selectedOption?: string;
+  sourceChatId?: string;
   trashBatchId?: string;
 }
 
@@ -524,6 +528,7 @@ export interface ValetPreferences {
   launchAtLogin: boolean;
   showMenuBarIcon: boolean;
   appearance: string;
+  darkTheme?: string;
   language: string;
   globalHotkey: string[];
   busyMessagePolicy?: string;
@@ -612,6 +617,13 @@ export const Valet = {
   /** AddMemory persists a user-authored long-term memory entry and syncs Sidecar. */
   addMemory(content: string, source: string): Promise<ValetSnapshot> {
     return call("Valet.AddMemory", content, source);
+  },
+  /**
+   * AnswerInboxQuestion records a user's chosen option/reply for a pending `user.question` Inbox card
+   * and forwards the answer back to Sidecar to continue the originating agent conversation.
+   */
+  answerInboxQuestion(itemID: string, answer: string): Promise<ValetSnapshot> {
+    return call("Valet.AnswerInboxQuestion", itemID, answer);
   },
   /** ApproveAllReversible approves every pending 7-day reversible Inbox card sequentially. */
   approveAllReversible(): Promise<ValetSnapshot> {

@@ -209,6 +209,9 @@ type InboxApprovalItem struct {
 	Logs                  []LogLine            `json:"logs"`
 	ToolName              string               `json:"toolName,omitempty"`
 	ToolArgs              map[string]any       `json:"toolArgs,omitempty"`
+	Options               []string             `json:"options,omitempty"`
+	SelectedOption        string               `json:"selectedOption,omitempty"`
+	SourceChatID          string               `json:"sourceChatId,omitempty"`
 	TrashBatchID          string               `json:"trashBatchId,omitempty"`
 }
 
@@ -274,10 +277,11 @@ type PluginDraftSpec struct {
 	Installed        bool   `json:"installed,omitempty"`
 }
 
-// ChatAttachment represents a file, image, or screen attachment on a message.
+// ChatAttachment represents a file, image, screen, or quoted item attachment on a message.
 type ChatAttachment struct {
 	ID          string `json:"id"`
-	Kind        string `json:"kind"` // "image" | "file" | "screen"
+	Kind        string `json:"kind"` // "image" | "file" | "screen" | "timeline_event" | "inbox_item"
+	RefID       string `json:"refId,omitempty"`
 	Name        string `json:"name"`
 	Meta        string `json:"meta,omitempty"`
 	Badge       string `json:"badge,omitempty"`
@@ -416,7 +420,7 @@ type SafetyConfirmationChecklist struct {
 }
 
 // AutoReviewConfig configures the Auto Review permission evaluation engine
-// (TypeSafe AI Jev System One decision model + configurable small LLM fallback).
+// (TypeSafe AI Jev System One or Google Gemini Decisions `gemini-decision-1` + configurable small LLM fallback).
 type AutoReviewConfig struct {
 	Engine             string `json:"engine"` // "auto" | "jev" | "llm"
 	JevEndpoint        string `json:"jevEndpoint"`
@@ -434,6 +438,7 @@ type ValetPreferences struct {
 	LaunchAtLogin         bool                        `json:"launchAtLogin"`
 	ShowMenuBarIcon       bool                        `json:"showMenuBarIcon"`
 	Appearance            string                      `json:"appearance"` // "light" | "dark" | "auto"
+	DarkTheme             string                      `json:"darkTheme,omitempty"` // "obsidian" | "espresso" | "chronometer"
 	Language              string                      `json:"language"`
 	GlobalHotkey          []string                    `json:"globalHotkey"`
 	BusyMessagePolicy     string                      `json:"busyMessagePolicy,omitempty"` // "queue" | "steer"
@@ -657,4 +662,14 @@ type BuiltinSkillMeta struct {
 	Description string `json:"description"`
 	Content     string `json:"content"`
 	Source      string `json:"source,omitempty"` // "builtin" | "user"
+}
+
+// NormalizeDarkTheme clamps darkTheme to a supported palette ID.
+func NormalizeDarkTheme(raw string) string {
+	switch raw {
+	case "obsidian", "espresso", "chronometer":
+		return raw
+	default:
+		return "obsidian"
+	}
 }

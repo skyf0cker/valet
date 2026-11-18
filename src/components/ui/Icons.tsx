@@ -619,3 +619,21 @@ export const TerminalSlashIcon: React.FC<IconProps> = ({ size = 14, className = 
     <path d="M10 16l4-8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
   </svg>
 );
+
+export const ChatQuoteIcon: React.FC<IconProps> = ({ size = 14, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
+    <path
+      d="M20 11.5a7.5 7.5 0 01-10.8 6.7L4 19.5l1-4.3A7.5 7.5 0 1120 11.5z"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path
+      d="M9 10h6M9 13.5h4"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+    />
+  </svg>
+);

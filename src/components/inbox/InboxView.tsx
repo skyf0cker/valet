@@ -1,9 +1,18 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useValet } from "../../store/ValetContext";
 import type { AutonomyLevel, InboxCategory } from "../../types/valet";
+import {
+  getInboxQuestionOptions,
+  isQuestionInboxItem,
+  isReversibleTrashInboxItem,
+} from "../../utils/inbox";
+import { findLinkedTimelineEvent } from "../../utils/timelineLinks";
 import { EventChip, PluginTag } from "../ui/Badge";
 import { Checkbox } from "../ui/Checkbox";
 import {
+  ArrowUpRightIcon,
+  ChatQuoteIcon,
+  ClockIcon,
   DoubleCheckIcon,
   DriveIcon,
   MailIcon,
@@ -26,14 +35,18 @@ export const InboxView: React.FC = () => {
   const {
     state,
     sidebarCollapsed,
+    commandPaletteOpen,
     setCommandPaletteOpen,
     openSettingsSection,
     selectInboxItem,
     toggleInboxActionItem,
     approveInboxItem,
+    answerInboxQuestion,
     dismissInboxItem,
     approveAllReversibleInboxItems,
     restoreApprovedInboxItem,
+    quoteInboxItemToChat,
+    openInboxItemInTimeline,
   } = useValet();
 
   const [filter, setFilter] = useState<InboxFilter>("pending");
@@ -50,7 +63,7 @@ export const InboxView: React.FC = () => {
   );
 
   const reversiblePendingCount = useMemo(
-    () => pendingItems.filter((i) => i.reversible7d).length,
+    () => pendingItems.filter((i) => isReversibleTrashInboxItem(i)).length,
     [pendingItems]
   );
 
@@ -78,10 +91,10 @@ export const InboxView: React.FC = () => {
     );
   }, [visibleItems.length]);
 
-  // Keyboard navigation: ↑/↓ focus, Enter approve, Backspace dismiss, Space inspect drawer
+  // Keyboard navigation: ↑/↓ focus, Enter approve, Backspace dismiss, Space inspect drawer, Q quote to chat
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (state.selectedInboxItemId) return;
+      if (state.selectedInboxItemId || commandPaletteOpen) return;
       const target = e.target as HTMLElement | null;
       if (
         target &&
@@ -104,11 +117,42 @@ export const InboxView: React.FC = () => {
         e.preventDefault();
         const focused = visibleItems[focusedIndex];
         if (focused) selectInboxItem(focused.id);
+      } else if (
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        e.key.toLowerCase() === "q"
+      ) {
+        const focused = visibleItems[focusedIndex];
+        if (focused) {
+          e.preventDefault();
+          quoteInboxItemToChat(focused.id);
+        }
+      } else if (
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        e.key.toLowerCase() === "t"
+      ) {
+        const focused = visibleItems[focusedIndex];
+        if (focused) {
+          e.preventDefault();
+          openInboxItemInTimeline(focused.id);
+        }
       } else if (e.key === "Enter") {
         const focused = visibleItems[focusedIndex];
         if (focused && focused.status === "pending") {
           e.preventDefault();
-          approveInboxItem(focused.id);
+          if (isQuestionInboxItem(focused)) {
+            const opts = getInboxQuestionOptions(focused);
+            if (opts.length === 1) {
+              answerInboxQuestion(focused.id, opts[0]!);
+            } else {
+              selectInboxItem(focused.id);
+            }
+          } else {
+            approveInboxItem(focused.id);
+          }
         }
       } else if (e.key === "Backspace") {
         const focused = visibleItems[focusedIndex];
@@ -121,9 +165,13 @@ export const InboxView: React.FC = () => {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
+    answerInboxQuestion,
     approveInboxItem,
+    commandPaletteOpen,
     dismissInboxItem,
     focusedIndex,
+    openInboxItemInTimeline,
+    quoteInboxItemToChat,
     selectInboxItem,
     state.selectedInboxItemId,
     visibleItems,
@@ -149,7 +197,7 @@ export const InboxView: React.FC = () => {
       label: "进程与命令",
       compactLabel: "进程",
       count: counts.process,
-      dotClass: "bg-[var(--ink-primary)]",
+      dotClass: "bg-[var(--duty-dot)]",
     },
     { id: "outbound", label: "外发动作", compactLabel: "外发", count: counts.outbound },
     { id: "processed", label: "已处理", compactLabel: "已处理", count: counts.processed },
@@ -292,7 +340,7 @@ export const InboxView: React.FC = () => {
 
             <div className="hidden font-mono text-[10px] text-[var(--ink-subtle)] sm:block lg:text-[11px]">
               ⏎ 批准{"  "}·{"  "}⌫ 忽略
-              {!sidebarCollapsed && <>{"  "}·{"  "}Space 详情</>}
+              {!sidebarCollapsed && <>{"  "}·{"  "}Space 详情{"  "}·{"  "}Q 引用{"  "}·{"  "}T 时间线</>}
             </div>
           </>
         }
@@ -330,6 +378,10 @@ export const InboxView: React.FC = () => {
           visibleItems.map((item, idx) => {
             const isFocused = focusedIndex === idx && !state.selectedInboxItemId;
             const isSelected = state.selectedInboxItemId === item.id;
+            const linkedTimelineEvent = findLinkedTimelineEvent(item, state.timelineEvents);
+            const isQuestion = isQuestionInboxItem(item);
+            const questionOptions = isQuestion ? getInboxQuestionOptions(item) : [];
+            const isTrashReversible = isReversibleTrashInboxItem(item);
             const checkedCount = item.actionItems.filter((a) => a.checked).length;
             const totalCount = item.actionItems.length;
             const previewItems = item.actionItems.slice(0, sidebarCollapsed ? 2 : 3);
@@ -422,6 +474,23 @@ export const InboxView: React.FC = () => {
                       </span>
                     )}
 
+                    {linkedTimelineEvent && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openInboxItemInTimeline(item.id);
+                        }}
+                        title={`在时间线中查看：${linkedTimelineEvent.title} (${linkedTimelineEvent.timeLabel})`}
+                        aria-label={`跳转到关联时间线事件：${linkedTimelineEvent.title}`}
+                        className="inline-flex h-[20px] shrink-0 cursor-pointer items-center gap-1 rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-[6px] text-[10.5px] font-medium text-[var(--ink-secondary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                      >
+                        <ClockIcon size={10.5} className="shrink-0 text-[var(--ink-muted)]" />
+                        <span>{sidebarCollapsed ? "时间线" : "关联时间线"}</span>
+                        <ArrowUpRightIcon size={10} className="shrink-0 text-[var(--ink-muted)]" />
+                      </button>
+                    )}
+
                     {(sidebarCollapsed || !item.warningTag) && item.ageLabel && (
                       <span
                         className={`font-mono text-[10px] text-[var(--amber-text)] ${
@@ -442,6 +511,28 @@ export const InboxView: React.FC = () => {
                   >
                     {item.summary}
                   </p>
+
+                  {isQuestion && questionOptions.length > 0 && item.status === "pending" && (
+                    <div
+                      onClick={(e) => e.stopPropagation()}
+                      className="mt-0.5 flex flex-wrap gap-1.5"
+                    >
+                      {questionOptions.map((opt, optIdx) => (
+                        <button
+                          key={opt}
+                          type="button"
+                          onClick={() => answerInboxQuestion(item.id, opt)}
+                          className={`inline-flex cursor-pointer items-center rounded-[7px] border px-2.5 py-1 text-[11.5px] font-medium transition-colors ${
+                            optIdx === 0
+                              ? "border-[var(--ink-primary)] bg-[var(--ink-primary)]/5 text-[var(--ink-strong)] hover:bg-[var(--ink-primary)]/10"
+                              : "border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-strong)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)]"
+                          }`}
+                        >
+                          {opt}
+                        </button>
+                      ))}
+                    </div>
+                  )}
 
                   {/* Inline Checklist Preview (e.g. Docker 12 remnants) */}
                   {item.actionItems.length > 2 && item.status === "pending" && (
@@ -502,38 +593,84 @@ export const InboxView: React.FC = () => {
                 {/* Right Action Buttons */}
                 <div
                   onClick={(e) => e.stopPropagation()}
-                  className={`flex shrink-0 items-start justify-end gap-1.5 pt-0.5 lg:gap-2 ${
-                    sidebarCollapsed ? "w-[144px]" : "w-[152px] lg:w-[184px]"
-                  }`}
+                  className="flex shrink-0 items-start justify-end gap-1.5 pt-0.5 lg:gap-2"
                 >
+                  <button
+                    type="button"
+                    onClick={() => quoteInboxItemToChat(item.id)}
+                    title="引用到对话 (Q)"
+                    aria-label={`引用「${item.title}」到对话`}
+                    className={`inline-flex cursor-pointer items-center gap-1 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] font-medium text-[var(--ink-secondary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] ${
+                      sidebarCollapsed
+                        ? "h-[26px] px-2 text-[11px]"
+                        : "h-[28px] px-2.5 text-[12px]"
+                    }`}
+                  >
+                    <ChatQuoteIcon size={sidebarCollapsed ? 11.5 : 12.5} className="shrink-0 text-[var(--ink-muted)]" />
+                    <span>引用</span>
+                  </button>
+
                   {item.status === "pending" ? (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => dismissInboxItem(item.id)}
-                        className={`inline-flex cursor-pointer items-center rounded-[7px] border border-[var(--border-strong)] bg-[var(--bg-surface)] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)] ${
-                          sidebarCollapsed
-                            ? "h-[26px] px-2.5 text-[11px]"
-                            : "h-[28px] px-3 text-[12px]"
-                        }`}
-                      >
-                        {item.dismissLabel}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => approveInboxItem(item.id)}
-                        className={`inline-flex cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] font-semibold text-[var(--ink-on-primary)] transition-opacity hover:opacity-90 ${
-                          sidebarCollapsed
-                            ? "h-[26px] px-2.5 text-[11px]"
-                            : "h-[28px] px-3 text-[12px]"
-                        }`}
-                      >
-                        {item.approveLabel}
-                      </button>
-                    </>
+                    isQuestion ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => dismissInboxItem(item.id)}
+                          className={`inline-flex cursor-pointer items-center rounded-[7px] border border-[var(--border-strong)] bg-[var(--bg-surface)] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)] ${
+                            sidebarCollapsed
+                              ? "h-[26px] px-2.5 text-[11px]"
+                              : "h-[28px] px-3 text-[12px]"
+                          }`}
+                        >
+                          {item.dismissLabel || "忽略"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (questionOptions.length === 1) {
+                              answerInboxQuestion(item.id, questionOptions[0]!);
+                            } else {
+                              selectInboxItem(item.id);
+                            }
+                          }}
+                          className={`inline-flex cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] font-semibold text-[var(--ink-on-primary)] transition-opacity hover:opacity-90 ${
+                            sidebarCollapsed
+                              ? "h-[26px] px-2.5 text-[11px]"
+                              : "h-[28px] px-3 text-[12px]"
+                          }`}
+                        >
+                          {questionOptions.length === 1 ? questionOptions[0] : "选择方案"}
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => dismissInboxItem(item.id)}
+                          className={`inline-flex cursor-pointer items-center rounded-[7px] border border-[var(--border-strong)] bg-[var(--bg-surface)] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)] ${
+                            sidebarCollapsed
+                              ? "h-[26px] px-2.5 text-[11px]"
+                              : "h-[28px] px-3 text-[12px]"
+                          }`}
+                        >
+                          {item.dismissLabel}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => approveInboxItem(item.id)}
+                          className={`inline-flex cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] font-semibold text-[var(--ink-on-primary)] transition-opacity hover:opacity-90 ${
+                            sidebarCollapsed
+                              ? "h-[26px] px-2.5 text-[11px]"
+                              : "h-[28px] px-3 text-[12px]"
+                          }`}
+                        >
+                          {item.approveLabel}
+                        </button>
+                      </>
+                    )
                   ) : (
                     <div className="flex items-center gap-2">
-                      {item.status === "approved" && item.reversible7d && !item.restored && (
+                      {item.status === "approved" && isTrashReversible && !item.restored && (
                         <button
                           type="button"
                           onClick={() => restoreApprovedInboxItem(item.id)}
@@ -546,7 +683,7 @@ export const InboxView: React.FC = () => {
                         {item.restored
                           ? "已还原"
                           : item.status === "approved"
-                            ? `已批准${item.processedAt ? ` · ${item.processedAt}` : ""}`
+                            ? `${isQuestion ? "已回复" : "已批准"}${item.processedAt ? ` · ${item.processedAt}` : ""}`
                             : `已忽略${item.processedAt ? ` · ${item.processedAt}` : ""}`}
                       </span>
                     </div>

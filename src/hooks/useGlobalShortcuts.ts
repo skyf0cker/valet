@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { getDarkThemeMeta } from "../constants/themes";
 import { useValet } from "../store/ValetContext";
 
 export function useGlobalShortcuts() {
@@ -67,7 +68,11 @@ export function useGlobalShortcuts() {
           document.documentElement.dataset.theme === "dark";
         const next = isCurrentlyDark ? "light" : "dark";
         updatePreferences({ appearance: next });
-        pushToast(next === "dark" ? "已切换深色模式" : "已切换浅色模式");
+        pushToast(
+          next === "dark"
+            ? `已切换深色模式 · ${getDarkThemeMeta(state.preferences.darkTheme).name}`
+            : "已切换浅色模式"
+        );
         return;
       }
 
@@ -91,6 +96,7 @@ export function useGlobalShortcuts() {
     setActiveView,
     setCommandPaletteOpen,
     state.onboardingCompleted,
+    state.preferences.darkTheme,
     togglePauseValet,
     toggleSidebarCollapsed,
     updatePreferences,

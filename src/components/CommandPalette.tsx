@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { DARK_THEME_OPTIONS, normalizeDarkTheme } from "../constants/themes";
 import { useValet } from "../store/ValetContext";
 import type { SettingsSectionId } from "../types/valet";
+import { isReversibleTrashInboxItem } from "../utils/inbox";
 import { SearchIcon } from "./ui/Icons";
 
 interface PaletteItem {
@@ -42,6 +44,7 @@ export const CommandPalette: React.FC = () => {
     toggleSidebarCollapsed,
     updatePreferences,
     resetOnboarding,
+    pushToast,
   } = useValet();
 
   const [query, setQuery] = useState("");
@@ -55,7 +58,7 @@ export const CommandPalette: React.FC = () => {
   }, [commandPaletteOpen]);
 
   const pendingInboxItems = state.inboxItems.filter((i) => i.status === "pending");
-  const reversibleCount = pendingInboxItems.filter((i) => i.reversible7d).length;
+  const reversibleCount = pendingInboxItems.filter((i) => isReversibleTrashInboxItem(i)).length;
 
   const allItems = useMemo<PaletteItem[]>(() => {
     const actions: PaletteItem[] = [
@@ -109,13 +112,33 @@ export const CommandPalette: React.FC = () => {
           state.preferences.appearance === "dark"
             ? "切换外观为浅色模式"
             : "切换外观为深色模式",
-        subtitle: "立即预览中性深色 / 浅色外观变化",
+        subtitle: "在浅色与当前选中的深色多主题间切换",
         shortcut: "⌘⇧D",
         onSelect: () =>
           updatePreferences({
             appearance: state.preferences.appearance === "dark" ? "light" : "dark",
           }),
       },
+      ...DARK_THEME_OPTIONS.map((opt) => {
+        const isCurrent = normalizeDarkTheme(state.preferences.darkTheme) === opt.id;
+        return {
+          id: `act-dark-theme-${opt.id}`,
+          group: "外观主题",
+          title: `切换深色主题 · ${opt.name} (${opt.enName})`,
+          subtitle: `${opt.tagline}${isCurrent ? " · 当前已选" : ""}`,
+          onSelect: () => {
+            const isCurrentlyDark =
+              document.documentElement.dataset.theme === "dark";
+            if (!isCurrentlyDark) {
+              updatePreferences({ darkTheme: opt.id, appearance: "dark" });
+              pushToast(`已切换至深色 · ${opt.name}`);
+            } else {
+              updatePreferences({ darkTheme: opt.id });
+              pushToast(`已切换深色主题 · ${opt.name}`);
+            }
+          },
+        };
+      }),
       {
         id: "act-onboarding",
         group: "快速动作",
@@ -199,7 +222,9 @@ export const CommandPalette: React.FC = () => {
     state.isPaused,
     state.plugins,
     state.preferences.appearance,
+    state.preferences.darkTheme,
     state.timelineEvents,
+    pushToast,
     togglePauseValet,
     toggleSidebarCollapsed,
     updatePreferences,

@@ -28,6 +28,18 @@ import {
   createInitialSnapshot,
 } from "../services/mockData";
 import { valetService } from "../services/valetService";
+import { normalizeDarkTheme } from "../constants/themes";
+import {
+  buildInboxQuoteAttachment,
+  buildTimelineQuoteAttachment,
+} from "../utils/chatQuotes";
+import { findLinkedTimelineEvent } from "../utils/timelineLinks";
+import {
+  getInboxQuestionOptions,
+  isFileCleanupTimelineEvent,
+  isQuestionInboxItem,
+  isReversibleTrashInboxItem,
+} from "../utils/inbox";
 import type {
   AgentProviderConfig,
   AppView,
@@ -37,6 +49,7 @@ import type {
   ChatMessage,
   ChatThread,
   EventPolicyMode,
+  InboxApprovalItem,
   McpServerItem,
   ModelSelection,
   OnboardingStepId,
@@ -65,6 +78,12 @@ export interface ArrivalNotice {
   id: string;
   pluginName: string;
   eventCode: string;
+}
+
+export interface ComposerDraft {
+  text: string;
+  attachments: ChatAttachment[];
+  mentionPluginId: string;
 }
 
 function createCleanSlateShell(): ValetSnapshot {
@@ -137,12 +156,37 @@ function loadInitialState(): ValetSnapshot {
     if (!raw) return createInitialSnapshot();
     const parsed = JSON.parse(raw) as Partial<ValetSnapshot>;
     const base = createInitialSnapshot();
+    const baseInboxById = new Map(base.inboxItems.map((it) => [it.id, it]));
+    const parsedInbox = parsed.inboxItems ?? base.inboxItems;
+    const inboxItems = parsedInbox.map((it) => {
+      if (it.linkedTimelineEventId) return it;
+      const seedMatch = baseInboxById.get(it.id);
+      if (seedMatch?.linkedTimelineEventId) {
+        return { ...it, linkedTimelineEventId: seedMatch.linkedTimelineEventId };
+      }
+      return it;
+    });
+    const parsedTimeline = parsed.timelineEvents ?? base.timelineEvents;
+    const timelineIdSet = new Set(parsedTimeline.map((e) => e.id));
+    const missingSeedEvents = base.timelineEvents.filter(
+      (se) =>
+        !timelineIdSet.has(se.id) &&
+        inboxItems.some((it) => it.linkedTimelineEventId === se.id)
+    );
+    const timelineEvents =
+      missingSeedEvents.length > 0
+        ? [...missingSeedEvents, ...parsedTimeline]
+        : parsedTimeline;
+
     return {
       ...base,
       ...parsed,
+      inboxItems,
+      timelineEvents,
       preferences: {
         ...base.preferences,
         ...(parsed.preferences ?? {}),
+        darkTheme: normalizeDarkTheme(parsed.preferences?.darkTheme),
         autonomyLevel: normalizeClientAutonomy(parsed.preferences?.autonomyLevel),
         confirmChecklist: {
           ...base.preferences.confirmChecklist,
@@ -300,8 +344,10 @@ export interface ValetContextValue {
 
   // Inbox approvals
   selectInboxItem: (itemId: string | null) => void;
+  openInboxItemInTimeline: (itemId: string) => void;
   toggleInboxActionItem: (itemId: string, actionId: string) => void;
   approveInboxItem: (itemId: string) => void;
+  answerInboxQuestion: (itemId: string, answer: string) => void;
   dismissInboxItem: (itemId: string) => void;
   approveAllReversibleInboxItems: () => void;
   restoreApprovedInboxItem: (itemId: string) => void;
@@ -344,6 +390,7 @@ export interface ValetContextValue {
   runFirstScan: () => void;
 
   // Timeline
+  timelineFocusSignal: { tick: number; eventId: string } | null;
   selectTimelineEvent: (eventId: string | null) => void;
   setTimelinePluginFilter: (pluginId: string) => void;
   toggleTimelineActionItem: (eventId: string, actionId: string) => void;
@@ -352,6 +399,11 @@ export interface ValetContextValue {
   restoreTimelineEvent: (eventId: string) => void;
 
   // Chat
+  composerQuoteSignal: { tick: number; chatId: string } | null;
+  getComposerDraft: (chatId: string) => ComposerDraft;
+  setComposerDraft: (chatId: string, draft: ComposerDraft) => void;
+  quoteInboxItemToChat: (itemId: string) => void;
+  quoteTimelineEventToChat: (eventId: string) => void;
   selectChatThread: (chatId: string) => void;
   createNewChat: () => void;
   archiveChatThread: (chatId: string, archived?: boolean) => void;
@@ -409,6 +461,15 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [queuedMessages, setQueuedMessages] = useState<Record<string, QueuedChatMessage[]>>({});
   const queuedMessagesRef = useRef<Record<string, QueuedChatMessage[]>>({});
   const abortedChatRef = useRef<Record<string, boolean>>({});
+  const composerDraftsRef = useRef<Record<string, ComposerDraft>>({});
+  const [composerQuoteSignal, setComposerQuoteSignal] = useState<{
+    tick: number;
+    chatId: string;
+  } | null>(null);
+  const [timelineFocusSignal, setTimelineFocusSignal] = useState<{
+    tick: number;
+    eventId: string;
+  } | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [nodTick, setNodTick] = useState(0);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
@@ -455,19 +516,22 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   }, [state]);
 
-  // Apply light/dark/auto theme to document root
+  // Apply light/dark/auto theme and dark palette to document root
   useEffect(() => {
     const applyTheme = () => {
       const mode = state.preferences.appearance;
       const isSystemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
       const resolved = mode === "auto" ? (isSystemDark ? "dark" : "light") : mode;
       document.documentElement.dataset.theme = resolved;
+      document.documentElement.dataset.darkPalette = normalizeDarkTheme(
+        state.preferences.darkTheme
+      );
     };
     applyTheme();
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
     mq.addEventListener("change", applyTheme);
     return () => mq.removeEventListener("change", applyTheme);
-  }, [state.preferences.appearance]);
+  }, [state.preferences.appearance, state.preferences.darkTheme]);
 
   // Hydrate canonical state and subscribe to MyGo push events when hosted in MyGo
   useEffect(() => {
@@ -715,17 +779,105 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     [syncFromBackend]
   );
 
+  const answerInboxQuestion = useCallback(
+    (itemId: string, rawAnswer: string) => {
+      const target = stateRef.current.inboxItems.find((i) => i.id === itemId);
+      if (!target || target.status !== "pending") return;
+
+      const options = getInboxQuestionOptions(target);
+      const chosen = rawAnswer.trim() || options[0] || "确认";
+      const shortChosen = chosen.length > 24 ? `${chosen.slice(0, 23)}…` : chosen;
+      const prevPendingIds = new Set(
+        stateRef.current.inboxItems
+          .filter((i) => i.status === "pending")
+          .map((i) => i.id)
+      );
+      const nowTime = new Date().toTimeString().slice(0, 5);
+
+      setState((prev) => ({
+        ...prev,
+        selectedInboxItemId:
+          prev.selectedInboxItemId === itemId ? null : prev.selectedInboxItemId,
+        selectedTimelineEventId:
+          target.linkedTimelineEventId &&
+          prev.selectedTimelineEventId === target.linkedTimelineEventId
+            ? null
+            : prev.selectedTimelineEventId,
+        inboxItems: prev.inboxItems.map((it) =>
+          it.id === itemId
+            ? {
+                ...it,
+                status: "approved" as const,
+                processedAt: nowTime,
+                selectedOption: chosen,
+                reversible7d: false,
+                traceSteps: it.traceSteps.map((s) => ({ ...s, status: "done" as const })),
+              }
+            : it
+        ),
+        inboxProcessedHistoryCount: prev.inboxProcessedHistoryCount + 1,
+        timelineEvents: target.linkedTimelineEventId
+          ? prev.timelineEvents.map((evt) =>
+              evt.id === target.linkedTimelineEventId
+                ? {
+                    ...evt,
+                    status: "completed" as const,
+                    canRestore: false,
+                    summary: `已在收件箱回复：「${chosen}」`,
+                    traceSteps: evt.traceSteps.map((s) => ({ ...s, status: "done" as const })),
+                  }
+                : evt
+            )
+          : prev.timelineEvents,
+      }));
+      triggerNod();
+
+      if (isMyGo()) {
+        pushToast(`已提交选择「${shortChosen}」，Valet 正在继续处理…`);
+        void Valet.answerInboxQuestion(itemId, chosen)
+          .then((snap) => {
+            setState((prev) => mergeBackendSnapshot(prev, snap));
+            const remoteItems = snap.inboxItems as unknown as InboxApprovalItem[];
+            const newPending = remoteItems.find(
+              (i) => i.status === "pending" && !prevPendingIds.has(i.id) && i.id !== itemId
+            );
+            if (newPending) {
+              pushToast(
+                `已根据你的选择提交下一步待批操作：「${newPending.title}」`,
+                "warning"
+              );
+            } else {
+              pushToast(`已按你的选择「${shortChosen}」处理完成`, "success");
+            }
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+        return;
+      }
+
+      pushToast(`已记录你的选择：「${shortChosen}」`, "success");
+    },
+    [pushToast, triggerNod]
+  );
+
   const approveInboxItem = useCallback(
     (itemId: string) => {
       const target = stateRef.current.inboxItems.find((i) => i.id === itemId);
       if (!target || target.status !== "pending") return;
+
+      if (isQuestionInboxItem(target)) {
+        const opts = getInboxQuestionOptions(target);
+        answerInboxQuestion(itemId, opts[0] ?? "确认");
+        return;
+      }
 
       const reclaimed =
         target.actionItems.some((a) => a.sizeMB > 0)
           ? computeSelectedGB(target.actionItems, target.reclaimableGB ?? 0)
           : target.reclaimableGB ?? 0;
 
-      const toastMsg = target.reversible7d
+      const toastMsg = isReversibleTrashInboxItem(target)
         ? `已批准「${target.pluginName}」清理 ${reclaimed > 0 ? `${reclaimed} GB` : ""}（7 天内可还原）`
         : `已批准并执行「${target.title}」`;
 
@@ -756,6 +908,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         if (!cur || cur.status !== "pending") return prev;
 
         const nowTime = new Date().toTimeString().slice(0, 5);
+        const derivedEventId = cur.linkedTimelineEventId || `evt-from-${cur.id}`;
         const nextInbox = prev.inboxItems.map((it) =>
           it.id === itemId
             ? {
@@ -763,6 +916,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 status: "approved" as const,
                 processedAt: nowTime,
                 reclaimedGB: reclaimed,
+                linkedTimelineEventId: derivedEventId,
                 traceSteps: it.traceSteps.map((s) => ({ ...s, status: "done" as const })),
               }
             : it
@@ -836,7 +990,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       triggerNod();
       pushToast(toastMsg, "success");
     },
-    [pushToast, triggerNod]
+    [answerInboxQuestion, pushToast, triggerNod]
   );
 
   const dismissInboxItem = useCallback(
@@ -879,7 +1033,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   const approveAllReversibleInboxItems = useCallback(() => {
     const targets = stateRef.current.inboxItems.filter(
-      (i) => i.status === "pending" && i.reversible7d
+      (i) => i.status === "pending" && isReversibleTrashInboxItem(i)
     );
     if (targets.length === 0) return;
 
@@ -915,7 +1069,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     setState((prev) => {
       const curTargets = prev.inboxItems.filter(
-        (i) => i.status === "pending" && i.reversible7d
+        (i) => i.status === "pending" && isReversibleTrashInboxItem(i)
       );
       if (curTargets.length === 0) return prev;
 
@@ -931,6 +1085,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
               ...it,
               status: "approved" as const,
               processedAt: nowTime,
+              linkedTimelineEventId: it.linkedTimelineEventId || `evt-batch-${it.id}`,
               traceSteps: it.traceSteps.map((s) => ({ ...s, status: "done" as const })),
             }
           : it
@@ -1820,11 +1975,33 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       const target = stateRef.current.timelineEvents.find((e) => e.id === eventId);
       if (!target) return;
 
+      const linkedInbox = stateRef.current.inboxItems.find(
+        (i) => i.linkedTimelineEventId === eventId && i.status === "pending"
+      );
+      if (linkedInbox && isQuestionInboxItem(linkedInbox)) {
+        const opts = getInboxQuestionOptions(linkedInbox);
+        if (opts.length === 1) {
+          answerInboxQuestion(linkedInbox.id, opts[0]!);
+        } else {
+          setState((prev) => ({
+            ...prev,
+            activeView: "inbox",
+            selectedInboxItemId: linkedInbox.id,
+            selectedTimelineEventId: null,
+          }));
+        }
+        return;
+      }
+
       const selectedMB = target.actionItems
         .filter((item) => item.checked)
         .reduce((acc, item) => acc + item.sizeMB, 0);
       const reclaimedGB = Number((selectedMB / 1024).toFixed(1));
       const cleanedGBLabel = reclaimedGB > 0 ? `${reclaimedGB} GB` : "所选项目";
+      const isCleanup = isFileCleanupTimelineEvent(target) || selectedMB > 0;
+      const toastMsg = isCleanup
+        ? `已移入废纸篓（${cleanedGBLabel || "完成"}），7 天内可还原`
+        : `已批准并执行「${target.title}」`;
 
       if (isMyGo()) {
         void Valet.executeTimelineEvent(eventId)
@@ -1833,7 +2010,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
               mergeBackendSnapshot({ ...prev, selectedTimelineEventId: null }, snap)
             );
             triggerNod();
-            pushToast(`已移入废纸篓（${cleanedGBLabel || "完成"}），7 天内可还原`, "success");
+            pushToast(toastMsg, "success");
           })
           .catch((err: unknown) => {
             pushToast(err instanceof Error ? err.message : String(err), "danger");
@@ -1852,13 +2029,14 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             ...evt,
             status: "completed" as const,
             reclaimedGB: reclaimedGB > 0 ? reclaimedGB : evt.reclaimedGB,
-            canRestore: selectedMB > 0,
+            canRestore: isCleanup && selectedMB > 0,
             restored: false,
             ignored: false,
-            summary:
-              selectedMB > 0
+            summary: isCleanup
+              ? selectedMB > 0
                 ? `已按你的确认将 ${cleanedGBLabel} 移入废纸篓，保留了用户文件（7 天内可还原）。`
-                : "已执行你勾选的清理项目。",
+                : "已执行你勾选的清理项目。"
+              : "已批准并执行完成。",
             traceSteps: evt.traceSteps.map((s) => ({ ...s, status: "done" as const })),
             logs: [
               ...evt.logs,
@@ -1866,7 +2044,9 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 id: `log-done-${Date.now()}`,
                 ts: new Date().toTimeString().slice(0, 8),
                 level: "EXEC" as const,
-                message: `Moved ${cleanedGBLabel} to Trash cleanly (7-day restore enabled)`,
+                message: isCleanup
+                  ? `Moved ${cleanedGBLabel} to Trash cleanly (7-day restore enabled)`
+                  : `Executed approved action: ${evt.title}`,
               },
             ],
           };
@@ -1896,9 +2076,9 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         };
       });
       triggerNod();
-      pushToast(`已移入废纸篓（${cleanedGBLabel || "完成"}），7 天内可还原`, "success");
+      pushToast(toastMsg, "success");
     },
-    [pushToast, triggerNod]
+    [answerInboxQuestion, pushToast, triggerNod]
   );
 
   const ignoreTimelineEvent = useCallback(
@@ -1963,6 +2143,103 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }
     },
     [pushToast, syncFromBackend, triggerNod]
+  );
+
+  const getComposerDraft = useCallback((chatId: string): ComposerDraft => {
+    const existing = composerDraftsRef.current[chatId];
+    if (existing) return existing;
+    return { text: "", attachments: [], mentionPluginId: "" };
+  }, []);
+
+  const setComposerDraft = useCallback((chatId: string, draft: ComposerDraft) => {
+    composerDraftsRef.current[chatId] = draft;
+  }, []);
+
+  const attachQuoteToChat = useCallback((attachment: ChatAttachment) => {
+    const cur = stateRef.current;
+    const activeThreads = cur.chatThreads.filter((t) => !t.archived);
+    const preferred =
+      activeThreads.find((t) => t.id === cur.activeChatId) ??
+      activeThreads[0] ??
+      cur.chatThreads[0];
+    const targetChatId = preferred?.id ?? "chat-default";
+
+    const existing = composerDraftsRef.current[targetChatId] ?? {
+      text: "",
+      attachments: [],
+      mentionPluginId: "",
+    };
+    const alreadyIdx = existing.attachments.findIndex((a) => a.id === attachment.id);
+    const nextAttachments =
+      alreadyIdx >= 0
+        ? existing.attachments.map((a, i) => (i === alreadyIdx ? attachment : a))
+        : [...existing.attachments, attachment];
+
+    composerDraftsRef.current[targetChatId] = {
+      ...existing,
+      attachments: nextAttachments,
+    };
+
+    setState((prev) => ({
+      ...prev,
+      activeView: "chat",
+      activeChatId: targetChatId,
+      selectedInboxItemId: null,
+      selectedTimelineEventId: null,
+      activePluginDetailId: null,
+    }));
+    setComposerQuoteSignal((prev) => ({
+      tick: (prev?.tick ?? 0) + 1,
+      chatId: targetChatId,
+    }));
+  }, []);
+
+  const quoteInboxItemToChat = useCallback(
+    (itemId: string) => {
+      const target = stateRef.current.inboxItems.find((i) => i.id === itemId);
+      if (!target) return;
+      attachQuoteToChat(buildInboxQuoteAttachment(target));
+    },
+    [attachQuoteToChat]
+  );
+
+  const quoteTimelineEventToChat = useCallback(
+    (eventId: string) => {
+      const target = stateRef.current.timelineEvents.find((e) => e.id === eventId);
+      if (!target) return;
+      attachQuoteToChat(buildTimelineQuoteAttachment(target));
+    },
+    [attachQuoteToChat]
+  );
+
+  const openInboxItemInTimeline = useCallback(
+    (itemId: string) => {
+      const cur = stateRef.current;
+      const item = cur.inboxItems.find((i) => i.id === itemId);
+      if (!item) return;
+      const linkedEvt = findLinkedTimelineEvent(item, cur.timelineEvents);
+      if (!linkedEvt) {
+        pushToast("未找到该事项关联的时间线事件", "warning");
+        return;
+      }
+      setState((prev) => ({
+        ...prev,
+        activeView: "timeline",
+        selectedInboxItemId: null,
+        activePluginDetailId: null,
+        timelinePluginFilter:
+          prev.timelinePluginFilter !== "all" &&
+          prev.timelinePluginFilter !== linkedEvt.pluginId
+            ? "all"
+            : prev.timelinePluginFilter,
+        selectedTimelineEventId: linkedEvt.id,
+      }));
+      setTimelineFocusSignal((prev) => ({
+        tick: (prev?.tick ?? 0) + 1,
+        eventId: linkedEvt.id,
+      }));
+    },
+    [pushToast]
   );
 
   const selectChatThread = useCallback((chatId: string) => {
@@ -2160,36 +2437,174 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           const snap = await Valet.getSnapshot();
           setState((prev) => mergeBackendSnapshot(prev, snap));
         } else {
-          setState((prev) => ({
-            ...prev,
-            timelineEvents: outcome.createdEvent
-              ? [outcome.createdEvent, ...prev.timelineEvents]
-              : prev.timelineEvents,
-            inboxItems: outcome.createdInboxItem
+          setState((prev) => {
+            let nextInbox = outcome.createdInboxItem
               ? [outcome.createdInboxItem, ...prev.inboxItems]
-              : prev.inboxItems,
-            chatThreads: prev.chatThreads.map((t) => {
-              if (t.id !== chatId) return t;
-              const exists = t.messages.some((m) => m.id === outcome.replyMessage.id);
-              return {
-                ...t,
-                timelineActionCount:
-                  t.timelineActionCount + (outcome.createdEvent ? 1 : 0),
-                linkedEventIds: outcome.createdEvent
-                  ? [outcome.createdEvent.id, ...t.linkedEventIds]
-                  : t.linkedEventIds,
-                messages: exists
-                  ? t.messages.map((m) =>
-                      m.id === outcome.replyMessage.id ? outcome.replyMessage : m
-                    )
-                  : [...t.messages, outcome.replyMessage],
-              };
-            }),
-          }));
+              : prev.inboxItems;
+            let nextTimeline = outcome.createdEvent
+              ? [outcome.createdEvent, ...prev.timelineEvents]
+              : prev.timelineEvents;
+            let processedDelta = 0;
+
+            if (outcome.resolvedQuotes && outcome.resolvedQuotes.length > 0) {
+              const nowHHMM = new Date().toTimeString().slice(0, 5);
+              for (const rq of outcome.resolvedQuotes) {
+                if (rq.kind === "inbox_item") {
+                  const target = nextInbox.find((i) => i.id === rq.refId);
+                  if (!target) continue;
+                  if (rq.action === "approve" && target.status === "pending") {
+                    processedDelta += 1;
+                    nextInbox = nextInbox.map((it) =>
+                      it.id === rq.refId
+                        ? { ...it, status: "approved", processedAt: nowHHMM }
+                        : it
+                    );
+                    if (target.linkedTimelineEventId) {
+                      nextTimeline = nextTimeline.map((evt) =>
+                        evt.id === target.linkedTimelineEventId
+                          ? {
+                              ...evt,
+                              status: "completed",
+                              canRestore: target.reversible7d,
+                              summary: "已在对话中批准并执行完成。",
+                            }
+                          : evt
+                      );
+                    }
+                  } else if (rq.action === "dismiss" && target.status === "pending") {
+                    processedDelta += 1;
+                    nextInbox = nextInbox.map((it) =>
+                      it.id === rq.refId
+                        ? { ...it, status: "dismissed", processedAt: nowHHMM }
+                        : it
+                    );
+                    if (target.linkedTimelineEventId) {
+                      nextTimeline = nextTimeline.map((evt) =>
+                        evt.id === target.linkedTimelineEventId
+                          ? {
+                              ...evt,
+                              status: "completed",
+                              ignored: true,
+                              summary: "已在对话中选择忽略，未作任何改动。",
+                            }
+                          : evt
+                      );
+                    }
+                  } else if (rq.action === "restore" && target.status === "approved" && target.reversible7d) {
+                    nextInbox = nextInbox.map((it) =>
+                      it.id === rq.refId ? { ...it, restored: true } : it
+                    );
+                    if (target.linkedTimelineEventId) {
+                      nextTimeline = nextTimeline.map((evt) =>
+                        evt.id === target.linkedTimelineEventId
+                          ? {
+                              ...evt,
+                              restored: true,
+                              canRestore: false,
+                              summary: "已在对话中一键还原已清理内容。",
+                            }
+                          : evt
+                      );
+                    }
+                  }
+                } else if (rq.kind === "timeline_event") {
+                  const target = nextTimeline.find((e) => e.id === rq.refId);
+                  if (!target) continue;
+                  if (rq.action === "approve" && target.status === "pending_confirm") {
+                    const hadPendingInbox = nextInbox.some(
+                      (i) => i.linkedTimelineEventId === rq.refId && i.status === "pending"
+                    );
+                    if (hadPendingInbox) processedDelta += 1;
+                    nextTimeline = nextTimeline.map((evt) =>
+                      evt.id === rq.refId
+                        ? {
+                            ...evt,
+                            status: "completed",
+                            canRestore: evt.actionItems.some((a) => a.sizeMB > 0),
+                            summary: "已在对话中确认并执行完成。",
+                          }
+                        : evt
+                    );
+                    nextInbox = nextInbox.map((it) =>
+                      it.linkedTimelineEventId === rq.refId && it.status === "pending"
+                        ? { ...it, status: "approved", processedAt: nowHHMM }
+                        : it
+                    );
+                  } else if (rq.action === "dismiss" && target.status === "pending_confirm") {
+                    const hadPendingInbox = nextInbox.some(
+                      (i) => i.linkedTimelineEventId === rq.refId && i.status === "pending"
+                    );
+                    if (hadPendingInbox) processedDelta += 1;
+                    nextTimeline = nextTimeline.map((evt) =>
+                      evt.id === rq.refId
+                        ? {
+                            ...evt,
+                            status: "completed",
+                            ignored: true,
+                            summary: "已在对话中选择忽略本次提醒。",
+                          }
+                        : evt
+                    );
+                    nextInbox = nextInbox.map((it) =>
+                      it.linkedTimelineEventId === rq.refId && it.status === "pending"
+                        ? { ...it, status: "dismissed", processedAt: nowHHMM }
+                        : it
+                    );
+                  } else if (rq.action === "restore" && target.status === "completed" && target.canRestore) {
+                    nextTimeline = nextTimeline.map((evt) =>
+                      evt.id === rq.refId
+                        ? {
+                            ...evt,
+                            restored: true,
+                            canRestore: false,
+                            summary: "已在对话中一键还原已清理内容。",
+                          }
+                        : evt
+                    );
+                    nextInbox = nextInbox.map((it) =>
+                      it.linkedTimelineEventId === rq.refId ? { ...it, restored: true } : it
+                    );
+                  }
+                }
+              }
+            }
+
+            return {
+              ...prev,
+              timelineEvents: nextTimeline,
+              inboxItems: nextInbox,
+              inboxProcessedHistoryCount: prev.inboxProcessedHistoryCount + processedDelta,
+              chatThreads: prev.chatThreads.map((t) => {
+                if (t.id !== chatId) return t;
+                const exists = t.messages.some((m) => m.id === outcome.replyMessage.id);
+                return {
+                  ...t,
+                  timelineActionCount:
+                    t.timelineActionCount + (outcome.createdEvent ? 1 : 0),
+                  linkedEventIds: outcome.createdEvent
+                    ? [outcome.createdEvent.id, ...t.linkedEventIds]
+                    : t.linkedEventIds,
+                  messages: exists
+                    ? t.messages.map((m) =>
+                        m.id === outcome.replyMessage.id ? outcome.replyMessage : m
+                      )
+                    : [...t.messages, outcome.replyMessage],
+                };
+              }),
+            };
+          });
         }
 
-        if (outcome.createdEvent) {
-          pushToast("已生成待确认清理任务，已同步至收件箱与时间线", "warning");
+        if (outcome.createdInboxItem) {
+          if (isQuestionInboxItem(outcome.createdInboxItem)) {
+            pushToast("已将待确认问题同步至收件箱", "warning");
+          } else if (isReversibleTrashInboxItem(outcome.createdInboxItem)) {
+            pushToast("已生成待确认清理任务，已同步至收件箱与时间线", "warning");
+          } else {
+            pushToast("已生成待确认操作，已同步至收件箱", "warning");
+          }
+        } else if (outcome.createdEvent?.status === "pending_confirm") {
+          pushToast("已生成待确认事项，请前往时间线查看", "warning");
         }
       } catch (err: unknown) {
         pushToast(err instanceof Error ? err.message : String(err), "danger");
@@ -2746,6 +3161,9 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   }, [pushToast, syncFromBackend]);
 
   const resetAllData = useCallback(() => {
+    composerDraftsRef.current = {};
+    setComposerQuoteSignal(null);
+    setTimelineFocusSignal(null);
     if (isMyGo()) {
       syncFromBackend(Valet.resetAllData(), true);
       pushToast("已重置全部本地数据", "warning");
@@ -2784,8 +3202,10 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       openPluginDetail,
       togglePauseValet,
       selectInboxItem,
+      openInboxItemInTimeline,
       toggleInboxActionItem,
       approveInboxItem,
+      answerInboxQuestion,
       dismissInboxItem,
       approveAllReversibleInboxItems,
       restoreApprovedInboxItem,
@@ -2809,12 +3229,18 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       updateModels,
       setAutonomyLevel,
       runFirstScan,
+      timelineFocusSignal,
       selectTimelineEvent,
       setTimelinePluginFilter,
       toggleTimelineActionItem,
       executeTimelineEventActions,
       ignoreTimelineEvent,
       restoreTimelineEvent,
+      composerQuoteSignal,
+      getComposerDraft,
+      setComposerDraft,
+      quoteInboxItemToChat,
+      quoteTimelineEventToChat,
       selectChatThread,
       createNewChat,
       archiveChatThread,
@@ -2848,6 +3274,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       addAutomationRule,
       addMcpServer,
       addMemoryEntry,
+      answerInboxQuestion,
       approveAllReversibleInboxItems,
       approveInboxItem,
       archiveChatThread,
@@ -2860,6 +3287,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       clearMemories,
       commandPaletteOpen,
       completeOnboarding,
+      composerQuoteSignal,
       createNewChat,
       deleteAutomationRule,
       deleteMcpServer,
@@ -2868,6 +3296,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       dismissToast,
       executeTimelineEventActions,
       fixPluginAuth,
+      getComposerDraft,
       ignoreTimelineEvent,
       importExistingConfig,
       installCustomPlugin,
@@ -2875,10 +3304,13 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       installPluginDraft,
       isCompactViewport,
       nodTick,
+      openInboxItemInTimeline,
       openPluginDetail,
       openSettingsSection,
       performProcessAction,
       pushToast,
+      quoteInboxItemToChat,
+      quoteTimelineEventToChat,
       reconnectMcpServer,
       refreshPermissions,
       reloadPlugin,
@@ -2900,12 +3332,14 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setActiveSettingsSection,
       setActiveView,
       setAutonomyLevel,
+      setComposerDraft,
       setOnboardingStep,
       setPermissionGranted,
       setTimelinePluginFilter,
       sidebarCollapsed,
       simulatePluginEvent,
       state,
+      timelineFocusSignal,
       toasts,
       toggleAutomation,
       toggleInboxActionItem,

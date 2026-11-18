@@ -879,6 +879,9 @@ func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, r
 		}
 		return s.TriggerPluginEvent(ctx, strings.TrimSpace(req.ID), strings.TrimSpace(req.EventID), req.PayloadJSON)
 
+	case "host.item.resolve":
+		return s.execHostItemResolve(ctx, raw)
+
 	default:
 		return nil, fmt.Errorf("unknown host RPC method: %s", method)
 	}
@@ -1278,6 +1281,28 @@ func (s *Service) queueApprovalFromAgent(req sidecar.QueueApprovalRequest) map[s
 	evtID := fmt.Sprintf("evt-ag-%d", now.UnixNano())
 	inboxID := fmt.Sprintf("inbox-ag-%d", now.UnixNano())
 
+	options := extractStringSlice(req.Options)
+	if len(options) == 0 {
+		options = extractStringSlice(req.ToolArgs["options"])
+	}
+	sourceChatID := strings.TrimSpace(req.SourceChatID)
+	if sourceChatID == "" {
+		if cid, ok := req.ToolArgs["sourceChatId"].(string); ok {
+			sourceChatID = strings.TrimSpace(cid)
+		}
+	}
+	isQuestion := req.EventCode == "user.question" || req.ToolName == "ask_user"
+	reversible7d := req.Reversible7d
+	traceStage := "安全拦截"
+	traceDetail := "策略要求人工批准后执行 " + req.ToolName
+	evtTriggerLabel := nowHHMM + " · Agent 安全拦截"
+	if isQuestion {
+		reversible7d = false
+		traceStage = "等待确认"
+		traceDetail = "等待你在收件箱选择处理方案"
+		evtTriggerLabel = nowHHMM + " · 等待用户确认"
+	}
+
 	evt := types.TimelineEvent{
 		ID:                  evtID,
 		Timestamp:           ts,
@@ -1291,12 +1316,12 @@ func (s *Service) queueApprovalFromAgent(req sidecar.QueueApprovalRequest) map[s
 		EventCode:           req.EventCode,
 		Status:              "pending_confirm",
 		ConfirmBannerText:   req.Summary,
-		TriggerLatencyLabel: nowHHMM + " · Agent 安全拦截",
+		TriggerLatencyLabel: evtTriggerLabel,
 		Payload:             req.ToolArgs,
 		Reasoning:           req.Reasoning,
 		ActionItems:         req.ActionItems,
 		TraceSteps: []types.TraceStep{
-			{ID: "st1", Time: nowHHMM, Stage: "安全拦截", Detail: "策略要求人工批准后执行 " + req.ToolName, Status: "active"},
+			{ID: "st1", Time: nowHHMM, Stage: traceStage, Detail: traceDetail, Status: "active"},
 		},
 		Logs: []types.LogLine{
 			{ID: "lg1", TS: now.Format("15:04:05"), Level: "WARN", Message: fmt.Sprintf("beforeTool blocked %s -> queued inbox %s", req.ToolName, inboxID)},
@@ -1317,7 +1342,7 @@ func (s *Service) queueApprovalFromAgent(req sidecar.QueueApprovalRequest) map[s
 		PluginBadge:           req.PluginName,
 		EventCode:             req.EventCode,
 		WarningTag:            req.WarningTag,
-		Reversible7d:          req.Reversible7d,
+		Reversible7d:          reversible7d,
 		ReclaimableGB:         req.ReclaimableGB,
 		ApproveLabel:          req.ApproveLabel,
 		DismissLabel:          req.DismissLabel,
@@ -1331,6 +1356,8 @@ func (s *Service) queueApprovalFromAgent(req sidecar.QueueApprovalRequest) map[s
 		Logs:                  evt.Logs,
 		ToolName:              req.ToolName,
 		ToolArgs:              req.ToolArgs,
+		Options:               options,
+		SourceChatID:          sourceChatID,
 	}
 
 	s.mu.Lock()
@@ -2006,6 +2033,190 @@ func (s *Service) ToggleInboxActionItem(itemID, actionID string) (types.ValetSna
 	}), nil
 }
 
+// AnswerInboxQuestion records a user's chosen option/reply for a pending `user.question` Inbox card
+// and forwards the answer back to Sidecar to continue the originating agent conversation.
+func (s *Service) AnswerInboxQuestion(ctx context.Context, itemID string, answer string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	snap := s.store.Snapshot()
+	var target *types.InboxApprovalItem
+	for i := range snap.InboxItems {
+		if snap.InboxItems[i].ID == itemID {
+			copyItem := snap.InboxItems[i]
+			target = &copyItem
+			break
+		}
+	}
+	if target == nil || target.Status != "pending" {
+		return snap, nil
+	}
+
+	opts := extractInboxQuestionOptions(*target)
+	chosen := strings.TrimSpace(answer)
+	if chosen == "" {
+		if len(opts) > 0 {
+			chosen = opts[0]
+		} else {
+			chosen = "确认"
+		}
+	}
+
+	question, _ := target.ToolArgs["question"].(string)
+	if strings.TrimSpace(question) == "" {
+		question, _ = target.Payload["question"].(string)
+	}
+	if strings.TrimSpace(question) == "" {
+		question = target.Summary
+	}
+	if strings.TrimSpace(question) == "" {
+		question = target.Title
+	}
+
+	sourceChatID := strings.TrimSpace(target.SourceChatID)
+	if sourceChatID == "" {
+		if cid, ok := target.ToolArgs["sourceChatId"].(string); ok {
+			sourceChatID = strings.TrimSpace(cid)
+		}
+	}
+	if sourceChatID == "" {
+		if cid, ok := target.Payload["sourceChatId"].(string); ok {
+			sourceChatID = strings.TrimSpace(cid)
+		}
+	}
+	if sourceChatID == "" && target.PluginID != "" && target.PluginID != "valet-core" {
+		sourceChatID = "event:" + target.PluginID
+	}
+
+	now := time.Now()
+	nowHHMM := now.Format("15:04")
+	answerStep := types.TraceStep{
+		ID:     fmt.Sprintf("st-ans-%d", now.UnixNano()),
+		Time:   nowHHMM,
+		Stage:  "用户回复",
+		Detail: "已选择：" + chosen,
+		Status: "done",
+	}
+
+	nextSnap := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.InboxItems {
+			if st.InboxItems[i].ID == itemID {
+				st.InboxItems[i].Status = "approved"
+				st.InboxItems[i].ProcessedAt = nowHHMM
+				st.InboxItems[i].SelectedOption = chosen
+				st.InboxItems[i].Reversible7d = false
+				for j := range st.InboxItems[i].TraceSteps {
+					st.InboxItems[i].TraceSteps[j].Status = "done"
+				}
+				st.InboxItems[i].TraceSteps = append(st.InboxItems[i].TraceSteps, answerStep)
+			}
+		}
+		st.InboxProcessedHistoryCount++
+		if target.LinkedTimelineEventID != "" {
+			for i := range st.TimelineEvents {
+				if st.TimelineEvents[i].ID == target.LinkedTimelineEventID {
+					st.TimelineEvents[i].Status = "completed"
+					st.TimelineEvents[i].CanRestore = false
+					st.TimelineEvents[i].Summary = fmt.Sprintf("已在收件箱回复：「%s」", chosen)
+					for j := range st.TimelineEvents[i].TraceSteps {
+						st.TimelineEvents[i].TraceSteps[j].Status = "done"
+					}
+					st.TimelineEvents[i].TraceSteps = append(st.TimelineEvents[i].TraceSteps, answerStep)
+				}
+			}
+		}
+	})
+	s.emitStateChange("inbox")
+
+	if s.client != nil {
+		s.syncSidecarBlocking(ctx, nextSnap)
+		var ansResp sidecar.AnswerInboxQuestionResponse
+		if err := s.client.Call(ctx, "inbox.answerQuestion", sidecar.AnswerInboxQuestionRequest{
+			InboxID:      target.ID,
+			Question:     question,
+			Answer:       chosen,
+			SourceChatID: sourceChatID,
+		}, &ansResp); err == nil {
+			replySummary := summarizeMarkdownReply(ansResp.ReplyMessage.Content)
+			followDetail := replySummary
+			if followDetail == "" {
+				followDetail = "已将你的选择回传给智能体处理完成"
+			}
+			followTime := time.Now()
+			followHHMM := followTime.Format("15:04")
+			followStep := types.TraceStep{
+				ID:     fmt.Sprintf("st-done-%d", followTime.UnixNano()),
+				Time:   followHHMM,
+				Stage:  "后续处理",
+				Detail: followDetail,
+				Status: "done",
+			}
+			followLog := types.LogLine{
+				ID:      fmt.Sprintf("lg-ans-%d", followTime.UnixNano()),
+				TS:      followTime.Format("15:04:05"),
+				Level:   "EXEC",
+				Message: fmt.Sprintf("Answered %q -> %s (%s)", chosen, ansResp.ResolvedChatID, followDetail),
+			}
+			s.store.Update(func(st *types.ValetSnapshot) {
+				if ansResp.UsageCostDelta > 0 {
+					st.Preferences.DailySpendCurrent = math.Round((st.Preferences.DailySpendCurrent+ansResp.UsageCostDelta)*100) / 100
+				}
+				for i := range st.InboxItems {
+					if st.InboxItems[i].ID == itemID {
+						st.InboxItems[i].TraceSteps = append(st.InboxItems[i].TraceSteps, followStep)
+						st.InboxItems[i].Logs = append(st.InboxItems[i].Logs, followLog)
+					}
+				}
+				if target.LinkedTimelineEventID != "" && replySummary != "" {
+					for i := range st.TimelineEvents {
+						if st.TimelineEvents[i].ID == target.LinkedTimelineEventID {
+							st.TimelineEvents[i].Summary = fmt.Sprintf("已选择「%s」· %s", chosen, replySummary)
+							st.TimelineEvents[i].TraceSteps = append(st.TimelineEvents[i].TraceSteps, followStep)
+							st.TimelineEvents[i].Logs = append(st.TimelineEvents[i].Logs, followLog)
+						}
+					}
+				}
+				if ansResp.ResolvedChatID != "" {
+					for i := range st.ChatThreads {
+						if st.ChatThreads[i].ID == ansResp.ResolvedChatID {
+							userMsg := types.ChatMessage{
+								ID:        fmt.Sprintf("usr-ans-%d", followTime.UnixNano()),
+								Role:      "user",
+								Content:   chosen,
+								CreatedAt: nowHHMM,
+							}
+							st.ChatThreads[i].Messages = append(st.ChatThreads[i].Messages, userMsg)
+							if ansResp.ReplyMessage.ID != "" || ansResp.ReplyMessage.Content != "" {
+								st.ChatThreads[i].Messages = append(st.ChatThreads[i].Messages, ansResp.ReplyMessage)
+							}
+							st.ChatThreads[i].UpdatedAt = "刚刚"
+							break
+						}
+					}
+				}
+			})
+			s.emitStateChange("inbox")
+		} else {
+			errTime := time.Now()
+			s.store.Update(func(st *types.ValetSnapshot) {
+				for i := range st.InboxItems {
+					if st.InboxItems[i].ID == itemID {
+						st.InboxItems[i].Logs = append(st.InboxItems[i].Logs, types.LogLine{
+							ID:      fmt.Sprintf("lg-ans-err-%d", errTime.UnixNano()),
+							TS:      errTime.Format("15:04:05"),
+							Level:   "WARN",
+							Message: fmt.Sprintf("inbox.answerQuestion failed: %v", err),
+						})
+					}
+				}
+			})
+			s.emitStateChange("inbox")
+		}
+	}
+
+	return s.store.Snapshot(), nil
+}
+
 // ApproveInboxItem executes the approved Inbox action (trash, process termination, or sidecar tool)
 // and synchronizes the linked Timeline event and disk telemetry.
 func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.ValetSnapshot, error) {
@@ -2023,6 +2234,9 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 	}
 	if target == nil || target.Status != "pending" {
 		return snap, nil
+	}
+	if isQuestionInboxItem(*target) {
+		return s.AnswerInboxQuestion(ctx, itemID, "")
 	}
 
 	checkedPaths := make([]string, 0, len(target.ActionItems))
@@ -2142,6 +2356,9 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 				st.InboxItems[i].Status = "approved"
 				st.InboxItems[i].ProcessedAt = nowHHMM
 				st.InboxItems[i].TrashBatchID = batchID
+				if st.InboxItems[i].LinkedTimelineEventID == "" {
+					st.InboxItems[i].LinkedTimelineEventID = "evt-from-" + itemID
+				}
 			}
 		}
 		st.InboxProcessedHistoryCount++
@@ -2220,6 +2437,48 @@ func extractTargetPaths(m map[string]any) []string {
 	return out
 }
 
+func extractStringSlice(raw any) []string {
+	switch v := raw.(type) {
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if t := strings.TrimSpace(item); t != "" {
+				out = append(out, t)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				if t := strings.TrimSpace(s); t != "" {
+					out = append(out, t)
+				}
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func extractInboxQuestionOptions(it types.InboxApprovalItem) []string {
+	if opts := extractStringSlice(it.Options); len(opts) > 0 {
+		return opts
+	}
+	if opts := extractStringSlice(it.ToolArgs["options"]); len(opts) > 0 {
+		return opts
+	}
+	if opts := extractStringSlice(it.Payload["options"]); len(opts) > 0 {
+		return opts
+	}
+	return nil
+}
+
+func isQuestionInboxItem(it types.InboxApprovalItem) bool {
+	return it.EventCode == "user.question" || it.ToolName == "ask_user" || len(extractInboxQuestionOptions(it)) > 0
+}
+
 // DismissInboxItem rejects an Inbox item without touching files or processes.
 func (s *Service) DismissInboxItem(itemID string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
@@ -2255,7 +2514,7 @@ func (s *Service) ApproveAllReversible(ctx context.Context) (types.ValetSnapshot
 	}
 	snap := s.store.Snapshot()
 	for _, it := range snap.InboxItems {
-		if it.Status == "pending" && it.Reversible7d {
+		if it.Status == "pending" && it.Reversible7d && !isQuestionInboxItem(it) {
 			var err error
 			snap, err = s.ApproveInboxItem(ctx, it.ID)
 			if err != nil {
@@ -2480,6 +2739,214 @@ func (s *Service) RestoreTimelineEvent(eventID string) (types.ValetSnapshot, err
 			}
 		}
 	}), nil
+}
+
+func (s *Service) execHostItemResolve(ctx context.Context, raw json.RawMessage) (any, error) {
+	var req struct {
+		Source           string   `json:"source"`
+		ID               string   `json:"id"`
+		Action           string   `json:"action"`
+		CheckedActionIDs []string `json:"checkedActionIds"`
+		CheckedPaths     []string `json:"checkedPaths"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		return nil, errors.New("缺少事项 id 参数")
+	}
+	source := strings.ToLower(strings.TrimSpace(req.Source))
+	switch source {
+	case "inbox", "inbox_item":
+		source = "inbox"
+	case "timeline", "timeline_event":
+		source = "timeline"
+	default:
+		return nil, fmt.Errorf("不支持的事项来源 %q，应为 inbox 或 timeline", req.Source)
+	}
+
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	switch action {
+	case "approve", "dismiss", "execute", "ignore", "restore":
+	default:
+		return nil, fmt.Errorf("不支持的操作类型 %q", req.Action)
+	}
+
+	snap := s.store.Snapshot()
+	var inboxItem *types.InboxApprovalItem
+	for i := range snap.InboxItems {
+		if snap.InboxItems[i].ID == id {
+			cp := snap.InboxItems[i]
+			inboxItem = &cp
+			break
+		}
+	}
+	var timelineEvt *types.TimelineEvent
+	for i := range snap.TimelineEvents {
+		if snap.TimelineEvents[i].ID == id {
+			cp := snap.TimelineEvents[i]
+			timelineEvt = &cp
+			break
+		}
+	}
+
+	if source == "inbox" && inboxItem == nil {
+		if timelineEvt != nil {
+			return nil, fmt.Errorf("未在收件箱找到事项 %q（它位于时间线，请使用 source=\"timeline\"）", id)
+		}
+		return nil, fmt.Errorf("未找到收件箱事项 %q", id)
+	}
+	if source == "timeline" && timelineEvt == nil {
+		if inboxItem != nil {
+			return nil, fmt.Errorf("未在时间线找到事件 %q（它位于收件箱，请使用 source=\"inbox\"）", id)
+		}
+		return nil, fmt.Errorf("未找到时间线事件 %q", id)
+	}
+
+	if len(req.CheckedActionIDs) > 0 || len(req.CheckedPaths) > 0 {
+		idSet := make(map[string]bool, len(req.CheckedActionIDs))
+		for _, aid := range req.CheckedActionIDs {
+			if t := strings.TrimSpace(aid); t != "" {
+				idSet[t] = true
+			}
+		}
+		pathSet := make(map[string]bool, len(req.CheckedPaths))
+		for _, p := range req.CheckedPaths {
+			if t := strings.TrimSpace(p); t != "" {
+				pathSet[t] = true
+			}
+		}
+		applySelection := func(items []types.TimelineActionItem) int {
+			matched := 0
+			for j := range items {
+				match := idSet[items[j].ID] ||
+					pathSet[strings.TrimSpace(items[j].Path)] ||
+					pathSet[strings.TrimSpace(items[j].Label)]
+				items[j].Checked = match
+				if match {
+					matched++
+				}
+			}
+			return matched
+		}
+
+		var targetItems []types.TimelineActionItem
+		if source == "inbox" {
+			targetItems = inboxItem.ActionItems
+		} else {
+			targetItems = timelineEvt.ActionItems
+		}
+		if len(targetItems) > 0 {
+			matched := 0
+			for _, it := range targetItems {
+				if idSet[it.ID] || pathSet[strings.TrimSpace(it.Path)] || pathSet[strings.TrimSpace(it.Label)] {
+					matched++
+				}
+			}
+			if matched == 0 {
+				return nil, errors.New("提供的 checkedActionIds 或 checkedPaths 未匹配到该事项的任何子项")
+			}
+			s.store.Update(func(st *types.ValetSnapshot) {
+				if source == "inbox" {
+					linkedEvtID := ""
+					for i := range st.InboxItems {
+						if st.InboxItems[i].ID == id {
+							linkedEvtID = st.InboxItems[i].LinkedTimelineEventID
+							applySelection(st.InboxItems[i].ActionItems)
+							st.InboxItems[i].ReclaimableGB = computeCheckedGB(st.InboxItems[i].ActionItems, 0)
+						}
+					}
+					if linkedEvtID != "" {
+						for i := range st.TimelineEvents {
+							if st.TimelineEvents[i].ID == linkedEvtID {
+								applySelection(st.TimelineEvents[i].ActionItems)
+							}
+						}
+					}
+				} else {
+					for i := range st.TimelineEvents {
+						if st.TimelineEvents[i].ID == id {
+							applySelection(st.TimelineEvents[i].ActionItems)
+						}
+					}
+					for i := range st.InboxItems {
+						if st.InboxItems[i].LinkedTimelineEventID == id {
+							applySelection(st.InboxItems[i].ActionItems)
+							st.InboxItems[i].ReclaimableGB = computeCheckedGB(st.InboxItems[i].ActionItems, 0)
+						}
+					}
+				}
+			})
+		}
+	}
+
+	var summary string
+	if source == "inbox" {
+		switch action {
+		case "approve", "execute":
+			if inboxItem.Status != "pending" {
+				return nil, fmt.Errorf("收件箱事项 %q 当前状态为 %q，无需重复批准", id, inboxItem.Status)
+			}
+			if _, err := s.ApproveInboxItem(ctx, id); err != nil {
+				return nil, err
+			}
+			summary = fmt.Sprintf("已批准并执行收件箱事项「%s」", inboxItem.Title)
+		case "dismiss", "ignore":
+			if inboxItem.Status != "pending" {
+				return nil, fmt.Errorf("收件箱事项 %q 当前状态为 %q，无法忽略", id, inboxItem.Status)
+			}
+			if _, err := s.DismissInboxItem(id); err != nil {
+				return nil, err
+			}
+			summary = fmt.Sprintf("已忽略收件箱事项「%s」", inboxItem.Title)
+		case "restore":
+			if inboxItem.Status != "approved" || !inboxItem.Reversible7d || inboxItem.Restored {
+				return nil, fmt.Errorf("收件箱事项 %q 当前不支持还原", id)
+			}
+			if _, err := s.RestoreApprovedInboxItem(id); err != nil {
+				return nil, err
+			}
+			summary = fmt.Sprintf("已还原收件箱事项「%s」清理的内容", inboxItem.Title)
+		}
+	} else {
+		switch action {
+		case "execute", "approve":
+			if timelineEvt.Status != "pending_confirm" {
+				return nil, fmt.Errorf("时间线事件 %q 当前状态为 %q，无法执行待确认操作", id, timelineEvt.Status)
+			}
+			if _, err := s.ExecuteTimelineEvent(ctx, id); err != nil {
+				return nil, err
+			}
+			summary = fmt.Sprintf("已执行时间线待确认事件「%s」", timelineEvt.Title)
+		case "ignore", "dismiss":
+			if timelineEvt.Status != "pending_confirm" {
+				return nil, fmt.Errorf("时间线事件 %q 当前状态为 %q，无法忽略", id, timelineEvt.Status)
+			}
+			if _, err := s.IgnoreTimelineEvent(id); err != nil {
+				return nil, err
+			}
+			summary = fmt.Sprintf("已忽略时间线事件「%s」", timelineEvt.Title)
+		case "restore":
+			if timelineEvt.Status != "completed" || !timelineEvt.CanRestore || timelineEvt.Restored {
+				return nil, fmt.Errorf("时间线事件 %q 当前不支持还原", id)
+			}
+			if _, err := s.RestoreTimelineEvent(id); err != nil {
+				return nil, err
+			}
+			summary = fmt.Sprintf("已还原时间线事件「%s」清理的内容", timelineEvt.Title)
+		}
+	}
+
+	s.emitStateChange("full")
+	return map[string]any{
+		"ok":      true,
+		"source":  source,
+		"id":      id,
+		"action":  action,
+		"summary": summary,
+	}, nil
 }
 
 // --- Plugins ---
@@ -3570,6 +4037,7 @@ func (s *Service) UpdatePreferences(prefs types.ValetPreferences) (types.ValetSn
 		if st.Preferences.BusyMessagePolicy != "steer" && st.Preferences.BusyMessagePolicy != "queue" {
 			st.Preferences.BusyMessagePolicy = "queue"
 		}
+		st.Preferences.DarkTheme = types.NormalizeDarkTheme(st.Preferences.DarkTheme)
 	})
 	if s.opts.OnSyncTray != nil {
 		s.opts.OnSyncTray(next.Preferences.ShowMenuBarIcon, next.IsPaused)

@@ -38,7 +38,7 @@ export const Switch: React.FC<SwitchProps> = ({
         if (!disabled) onChange(!checked);
       }}
       className={`app-no-drag relative inline-flex ${trackSize} shrink-0 cursor-pointer items-center rounded-full p-[2px] transition-colors duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ink-primary)] ${
-        checked ? "bg-[var(--ink-primary)]" : "bg-[var(--switch-off-bg)]"
+        checked ? "bg-[var(--switch-on-bg)]" : "bg-[var(--switch-off-bg)]"
       } ${disabled ? "cursor-not-allowed opacity-45" : ""}`}
     >
       <span

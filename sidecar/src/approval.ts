@@ -64,6 +64,7 @@ export class InteractivePermissionCoordinator {
     }
   >();
   private readonly sessionAllowedTools = new Map<string, Set<string>>();
+  private readonly chatUserIntents = new Map<string, string[]>();
 
   setConversationChatId(convId: ConversationId, chatId: string): void {
     this.convToChatId.set(convId, chatId);
@@ -71,6 +72,36 @@ export class InteractivePermissionCoordinator {
 
   getChatId(convId: ConversationId): string | undefined {
     return this.convToChatId.get(convId);
+  }
+
+  recordUserIntent(chatId: string, rawPrompt: string): void {
+    if (!chatId || chatId.startsWith("approved:")) return;
+    let clean = rawPrompt.trim();
+    if (!clean) return;
+    const skillIdx = clean.indexOf("\n\n请严格按照该插件的 Skill");
+    if (skillIdx >= 0) {
+      clean = clean.slice(0, skillIdx).trim();
+    }
+    const fileIdx = clean.indexOf("\n\n[文件内容");
+    if (fileIdx >= 0) {
+      clean = clean.slice(0, fileIdx).trim();
+    }
+    clean = clean.slice(0, 500).trim();
+    if (!clean) return;
+    const prev = this.chatUserIntents.get(chatId) ?? [];
+    const next = [...prev, clean].slice(-3);
+    this.chatUserIntents.set(chatId, next);
+  }
+
+  getUserIntent(convIdOrChatId: ConversationId | string): string | undefined {
+    const chatId =
+      typeof convIdOrChatId === "string"
+        ? convIdOrChatId
+        : this.convToChatId.get(convIdOrChatId);
+    if (!chatId) return undefined;
+    const entries = this.chatUserIntents.get(chatId);
+    if (!entries || entries.length === 0) return undefined;
+    return entries.join("\n---\n");
   }
 
   setInteractiveChat(chatId: string, interactive: boolean): void {
@@ -362,6 +393,9 @@ const READ_ONLY_BASH_COMMANDS = new Set([
   "[",
   "[[",
   "system_profiler",
+  "tree",
+  "fd",
+  "bat",
 ]);
 
 const STANDARD_BIN_PREFIXES = [
@@ -817,6 +851,97 @@ export function isReadOnlyBashCommand(rawCmd: string): boolean {
   return parenDepth === 0;
 }
 
+const SAFE_LOCAL_AUTO_FS_BINS = new Set(["mkdir", "touch", "cp", "mv"]);
+
+/**
+ * Returns true for non-destructive local file organization commands (`mkdir`, `touch`, `cp`, `mv`)
+ * and non-guardrail `valet` self-config / read-only segments scoped to `homeDir` or `/tmp`
+ * (excluding dotfiles, `..`, `protectedDirs`, `LaunchAgents`, and `/Applications`).
+ */
+export function isSafeLocalAutoBashCommand(
+  rawCmd: string,
+  state: ValetSyncState,
+): boolean {
+  const trimmed = rawCmd.trim();
+  if (!trimmed) return false;
+  const { segments, hasUnsafeShellConstruct } = splitShellSegments(trimmed);
+  if (hasUnsafeShellConstruct || segments.length === 0) return false;
+
+  const protectedDirs = [
+    ...HARD_PROTECTED_PREFIXES,
+    ...state.preferences.cleanupPolicy.protectedDirs,
+  ].map((d) => expandPath(d, state.homeDir));
+
+  const isDisallowedExpandedPath = (expanded: string): boolean =>
+    expanded === state.homeDir ||
+    matchesPrefix(expanded, "/Applications") ||
+    matchesPrefix(expanded, `${state.homeDir}/Applications`) ||
+    matchesPrefix(expanded, `${state.homeDir}/Library/LaunchAgents`) ||
+    matchesPrefix(expanded, `${state.homeDir}/Library/Application Support`) ||
+    protectedDirs.some((p) => matchesPrefix(expanded, p));
+
+  const isSafeLocalTargetPath = (rawTok: string): boolean => {
+    const t = rawTok.trim();
+    if (!t || t.includes("$")) return false;
+    const parts = t.split("/").filter(Boolean);
+    if (parts.some((p) => p === ".." || (p.startsWith(".") && p !== "."))) {
+      return false;
+    }
+    const expanded = expandPath(t, state.homeDir);
+    if (expanded.startsWith("/")) {
+      const inAllowedRoot =
+        matchesPrefix(expanded, state.homeDir) ||
+        matchesPrefix(expanded, "/tmp") ||
+        matchesPrefix(expanded, "/private/tmp") ||
+        matchesPrefix(expanded, "/var/tmp");
+      if (!inAllowedRoot) return false;
+      return !isDisallowedExpandedPath(expanded);
+    }
+    const rel = expanded.replace(/^\.\/+/, "");
+    if (rel && rel !== ".") {
+      const resolvedRel = expandPath(`${state.homeDir}/${rel}`, state.homeDir);
+      if (isDisallowedExpandedPath(resolvedRel)) return false;
+    }
+    return true;
+  };
+
+  let parenDepth = 0;
+  for (const seg of segments) {
+    let cleanSeg = seg.trim();
+    while (cleanSeg.startsWith("(")) {
+      parenDepth += 1;
+      cleanSeg = cleanSeg.slice(1).trimStart();
+    }
+    while (cleanSeg.endsWith(")") && parenDepth > 0) {
+      parenDepth -= 1;
+      cleanSeg = cleanSeg.slice(0, -1).trimEnd();
+    }
+    if (!cleanSeg) return false;
+    const tokens = tokenizeSegment(cleanSeg);
+    if (tokens.length === 0) return false;
+
+    if (isReadOnlySegment(tokens)) continue;
+    if (classifyValetCliSegment(tokens) === "self_config") continue;
+
+    let idx = 0;
+    while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx]!)) {
+      idx += 1;
+    }
+    if (idx >= tokens.length) continue;
+
+    const bin = resolveBaseCommand(tokens[idx]!);
+    if (!bin || !SAFE_LOCAL_AUTO_FS_BINS.has(bin)) {
+      return false;
+    }
+    const rest = tokens.slice(idx + 1);
+    const targetArgs = rest.filter((a) => a !== "--" && !a.startsWith("-"));
+    const minTargets = bin === "cp" || bin === "mv" ? 2 : 1;
+    if (targetArgs.length < minTargets) return false;
+    if (!targetArgs.every(isSafeLocalTargetPath)) return false;
+  }
+  return parenDepth === 0;
+}
+
 /**
  * Blocks catastrophic, credential-reading, privilege-escalating, or protected-path
  * mutating shell commands before approval or execution.
@@ -1069,6 +1194,13 @@ export function evaluateToolPolicy(
     };
   }
 
+  if (
+    meta?.toolName === "item_resolve" &&
+    (args.action === "dismiss" || args.action === "ignore")
+  ) {
+    return { outcome: "allow" };
+  }
+
   if (!meta || meta.safety === "readonly") {
     return { outcome: "allow" };
   }
@@ -1177,6 +1309,7 @@ function buildApprovalPayload(
     trash_files: `移出 ${paths.length || 1} 项文件至废纸篓`,
     write_file: `写入文件 ${String(args.path ?? "")}`,
     kill_process: `终止进程 ${String(args.name ?? "process")}（PID ${String(args.pid ?? "?")}）`,
+    item_resolve: `处理引用事项 ${String(args.id ?? "")}（${String(args.action ?? "approve")}）`,
   };
 
   const actionItems: QueueApprovalParams["actionItems"] =
@@ -1277,6 +1410,15 @@ export function createSafetyExtension(options: {
           api: HookApi,
           _context: Context,
         ) => {
+          if (
+            call.name === "item_resolve" &&
+            !permissionCoordinator?.isForegroundChat(api.conversationId)
+          ) {
+            return {
+              block:
+                "安全边界拒绝：item_resolve 仅允许在前台用户对话中调用，后台任务禁止自行审批事项。",
+            };
+          }
           const state = getState();
           const meta = policyRegistry.get(call.name);
           const args = (call.arguments ?? {}) as Record<string, unknown>;
@@ -1337,6 +1479,8 @@ export function createSafetyExtension(options: {
                 isForeground:
                   permissionCoordinator?.isForegroundChat(api.conversationId) ??
                   false,
+                chatId: permissionCoordinator?.getChatId(api.conversationId),
+                userIntent: permissionCoordinator?.getUserIntent(api.conversationId),
               });
               if (reviewRes.approved) {
                 return undefined;

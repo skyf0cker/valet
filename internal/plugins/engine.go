@@ -759,14 +759,10 @@ func matchCronExpr(expr string, now time.Time) bool {
 }
 
 func (e *Engine) dispatch(d TriggerDispatch) {
-	if d.Kind == "plugin" {
-		e.mu.Lock()
-		throttle10m := e.preferences.Thresholds.EventThrottle10m
-		e.mu.Unlock()
-		if !e.throttle.Allow(d.PluginID, d.EventCode, throttle10m, false) {
-			return
-		}
-	}
+	// NOTE: no throttle here. dispatchPluginEventInternal owns the event
+	// throttle and records each Allow; checking here too would let the
+	// second check see the timestamp the first one just recorded and drop
+	// every real sensor event whenever EventThrottle10m is on.
 	if e.cfg.OnTrigger != nil {
 		e.cfg.OnTrigger(d)
 	}

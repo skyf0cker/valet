@@ -51,7 +51,7 @@ export function createStewardCoreExtension(options: {
       safety: "readonly",
       category: "process",
       iconKind: "pulse",
-      reversible7d: true,
+      reversible7d: false,
       approveLabel: "确定",
       dismissLabel: "关闭",
     },
@@ -64,7 +64,7 @@ export function createStewardCoreExtension(options: {
       safety: "readonly",
       category: "files",
       iconKind: "disk",
-      reversible7d: true,
+      reversible7d: false,
       approveLabel: "读取",
       dismissLabel: "取消",
     },
@@ -77,7 +77,7 @@ export function createStewardCoreExtension(options: {
       safety: "readonly",
       category: "files",
       iconKind: "disk",
-      reversible7d: true,
+      reversible7d: false,
       approveLabel: "列出",
       dismissLabel: "取消",
     },
@@ -148,7 +148,7 @@ export function createStewardCoreExtension(options: {
       safety: "readonly",
       category: "outbound",
       iconKind: "mail",
-      reversible7d: true,
+      reversible7d: false,
       approveLabel: "确认",
       dismissLabel: "取消",
     },
@@ -161,7 +161,7 @@ export function createStewardCoreExtension(options: {
       safety: "readonly",
       category: "files",
       iconKind: "disk",
-      reversible7d: true,
+      reversible7d: false,
       approveLabel: "确定",
       dismissLabel: "取消",
     },
@@ -174,7 +174,7 @@ export function createStewardCoreExtension(options: {
       safety: "readonly",
       category: "files",
       iconKind: "disk",
-      reversible7d: true,
+      reversible7d: false,
       approveLabel: "安装",
       dismissLabel: "取消",
     },
@@ -190,6 +190,20 @@ export function createStewardCoreExtension(options: {
       reversible7d: true,
       approveLabel: "批准",
       dismissLabel: "忽略",
+    },
+    {
+      toolName: "item_resolve",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "item.resolve",
+      eventCode: "item.resolved",
+      safety: "reversible",
+      checklistKey: "deleteOrOverwrite",
+      category: "files",
+      iconKind: "disk",
+      reversible7d: true,
+      approveLabel: "批准执行",
+      dismissLabel: "取消",
     },
   ]);
 
@@ -438,25 +452,47 @@ export function createStewardCoreExtension(options: {
       }
 
       // Background sensor/heartbeat turn: queue an Inbox card for user review
+      const sourceChatId = permissionCoordinator?.getChatId(api.conversationId);
+      const state = getState();
+      const sourcePluginId = sourceChatId?.startsWith("event:")
+        ? sourceChatId.slice("event:".length)
+        : undefined;
+      const sourcePlugin = sourcePluginId
+        ? state.plugins.find(
+            (p) => p.id === sourcePluginId || p.slug === sourcePluginId,
+          )
+        : undefined;
+      const cleanQuestion = args.question.trim();
+      const title =
+        cleanQuestion.length > 120
+          ? `${cleanQuestion.slice(0, 119)}…`
+          : cleanQuestion;
       const queued = await bridge.callHost<{
         inboxId: string;
         timelineEventId: string;
       }>("host.queueApproval", {
-        pluginId: "valet-core",
-        pluginName: "Valet 管家",
+        pluginId: sourcePlugin?.id ?? "valet-core",
+        pluginName: sourcePlugin?.name ?? "Valet 管家",
         eventCode: "user.question",
         category: "outbound",
         iconKind: "mail",
-        title: args.question.slice(0, 60),
-        summary: args.context ? `${args.question} · ${args.context}` : args.question,
+        title,
+        summary: args.context ? `${cleanQuestion} · ${args.context}` : cleanQuestion,
         reasoning: optsList?.length
           ? `备选方案：${optsList.join(" / ")}`
-          : args.question,
-        reversible7d: true,
-        approveLabel: "已知晓",
+          : cleanQuestion,
+        reversible7d: false,
+        approveLabel: optsList?.[0] ?? "确认回复",
         dismissLabel: "忽略",
         toolName: "ask_user",
-        toolArgs: { question: args.question, options: optsList },
+        toolArgs: {
+          question: cleanQuestion,
+          options: optsList,
+          ...(args.context ? { context: args.context } : {}),
+          ...(sourceChatId ? { sourceChatId } : {}),
+        },
+        options: optsList,
+        sourceChatId,
         actionItems: [],
       } satisfies QueueApprovalParams as unknown as Record<string, unknown>);
       if (queued?.inboxId) {
@@ -708,7 +744,7 @@ export function createStewardCoreExtension(options: {
         title: args.title,
         summary: args.summary,
         reasoning: args.summary,
-        reversible7d: args.reversible7d ?? true,
+        reversible7d: args.reversible7d ?? (category === "files"),
         reclaimableGB: estimatedGB,
         approveLabel: category === "files" ? "移入废纸篓" : "批准执行",
         dismissLabel: "忽略",
@@ -732,6 +768,64 @@ export function createStewardCoreExtension(options: {
       }
       return textResult(`已提交收件箱待批事项 ${queued?.inboxId ?? ""}`, {
         queued,
+      });
+    },
+  });
+
+  const itemResolveTool = defineTool({
+    name: "item_resolve",
+    description:
+      "Approve, dismiss, execute, ignore, or restore an existing Inbox approval item or Timeline pending confirmation event quoted by the user in foreground Chat. Never available in background turns.",
+    parameters: obj({
+      source: str({ description: "Item source: \"inbox\" or \"timeline\"." }),
+      id: str({ description: "Target inboxItem.id or timelineEvent.id." }),
+      action: str({
+        description:
+          "Action to perform: \"approve\", \"dismiss\", \"execute\", \"ignore\", or \"restore\".",
+      }),
+      checkedActionIds: opt(
+        arr(str(), {
+          description:
+            "Optional subset of actionItem IDs to keep checked before executing/approving.",
+        }),
+      ),
+      checkedPaths: opt(
+        arr(str(), {
+          description:
+            "Optional subset of actionItem paths/labels to keep checked before executing/approving.",
+        }),
+      ),
+      reason: opt(
+        str({ description: "Concise Chinese explanation of the user's decision." }),
+      ),
+    }),
+    execute: async (args, api) => {
+      if (!permissionCoordinator?.isForegroundChat(api.conversationId)) {
+        return {
+          output: [
+            {
+              type: "text" as const,
+              text: "安全边界拒绝：item_resolve 仅允许在前台用户交互对话中调用，后台任务禁止自行审批事项。",
+            },
+          ],
+          isError: true,
+        };
+      }
+      const res = await bridge.callHost<{
+        ok: boolean;
+        source: string;
+        id: string;
+        action: string;
+        summary: string;
+      }>("host.item.resolve", {
+        source: args.source,
+        id: args.id,
+        action: args.action,
+        checkedActionIds: args.checkedActionIds,
+        checkedPaths: args.checkedPaths,
+      });
+      return textResult(res.summary || `已完成操作 ${args.action} (${args.id})`, {
+        resolvedItem: res as never,
       });
     },
   });
@@ -772,7 +866,7 @@ export function createStewardCoreExtension(options: {
           "通用核心工具（所有插件共享这套原语）：",
           "- 只读探测工具：`system_overview`、`read_file`、`list_dir`、`ask_user`、`memory_remember`、`plugin_draft_create`、`bash`（纯只读命令与插件 `scripts/poll-*`/`import-*`/`read-*`/`inspect-*`/`scan-*`/`sample-*` 脚本直接放行）。",
           "- 工具使用优先顺序：查看目录文件请优先用 `list_dir`、查看文件内容请优先用 `read_file`；仅在需要系统探测（进程/网络/磁盘元数据）或执行变更命令时使用 `bash`。",
-          "- 变更执行工具：`trash_files`（移入废纸篓，7 天可还原）、`write_file`、`kill_process`、`bash`（修改系统/配置命令）。",
+          "- 变更执行工具：`trash_files`（移入废纸篓，7 天可还原）、`write_file`、`kill_process`、`bash`（修改系统/配置命令）、`item_resolve`（仅限前台对话中按用户明确指示批准、忽略、部分勾选执行或还原被引用的收件箱/时间线事项）。",
           "双模安全审批机制：在 `auto_review` 模式下，非纯只读调用会先由 Auto Review 模型评估风险，低风险自动放行，高风险或未配置时升级为人工确认（前台对话实时弹窗、后台任务推送收件箱）；在 `always_ask` 下每次变更都会确认；在 `full_access` 下除受保护目录/应用与安全护栏外的操作均自动放行。严禁访问 `~/.ssh`、`~/.gnupg`、`~/.aws`、Keychain 或使用 `sudo`。",
         ].join("\n");
       }),
@@ -844,6 +938,7 @@ export function createStewardCoreExtension(options: {
       memoryRememberTool,
       pluginDraftCreateTool,
       inboxProposeApprovalTool,
+      itemResolveTool,
     ],
   });
 }

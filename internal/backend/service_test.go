@@ -620,8 +620,29 @@ func TestTrashApprovalAndModelSync(t *testing.T) {
 		t.Fatalf("expected DesktopReady ApproveInboxItem to reject empty-path file approval")
 	}
 
-	if _, err := svc.ApproveInboxItem(context.Background(), "inbox-real"); err != nil {
+	approvedSnap, err := svc.ApproveInboxItem(context.Background(), "inbox-real")
+	if err != nil {
 		t.Fatalf("ApproveInboxItem(inbox-real) failed: %v", err)
+	}
+	var linkedID string
+	for _, it := range approvedSnap.InboxItems {
+		if it.ID == "inbox-real" {
+			linkedID = it.LinkedTimelineEventID
+			break
+		}
+	}
+	if linkedID != "evt-from-inbox-real" {
+		t.Fatalf("expected inbox-real LinkedTimelineEventID=%q, got %q", "evt-from-inbox-real", linkedID)
+	}
+	foundLinkedEvt := false
+	for _, ev := range approvedSnap.TimelineEvents {
+		if ev.ID == "evt-from-inbox-real" {
+			foundLinkedEvt = true
+			break
+		}
+	}
+	if !foundLinkedEvt {
+		t.Fatalf("expected timeline event evt-from-inbox-real to exist after ApproveInboxItem")
 	}
 	if _, statErr := os.Stat(freshDMG); !os.IsNotExist(statErr) {
 		t.Fatalf("expected %s to be moved out of Downloads, statErr=%v", freshDMG, statErr)
@@ -1072,5 +1093,435 @@ func TestExecKernelBash(t *testing.T) {
 		json.RawMessage(`{"command":"cat ~/.ssh/id_rsa"}`),
 	); err == nil || !strings.Contains(err.Error(), "安全边界拒绝") {
 		t.Fatalf("expected forbidden kernel bash command to be rejected, got: %v", err)
+	}
+}
+
+func TestQuoteItemToChatAndResolve(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	downloadsDir := filepath.Join(homeDir, "Downloads")
+	if err := os.MkdirAll(downloadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleFile := filepath.Join(downloadsDir, "stale-archive.dmg")
+	if err := os.WriteFile(staleFile, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		HomeDir:      homeDir,
+		DataDir:      dataDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("svc.start failed: %v", err)
+	}
+	defer func() {
+		if err := svc.close(); err != nil {
+			t.Errorf("close error: %v", err)
+		}
+	}()
+
+	svc.store.Update(func(st *types.ValetSnapshot) {
+		st.Preferences.AutonomyLevel = "full_access"
+		st.TimelineEvents = []types.TimelineEvent{
+			{
+				ID:          "evt-q1",
+				Timestamp:   time.Now().Format(time.RFC3339),
+				TimeLabel:   "12:00",
+				DayGroup:    "today",
+				Title:       "清理过期磁盘镜像 stale-archive.dmg",
+				Summary:     "检测到闲置镜像，等待确认移入废纸篓。",
+				PluginID:    "disk-guard",
+				PluginName:  "磁盘守卫",
+				PluginBadge: "磁盘守卫",
+				EventCode:   "disk.large_file",
+				Status:      "pending_confirm",
+				Payload:     map[string]any{"path": staleFile},
+				Reasoning:   "超过 90 天未打开。",
+				ActionItems: []types.TimelineActionItem{
+					{
+						ID:        "act-q1",
+						Label:     "stale-archive.dmg",
+						Path:      staleFile,
+						SizeMB:    1,
+						SizeLabel: "4 KB",
+						Checked:   true,
+					},
+				},
+			},
+			{
+				ID:          "evt-q2",
+				Timestamp:   time.Now().Format(time.RFC3339),
+				TimeLabel:   "11:50",
+				DayGroup:    "today",
+				Title:       "时间线待确认提醒",
+				Summary:     "等待确认或忽略。",
+				PluginID:    "disk-guard",
+				PluginName:  "磁盘守卫",
+				PluginBadge: "磁盘守卫",
+				EventCode:   "disk.cache_bloat",
+				Status:      "pending_confirm",
+				Payload:     map[string]any{},
+				Reasoning:   "缓存占用提醒。",
+				ActionItems: []types.TimelineActionItem{},
+			},
+		}
+		st.InboxItems = []types.InboxApprovalItem{
+			{
+				ID:                    "inbox-q1",
+				Timestamp:             time.Now().Format(time.RFC3339),
+				TimeLabel:             "12:00",
+				Category:              "files",
+				IconKind:              "disk",
+				Title:                 "清理过期磁盘镜像 stale-archive.dmg",
+				Summary:               "检测到闲置镜像，建议移入废纸篓（7 天可还原）。",
+				PluginID:              "disk-guard",
+				PluginName:            "磁盘守卫",
+				PluginBadge:           "磁盘守卫",
+				EventCode:             "disk.large_file",
+				Reversible7d:          true,
+				ReclaimableGB:         0.1,
+				ApproveLabel:          "移入废纸篓",
+				DismissLabel:          "忽略",
+				Status:                "pending",
+				LinkedTimelineEventID: "evt-q1",
+				ToolName:              "trash_files",
+				Payload:               map[string]any{"path": staleFile},
+				Reasoning:             "超过 90 天未打开。",
+				ActionItems: []types.TimelineActionItem{
+					{
+						ID:        "act-q1",
+						Label:     "stale-archive.dmg",
+						Path:      staleFile,
+						SizeMB:    1,
+						SizeLabel: "4 KB",
+						Checked:   true,
+					},
+				},
+			},
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	quoteAtt := types.ChatAttachment{
+		ID:          "quote-inbox-inbox-q1",
+		Kind:        "inbox_item",
+		RefID:       "inbox-q1",
+		Badge:       "收件箱",
+		Name:        "清理过期磁盘镜像 stale-archive.dmg",
+		Meta:        "磁盘守卫 · disk.large_file · 待批准",
+		TextExcerpt: "- 来源：收件箱待批/审批记录\n- inboxId：inbox-q1\n- 摘要：检测到闲置镜像，建议移入废纸篓。",
+	}
+
+	// 1. Ask a follow-up question referencing inbox-q1: attachment persists and item stays pending.
+	askRes, err := svc.SendChatMessage(ctx, types.SendChatParams{
+		ChatID:      "chat-default",
+		Prompt:      "为什么建议清理这个文件？有什么风险？",
+		Model:       "claude-opus-4",
+		Attachments: []types.ChatAttachment{quoteAtt},
+		Interactive: true,
+	})
+	if err != nil {
+		t.Fatalf("SendChatMessage(ask) failed: %v", err)
+	}
+	if !strings.Contains(askRes.ReplyMessage.Content, "清理过期磁盘镜像") {
+		t.Fatalf("expected reply to reference quoted item title, got: %s", askRes.ReplyMessage.Content)
+	}
+
+	snapAfterAsk, err := svc.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot failed: %v", err)
+	}
+	if snapAfterAsk.InboxItems[0].Status != "pending" || snapAfterAsk.TimelineEvents[0].Status != "pending_confirm" {
+		t.Fatalf("expected inbox-q1/evt-q1 to remain pending after question, got inbox=%s evt=%s",
+			snapAfterAsk.InboxItems[0].Status, snapAfterAsk.TimelineEvents[0].Status)
+	}
+	var savedUserMsg *types.ChatMessage
+	for _, th := range snapAfterAsk.ChatThreads {
+		if th.ID == "chat-default" {
+			for i := range th.Messages {
+				if th.Messages[i].Role == "user" {
+					savedUserMsg = &th.Messages[i]
+					break
+				}
+			}
+		}
+	}
+	if savedUserMsg == nil || len(savedUserMsg.Attachments) != 1 ||
+		savedUserMsg.Attachments[0].Kind != "inbox_item" ||
+		savedUserMsg.Attachments[0].RefID != "inbox-q1" {
+		t.Fatalf("expected persisted user quote attachment, got: %+v", savedUserMsg)
+	}
+
+	// 2. Ask agent to approve and execute the quoted item via item_resolve -> host.item.resolve.
+	approveRes, err := svc.SendChatMessage(ctx, types.SendChatParams{
+		ChatID:      "chat-default",
+		Prompt:      "确认没有问题，请帮我直接批准执行",
+		Model:       "claude-opus-4",
+		Attachments: []types.ChatAttachment{quoteAtt},
+		Interactive: true,
+	})
+	if err != nil {
+		t.Fatalf("SendChatMessage(approve) failed: %v", err)
+	}
+	if !strings.Contains(approveRes.ReplyMessage.Content, "已批准并执行") {
+		t.Fatalf("expected approval confirmation in reply, got: %s", approveRes.ReplyMessage.Content)
+	}
+
+	snapAfterApprove, err := svc.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot failed: %v", err)
+	}
+	if snapAfterApprove.InboxItems[0].Status != "approved" {
+		t.Fatalf("expected inbox-q1 status=approved, got %s", snapAfterApprove.InboxItems[0].Status)
+	}
+	if snapAfterApprove.TimelineEvents[0].Status != "completed" {
+		t.Fatalf("expected evt-q1 status=completed, got %s", snapAfterApprove.TimelineEvents[0].Status)
+	}
+	if _, statErr := os.Stat(staleFile); !os.IsNotExist(statErr) {
+		t.Fatalf("expected %s moved to vault after approval, statErr=%v", staleFile, statErr)
+	}
+
+	// 3. Also verify timeline quote ignore via chat -> item_resolve -> host.item.resolve.
+	timelineQuote := types.ChatAttachment{
+		ID:          "quote-timeline-evt-q2",
+		Kind:        "timeline_event",
+		RefID:       "evt-q2",
+		Badge:       "时间线",
+		Name:        "时间线待确认提醒",
+		Meta:        "磁盘守卫 · disk.cache_bloat · 待确认",
+		TextExcerpt: "- 来源：时间线事件\n- eventId：evt-q2\n- 摘要：等待确认或忽略。",
+	}
+	if _, err := svc.SendChatMessage(ctx, types.SendChatParams{
+		ChatID:      "chat-default",
+		Prompt:      "这个先忽略保留",
+		Model:       "claude-opus-4",
+		Attachments: []types.ChatAttachment{timelineQuote},
+		Interactive: true,
+	}); err != nil {
+		t.Fatalf("SendChatMessage(ignore timeline) failed: %v", err)
+	}
+	snapAfterIgnore, err := svc.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot failed: %v", err)
+	}
+	if snapAfterIgnore.TimelineEvents[1].Status != "completed" || !snapAfterIgnore.TimelineEvents[1].Ignored {
+		t.Fatalf("expected evt-q2 completed+ignored, got status=%s ignored=%v",
+			snapAfterIgnore.TimelineEvents[1].Status, snapAfterIgnore.TimelineEvents[1].Ignored)
+	}
+}
+
+func TestUserQuestionInboxNormalizationAndAnswer(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Seed a legacy persisted snapshot containing a user.question card with Reversible7d=true
+	initialStore, err := store.OpenWithOptions(dataDir, homeDir, false)
+	if err != nil {
+		t.Fatalf("initial store.OpenWithOptions failed: %v", err)
+	}
+	nowTS := time.Now().Format(time.RFC3339)
+	initialStore.Update(func(st *types.ValetSnapshot) {
+		st.TimelineEvents = append([]types.TimelineEvent{
+			{
+				ID:          "evt-uq-legacy",
+				Timestamp:   nowTS,
+				TimeLabel:   "12:30",
+				DayGroup:    "today",
+				Title:       "是否添加 ntp-server？",
+				Summary:     "等待用户选择",
+				PluginID:    "surge-doctor",
+				PluginName:  "Surge 诊断",
+				PluginBadge: "Surge 诊断",
+				EventCode:   "user.question",
+				Status:      "pending_confirm",
+				Payload: map[string]any{
+					"question": "是否添加 ntp-server？",
+					"options":  []any{"好，添加并重载", "先不动，继续观察"},
+				},
+				Reasoning:   "备选方案：好，添加并重载 / 先不动，继续观察",
+				ActionItems: []types.TimelineActionItem{},
+			},
+			{
+				ID:          "evt-uq-approve",
+				Timestamp:   nowTS,
+				TimeLabel:   "12:31",
+				DayGroup:    "today",
+				Title:       "是否刷新 DNS？",
+				Summary:     "等待用户选择",
+				PluginID:    "surge-doctor",
+				PluginName:  "Surge 诊断",
+				PluginBadge: "Surge 诊断",
+				EventCode:   "user.question",
+				Status:      "pending_confirm",
+				Payload: map[string]any{
+					"question": "是否刷新 DNS？",
+					"options":  []any{"立即刷新", "暂不处理"},
+				},
+				Reasoning:   "备选方案：立即刷新 / 暂不处理",
+				ActionItems: []types.TimelineActionItem{},
+			},
+		}, st.TimelineEvents...)
+
+		st.InboxItems = append([]types.InboxApprovalItem{
+			{
+				ID:                    "inbox-uq-legacy",
+				Timestamp:             nowTS,
+				TimeLabel:             "12:30",
+				Category:              "outbound",
+				IconKind:              "mail",
+				Title:                 "是否添加 ntp-server？",
+				Summary:               "等待用户选择",
+				PluginID:              "surge-doctor",
+				PluginName:            "Surge 诊断",
+				PluginBadge:           "Surge 诊断",
+				EventCode:             "user.question",
+				Reversible7d:          true,
+				ApproveLabel:          "已知晓",
+				DismissLabel:          "忽略",
+				Status:                "pending",
+				LinkedTimelineEventID: "evt-uq-legacy",
+				ToolName:              "ask_user",
+				ToolArgs: map[string]any{
+					"question": "是否添加 ntp-server？",
+					"options":  []any{"好，添加并重载", "先不动，继续观察"},
+				},
+				Payload: map[string]any{
+					"question": "是否添加 ntp-server？",
+					"options":  []any{"好，添加并重载", "先不动，继续观察"},
+				},
+				Reasoning:   "备选方案：好，添加并重载 / 先不动，继续观察",
+				ActionItems: []types.TimelineActionItem{},
+			},
+			{
+				ID:                    "inbox-uq-approve",
+				Timestamp:             nowTS,
+				TimeLabel:             "12:31",
+				Category:              "outbound",
+				IconKind:              "mail",
+				Title:                 "是否刷新 DNS？",
+				Summary:               "等待用户选择",
+				PluginID:              "surge-doctor",
+				PluginName:            "Surge 诊断",
+				PluginBadge:           "Surge 诊断",
+				EventCode:             "user.question",
+				Reversible7d:          true,
+				ApproveLabel:          "已知晓",
+				DismissLabel:          "忽略",
+				Status:                "pending",
+				LinkedTimelineEventID: "evt-uq-approve",
+				ToolName:              "ask_user",
+				ToolArgs: map[string]any{
+					"question": "是否刷新 DNS？",
+					"options":  []any{"立即刷新", "暂不处理"},
+				},
+				Payload: map[string]any{
+					"question": "是否刷新 DNS？",
+					"options":  []any{"立即刷新", "暂不处理"},
+				},
+				Reasoning:   "备选方案：立即刷新 / 暂不处理",
+				ActionItems: []types.TimelineActionItem{},
+			},
+		}, st.InboxItems...)
+	})
+
+	// Reopen from disk and confirm normalizeLoadedSnapshot fixed Reversible7d and Options
+	reopened, err := store.OpenWithOptions(dataDir, homeDir, false)
+	if err != nil {
+		t.Fatalf("reopen store failed: %v", err)
+	}
+	reopenedSnap := reopened.Snapshot()
+	if reopenedSnap.InboxItems[0].Reversible7d {
+		t.Fatalf("expected user.question item normalized to Reversible7d=false")
+	}
+	if len(reopenedSnap.InboxItems[0].Options) != 2 || reopenedSnap.InboxItems[0].Options[0] != "好，添加并重载" {
+		t.Fatalf("expected normalized Options on legacy user.question item, got %+v", reopenedSnap.InboxItems[0].Options)
+	}
+
+	// 2. Start Service and verify ApproveAllReversible skips user.question cards
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		HomeDir:      homeDir,
+		DataDir:      dataDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("svc.start failed: %v", err)
+	}
+	defer func() {
+		if err := svc.close(); err != nil {
+			t.Errorf("close error: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	afterBatch, err := svc.ApproveAllReversible(ctx)
+	if err != nil {
+		t.Fatalf("ApproveAllReversible failed: %v", err)
+	}
+	for _, it := range afterBatch.InboxItems {
+		if it.EventCode == "user.question" && it.Status != "pending" {
+			t.Fatalf("expected ApproveAllReversible to skip user.question %s, got status=%s", it.ID, it.Status)
+		}
+	}
+
+	// 3. ApproveInboxItem on a user.question item routes to AnswerInboxQuestion without creating duplicate cards
+	afterApprove, err := svc.ApproveInboxItem(ctx, "inbox-uq-approve")
+	if err != nil {
+		t.Fatalf("ApproveInboxItem(inbox-uq-approve) failed: %v", err)
+	}
+	var approvedItem *types.InboxApprovalItem
+	for i := range afterApprove.InboxItems {
+		if afterApprove.InboxItems[i].ID == "inbox-uq-approve" {
+			approvedItem = &afterApprove.InboxItems[i]
+			break
+		}
+	}
+	if approvedItem == nil || approvedItem.Status != "approved" || approvedItem.SelectedOption != "立即刷新" || approvedItem.Reversible7d {
+		t.Fatalf("unexpected approved user.question item state: %+v", approvedItem)
+	}
+
+	// 4. AnswerInboxQuestion records explicit chosen option and marks linked timeline event completed without CanRestore
+	beforeCount := len(afterApprove.InboxItems)
+	afterAnswer, err := svc.AnswerInboxQuestion(ctx, "inbox-uq-legacy", "先不动，继续观察")
+	if err != nil {
+		t.Fatalf("AnswerInboxQuestion failed: %v", err)
+	}
+	if len(afterAnswer.InboxItems) != beforeCount {
+		t.Fatalf("expected no duplicate Inbox item queued on AnswerInboxQuestion, before=%d after=%d", beforeCount, len(afterAnswer.InboxItems))
+	}
+	var legacyItem *types.InboxApprovalItem
+	for i := range afterAnswer.InboxItems {
+		if afterAnswer.InboxItems[i].ID == "inbox-uq-legacy" {
+			legacyItem = &afterAnswer.InboxItems[i]
+			break
+		}
+	}
+	if legacyItem == nil || legacyItem.Status != "approved" || legacyItem.SelectedOption != "先不动，继续观察" || legacyItem.Reversible7d {
+		t.Fatalf("unexpected answered user.question item: %+v", legacyItem)
+	}
+	var linkedEvt *types.TimelineEvent
+	for i := range afterAnswer.TimelineEvents {
+		if afterAnswer.TimelineEvents[i].ID == "evt-uq-legacy" {
+			linkedEvt = &afterAnswer.TimelineEvents[i]
+			break
+		}
+	}
+	if linkedEvt == nil || linkedEvt.Status != "completed" || linkedEvt.CanRestore || !strings.Contains(linkedEvt.Summary, "先不动，继续观察") {
+		t.Fatalf("unexpected linked timeline event after AnswerInboxQuestion: %+v", linkedEvt)
 	}
 }

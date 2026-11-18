@@ -1,7 +1,8 @@
 import React from "react";
 import type { TimelineEvent } from "../../types/valet";
+import { isFileCleanupTimelineEvent } from "../../utils/inbox";
 import { EventChip, PluginTag, StatusPill } from "../ui/Badge";
-import { CheckIcon, CloseIcon, WarningTriangleIcon } from "../ui/Icons";
+import { ChatQuoteIcon, CheckIcon, CloseIcon, WarningTriangleIcon } from "../ui/Icons";
 
 interface TimelineRowProps {
   event: TimelineEvent;
@@ -14,6 +15,7 @@ interface TimelineRowProps {
   onExecutePending: () => void;
   onFixAuth: (pluginId: string) => void;
   onRestore: () => void;
+  onQuoteToChat: () => void;
 }
 
 export const TimelineRow: React.FC<TimelineRowProps> = ({
@@ -27,11 +29,16 @@ export const TimelineRow: React.FC<TimelineRowProps> = ({
   onExecutePending,
   onFixAuth,
   onRestore,
+  onQuoteToChat,
 }) => {
   const staggerDelay = Math.min(index, 6) * 40;
+  const isQuestion =
+    event.eventCode === "user.question" || Array.isArray(event.payload?.options);
+  const isFileCleanup = isFileCleanupTimelineEvent(event);
 
   return (
     <div
+      data-timeline-event-id={event.id}
       onClick={onOpenDetail}
       style={{ animationDelay: `${staggerDelay}ms` }}
       className={`animate-valet-timeline-in group flex cursor-pointer rounded-[10px] transition-colors ${
@@ -206,14 +213,14 @@ export const TimelineRow: React.FC<TimelineRowProps> = ({
               onClick={onOpenDetail}
               className="inline-flex h-[28px] shrink-0 cursor-pointer items-center rounded-[7px] border border-[var(--border-strong)] bg-[var(--bg-canvas)] px-3 text-[12px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
             >
-              查看清单
+              {isQuestion ? "查看问题" : isFileCleanup ? "查看清单" : "查看详情"}
             </button>
             <button
               type="button"
-              onClick={onExecutePending}
+              onClick={isQuestion ? onOpenDetail : onExecutePending}
               className="inline-flex h-[28px] shrink-0 cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] px-3 text-[12px] font-semibold text-[var(--ink-on-primary)]"
             >
-              清理残留
+              {isQuestion ? "选择方案" : isFileCleanup ? "清理残留" : "批准执行"}
             </button>
           </div>
         )}
@@ -221,21 +228,33 @@ export const TimelineRow: React.FC<TimelineRowProps> = ({
 
       {/* 4. Right status / action lane */}
       <div
-        className={`flex shrink-0 items-start justify-end pt-3.5 pr-2 lg:pt-[18px] lg:pr-3 ${
-          compact ? "w-[76px]" : "w-[82px] lg:w-[108px]"
-        }`}
+        onClick={(e) => e.stopPropagation()}
+        className="flex shrink-0 items-start justify-end gap-1.5 pt-3.5 pr-2 lg:gap-2 lg:pt-[18px] lg:pr-3"
       >
         {event.status === "running" || event.status === "pending_confirm" ? (
           <StatusPill status={event.status} />
         ) : (
-          <span
-            className={`text-[11px] font-medium text-[var(--ink-primary)] transition-opacity lg:text-[12px] ${
-              isSelected ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+          <button
+            type="button"
+            onClick={onOpenDetail}
+            className={`inline-flex h-[24px] cursor-pointer items-center text-[11px] font-medium text-[var(--ink-primary)] transition-opacity lg:text-[12px] ${
+              isSelected ? "opacity-100" : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
             }`}
           >
             {compact ? "详情 →" : "查看详情 →"}
-          </span>
+          </button>
         )}
+
+        <button
+          type="button"
+          onClick={onQuoteToChat}
+          title="引用到对话 (Chat)"
+          aria-label={`引用「${event.title}」到对话`}
+          className="inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2 text-[11px] font-medium text-[var(--ink-secondary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+        >
+          <ChatQuoteIcon size={11.5} className="shrink-0 text-[var(--ink-muted)]" />
+          <span>引用</span>
+        </button>
       </div>
     </div>
   );

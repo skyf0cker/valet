@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useValet } from "../../store/ValetContext";
 import type { TimelineStatus } from "../../types/valet";
 import { SearchIcon } from "../ui/Icons";
@@ -9,6 +9,8 @@ import { TimelineRow } from "./TimelineRow";
 
 type StatusFilter = "all" | TimelineStatus;
 
+let lastConsumedTimelineFocusTick = 0;
+
 export const TimelineView: React.FC = () => {
   const {
     state,
@@ -16,16 +18,19 @@ export const TimelineView: React.FC = () => {
     arrivalNotice,
     clearArrivalNotice,
     setCommandPaletteOpen,
+    timelineFocusSignal,
     selectTimelineEvent,
     setTimelinePluginFilter,
     executeTimelineEventActions,
     fixPluginAuth,
     restoreTimelineEvent,
+    quoteTimelineEventToChat,
   } = useValet();
 
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [showEarlier, setShowEarlier] = useState(false);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const pendingScrollEventIdRef = useRef<string | null>(null);
 
   const todayEvents = useMemo(
     () => state.timelineEvents.filter((e) => e.dayGroup === "today"),
@@ -93,6 +98,44 @@ export const TimelineView: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [earlierEvents, statusFilter, state.timelinePluginFilter]
   );
+
+  useEffect(() => {
+    if (!timelineFocusSignal || timelineFocusSignal.tick === lastConsumedTimelineFocusTick) {
+      return;
+    }
+    const targetEvt = state.timelineEvents.find((e) => e.id === timelineFocusSignal.eventId);
+    if (!targetEvt) return;
+    lastConsumedTimelineFocusTick = timelineFocusSignal.tick;
+    pendingScrollEventIdRef.current = targetEvt.id;
+
+    if (statusFilter !== "all" && statusFilter !== targetEvt.status) {
+      setStatusFilter("all");
+    }
+    if (targetEvt.dayGroup === "earlier") {
+      setShowEarlier(true);
+    }
+  }, [state.timelineEvents, statusFilter, timelineFocusSignal]);
+
+  useEffect(() => {
+    const targetId = pendingScrollEventIdRef.current;
+    const container = scrollContainerRef.current;
+    if (!targetId || !container) return;
+
+    const rows = container.querySelectorAll<HTMLElement>("[data-timeline-event-id]");
+    let matched: HTMLElement | null = null;
+    for (const row of rows) {
+      if (row.dataset.timelineEventId === targetId) {
+        matched = row;
+        break;
+      }
+    }
+    if (!matched) return;
+    pendingScrollEventIdRef.current = null;
+    const raf = window.requestAnimationFrame(() => {
+      matched.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [filteredEarlier, filteredToday, showEarlier, statusFilter, timelineFocusSignal]);
 
   const filterChips: Array<{
     id: StatusFilter;
@@ -251,6 +294,7 @@ export const TimelineView: React.FC = () => {
                   onExecutePending={() => executeTimelineEventActions(evt.id)}
                   onFixAuth={(pid) => fixPluginAuth(pid)}
                   onRestore={() => restoreTimelineEvent(evt.id)}
+                  onQuoteToChat={() => quoteTimelineEventToChat(evt.id)}
                 />
               ))
             )}
@@ -287,6 +331,7 @@ export const TimelineView: React.FC = () => {
                         onExecutePending={() => executeTimelineEventActions(evt.id)}
                         onFixAuth={(pid) => fixPluginAuth(pid)}
                         onRestore={() => restoreTimelineEvent(evt.id)}
+                        onQuoteToChat={() => quoteTimelineEventToChat(evt.id)}
                       />
                     ))}
                   </div>

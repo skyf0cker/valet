@@ -43,11 +43,16 @@ export interface InboxApprovalItem {
   processedAt?: string;
   linkedTimelineEventId?: string;
   triggerLatencyLabel?: string;
-  payload: Record<string, string | number | boolean>;
+  payload: Record<string, unknown>;
   reasoning: string;
   actionItems: TimelineActionItem[];
   traceSteps: TraceStep[];
   logs: LogLine[];
+  toolName?: string;
+  toolArgs?: Record<string, unknown>;
+  options?: string[];
+  selectedOption?: string;
+  sourceChatId?: string;
 }
 
 export interface MonitoringThresholds {
@@ -251,7 +256,7 @@ export interface TimelineEvent {
   confirmBannerText?: string;
   authFixPluginId?: string;
   triggerLatencyLabel?: string;
-  payload: Record<string, string | number | boolean>;
+  payload: Record<string, unknown>;
   reasoning: string;
   actionItems: TimelineActionItem[];
   traceSteps: TraceStep[];
@@ -286,7 +291,8 @@ export interface PluginDraftSpec {
 
 export interface ChatAttachment {
   id: string;
-  kind: "image" | "file" | "screen";
+  kind: "image" | "file" | "screen" | "timeline_event" | "inbox_item";
+  refId?: string;
   name: string;
   meta?: string;
   badge?: string;
@@ -450,6 +456,7 @@ export interface HeartbeatRunLog {
 }
 
 export type AppearanceMode = "light" | "dark" | "auto";
+export type DarkThemeId = "obsidian" | "espresso" | "chronometer";
 export type ToneStyle = "formal" | "concise" | "friendly";
 
 export interface SafetyConfirmationChecklist {
@@ -465,6 +472,7 @@ export interface ValetPreferences {
   launchAtLogin: boolean;
   showMenuBarIcon: boolean;
   appearance: AppearanceMode;
+  darkTheme?: DarkThemeId;
   language: string;
   globalHotkey: string[];
   busyMessagePolicy?: BusyMessagePolicy;

@@ -12,17 +12,17 @@ export const DutyPulse: React.FC<DutyPulseProps> = ({ active = true, size = "sm"
   return (
     <span
       className={`relative flex shrink-0 items-center justify-center rounded-full ${outer} ${
-        active ? "bg-[var(--ink-primary)]/10" : "bg-[var(--amber-icon)]/15"
+        active ? "bg-[var(--duty-halo)]" : "bg-[var(--amber-icon)]/15"
       }`}
     >
       {active && (
         <span
-          className={`absolute rounded-full border border-[var(--ink-primary)]/40 ${dot} animate-valet-pulse`}
+          className={`absolute rounded-full border border-[var(--duty-ring)] ${dot} animate-valet-pulse`}
         />
       )}
       <span
         className={`relative rounded-full ${dot} ${
-          active ? "bg-[var(--ink-primary)]" : "bg-[var(--amber-icon)]"
+          active ? "bg-[var(--duty-dot)]" : "bg-[var(--amber-icon)]"
         }`}
       />
     </span>

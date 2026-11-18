@@ -356,7 +356,7 @@ export const PluginsView: React.FC = () => {
                     {/* Type badge */}
                     <div className="w-[64px] shrink-0 lg:w-[72px]">
                       {plugin.source === "core" && (
-                        <span className="inline-flex h-[18px] items-center rounded-[5px] bg-[var(--ink-primary)] px-[6px] text-[10px] font-semibold text-[var(--ink-on-primary)] lg:h-[20px] lg:px-[7px] lg:text-[11px]">
+                        <span className="inline-flex h-[18px] items-center rounded-[5px] border border-[var(--core-badge-border)] bg-[var(--core-badge-bg)] px-[6px] text-[10px] font-semibold text-[var(--core-badge-fg)] lg:h-[20px] lg:px-[7px] lg:text-[11px]">
                           核心
                         </span>
                       )}
@@ -403,7 +403,7 @@ export const PluginsView: React.FC = () => {
                             e.stopPropagation();
                             fixPluginAuth(plugin.id);
                           }}
-                          className="inline-flex h-[24px] cursor-pointer items-center rounded-[7px] border border-[var(--ink-primary)] bg-[var(--bg-elevated)] px-2 text-[11px] font-semibold text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)] lg:h-[26px] lg:px-2.5 lg:text-[12px]"
+                          className="inline-flex h-[24px] cursor-pointer items-center rounded-[7px] border border-[var(--repair-btn-border)] bg-[var(--repair-btn-bg)] px-2 text-[11px] font-semibold text-[var(--repair-btn-fg)] transition-opacity hover:opacity-90 lg:h-[26px] lg:px-2.5 lg:text-[12px]"
                         >
                           修复
                         </button>
