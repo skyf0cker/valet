@@ -51,6 +51,8 @@ type Service struct {
 	mu              sync.Mutex
 	started         bool
 	closed          bool
+	configured      bool
+	configuredOpts  StartOptions
 	opts            StartOptions
 	store           *store.Store
 	client          *sidecar.Client
@@ -74,6 +76,15 @@ func NewService() *Service {
 	}
 }
 
+// ConfigureService registers desktop StartOptions synchronously before the WebView can issue
+// RPC calls, preventing ensureStarted() from racing ahead with DesktopReady=false and nil callbacks.
+func ConfigureService(s *Service, opts StartOptions) {
+	s.mu.Lock()
+	s.configured = true
+	s.configuredOpts = opts
+	s.mu.Unlock()
+}
+
 // StartService opens durable storage, initializes telemetry, and starts the Pi Durable sidecar.
 func StartService(s *Service, opts StartOptions) error {
 	return s.start(opts)
@@ -87,7 +98,29 @@ func CloseService(s *Service) error {
 func (s *Service) start(opts StartOptions) error {
 	s.mu.Lock()
 	if s.started {
+		if s.opts.OnChatStream == nil && opts.OnChatStream != nil {
+			s.opts.OnChatStream = opts.OnChatStream
+		}
+		if s.opts.OnState == nil && opts.OnState != nil {
+			s.opts.OnState = opts.OnState
+		}
+		if s.opts.OnNotify == nil && opts.OnNotify != nil {
+			s.opts.OnNotify = opts.OnNotify
+		}
+		if s.opts.OnSyncTray == nil && opts.OnSyncTray != nil {
+			s.opts.OnSyncTray = opts.OnSyncTray
+		}
+		if s.opts.OnSyncLogin == nil && opts.OnSyncLogin != nil {
+			s.opts.OnSyncLogin = opts.OnSyncLogin
+		}
+		startMetrics := s.opts.OnMetrics == nil && opts.OnMetrics != nil && !s.closed
+		if startMetrics {
+			s.opts.OnMetrics = opts.OnMetrics
+		}
 		s.mu.Unlock()
+		if startMetrics {
+			go s.metricsLoop()
+		}
 		return nil
 	}
 	if opts.HomeDir == "" {
@@ -300,11 +333,15 @@ func (s *Service) close() error {
 func (s *Service) ensureStarted() error {
 	s.mu.Lock()
 	started := s.started
+	opts := StartOptions{DesktopReady: false}
+	if s.configured {
+		opts = s.configuredOpts
+	}
 	s.mu.Unlock()
 	if started {
 		return nil
 	}
-	return s.start(StartOptions{DesktopReady: false})
+	return s.start(opts)
 }
 
 func (s *Service) metricsLoop() {
@@ -601,18 +638,30 @@ func (s *Service) syncSidecarBlocking(ctx context.Context, snap types.ValetSnaps
 }
 
 func (s *Service) emitStateChange(scope string) {
-	if s.opts.OnState != nil {
-		s.opts.OnState(types.StateChangeNotice{Scope: scope})
+	s.mu.Lock()
+	onState := s.opts.OnState
+	s.mu.Unlock()
+	if onState != nil {
+		onState(types.StateChangeNotice{Scope: scope})
 	}
 }
 
 func (s *Service) handleSidecarNotify(method string, params json.RawMessage) {
-	if method == "host.chatStream" && s.opts.OnChatStream != nil {
-		var payload types.ChatStreamPayload
-		if err := json.Unmarshal(params, &payload); err == nil {
-			s.opts.OnChatStream(payload)
-		}
+	if method != "host.chatStream" {
+		return
 	}
+	s.mu.Lock()
+	onChatStream := s.opts.OnChatStream
+	s.mu.Unlock()
+	if onChatStream == nil {
+		return
+	}
+	var payload types.ChatStreamPayload
+	if err := json.Unmarshal(params, &payload); err != nil {
+		fmt.Fprintf(os.Stderr, "[valet] chatStream unmarshal error: %v\n", err)
+		return
+	}
+	onChatStream(payload)
 }
 
 func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, raw json.RawMessage) (any, error) {

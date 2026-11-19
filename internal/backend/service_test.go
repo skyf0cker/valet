@@ -1525,3 +1525,48 @@ func TestUserQuestionInboxNormalizationAndAnswer(t *testing.T) {
 		t.Fatalf("unexpected linked timeline event after AnswerInboxQuestion: %+v", linkedEvt)
 	}
 }
+
+func TestConfigureServicePreservesChatStreamCallbackOnEarlyEnsureStarted(t *testing.T) {
+	tmp := t.TempDir()
+	dataDir := filepath.Join(tmp, "data")
+	homeDir := filepath.Join(tmp, "home")
+	_ = os.MkdirAll(homeDir, 0o755)
+
+	var (
+		mu       sync.Mutex
+		received []types.ChatStreamPayload
+	)
+
+	svc := NewService()
+	opts := StartOptions{
+		DataDir:      dataDir,
+		HomeDir:      homeDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+		OnChatStream: func(p types.ChatStreamPayload) {
+			mu.Lock()
+			received = append(received, p)
+			mu.Unlock()
+		},
+	}
+
+	// Simulate main.go calling ConfigureService synchronously before WebView calls GetSnapshot()
+	// while StartService runs in a background goroutine.
+	ConfigureService(svc, opts)
+	if _, err := svc.GetSnapshot(); err != nil {
+		t.Fatalf("GetSnapshot failed: %v", err)
+	}
+	defer func() { _ = CloseService(svc) }()
+
+	if err := StartService(svc, opts); err != nil {
+		t.Fatalf("StartService failed: %v", err)
+	}
+
+	svc.handleSidecarNotify("host.chatStream", json.RawMessage(`{"chatId":"chat-1","phase":"streaming","partialText":"hello"}`))
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 1 || received[0].ChatID != "chat-1" || received[0].PartialText != "hello" {
+		t.Fatalf("expected chatStream callback to receive payload after early ensureStarted, got %+v", received)
+	}
+}

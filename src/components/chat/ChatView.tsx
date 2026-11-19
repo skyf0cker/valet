@@ -16,7 +16,7 @@ import {
 export const ChatView: React.FC = () => {
   const {
     state,
-    chatStream,
+    chatStreams,
     runningChatIds,
     sidebarCollapsed,
     createNewChat,
@@ -41,8 +41,7 @@ export const ChatView: React.FC = () => {
     activeThreads[0] ??
     state.chatThreads[0];
   const sending = thread ? (runningChatIds[thread.id] ?? 0) > 0 : false;
-  const activeStream =
-    chatStream && thread && chatStream.chatId === thread.id ? chatStream : null;
+  const activeStream = thread ? (chatStreams[thread.id] ?? null) : null;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });

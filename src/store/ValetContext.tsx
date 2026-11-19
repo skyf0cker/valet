@@ -314,6 +314,7 @@ function mergeBackendSnapshot(
 export interface ValetContextValue {
   state: ValetSnapshot;
   chatStream: ChatStreamPayload | null;
+  chatStreams: Record<string, ChatStreamPayload>;
   runningChatIds: Record<string, number>;
   queuedMessages: Record<string, QueuedChatMessage[]>;
   toasts: ToastMessage[];
@@ -455,7 +456,17 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const stateRef = useRef<ValetSnapshot>(state);
   stateRef.current = state;
 
-  const [chatStream, setChatStream] = useState<ChatStreamPayload | null>(null);
+  const [chatStreams, setChatStreams] = useState<Record<string, ChatStreamPayload>>({});
+  const chatStream = useMemo<ChatStreamPayload | null>(() => {
+    const active = state.activeChatId ? chatStreams[state.activeChatId] : undefined;
+    if (active) return active;
+    const all = Object.values(chatStreams);
+    if (all.length === 0) return null;
+    const foreground = all.find(
+      (s) => !s.chatId.startsWith("event:") && !s.chatId.startsWith("heartbeat")
+    );
+    return foreground ?? all[all.length - 1] ?? null;
+  }, [chatStreams, state.activeChatId]);
   const [runningChatIds, setRunningChatIds] = useState<Record<string, number>>({});
   const runningChatCountRef = useRef<Record<string, number>>({});
   const [queuedMessages, setQueuedMessages] = useState<Record<string, QueuedChatMessage[]>>({});
@@ -555,7 +566,16 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     });
 
     const offChatStream = events.chatStream.on((payload) => {
-      setChatStream(payload.phase === "done" || payload.phase === "error" ? null : payload);
+      if (!payload?.chatId) return;
+      setChatStreams((prev) => {
+        if (payload.phase === "done" || payload.phase === "error") {
+          if (!(payload.chatId in prev)) return prev;
+          const next = { ...prev };
+          delete next[payload.chatId];
+          return next;
+        }
+        return { ...prev, [payload.chatId]: payload };
+      });
     });
 
     const offStateChanged = events.stateChanged.on(() => {
@@ -2611,7 +2631,12 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       } finally {
         const remaining = bumpRun(-1);
         if (remaining === 0) {
-          setChatStream((cur) => (cur?.chatId === chatId ? null : cur));
+          setChatStreams((prev) => {
+            if (!(chatId in prev)) return prev;
+            const next = { ...prev };
+            delete next[chatId];
+            return next;
+          });
           if (abortedChatRef.current[chatId]) {
             delete abortedChatRef.current[chatId];
           } else {
@@ -3178,6 +3203,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     () => ({
       state,
       chatStream,
+      chatStreams,
       queuedMessages,
       runningChatIds,
       toasts,
@@ -3280,6 +3306,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       archiveChatThread,
       arrivalNotice,
       chatStream,
+      chatStreams,
       queuedMessages,
       runningChatIds,
       clearArrivalNotice,

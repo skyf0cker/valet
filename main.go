@@ -130,40 +130,43 @@ func main() {
 			log.Printf("[valet] shortcut Alt+Escape register skipped: %v", err)
 		}
 
+		startOpts := backend.StartOptions{
+			DesktopReady: true,
+			WatchDir:     watchDirWithMyGo,
+			OnSyncTray:   syncTray,
+			OnSyncLogin: func(launchAtLogin bool) {
+				if err := mygo.App.SetOpenAtLogin(launchAtLogin); err != nil {
+					log.Printf("[valet] SetOpenAtLogin(%v) failed: %v", launchAtLogin, err)
+				}
+			},
+			OnNotify: func(_kind, title, subtitle, body string) {
+				if !mygo.NotificationsSupported() {
+					return
+				}
+				n := mygo.NewNotification(mygo.NotificationOptions{
+					Title:    title,
+					Subtitle: subtitle,
+					Body:     body,
+					Group:    "valet.events",
+				})
+				if err := n.Show(); err != nil {
+					log.Printf("[valet] notification show failed: %v", err)
+				}
+			},
+			OnChatStream: func(payload types.ChatStreamPayload) {
+				_ = ChatStreamEvent.Emit(win, payload)
+			},
+			OnMetrics: func(m types.SystemMetrics) {
+				_ = MetricsUpdatedEvent.Emit(win, m)
+			},
+			OnState: func(n types.StateChangeNotice) {
+				_ = StateChangedEvent.Emit(win, n)
+			},
+		}
+		backend.ConfigureService(svc, startOpts)
+
 		go func() {
-			if err := backend.StartService(svc, backend.StartOptions{
-				DesktopReady: true,
-				WatchDir:     watchDirWithMyGo,
-				OnSyncTray:   syncTray,
-				OnSyncLogin: func(launchAtLogin bool) {
-					if err := mygo.App.SetOpenAtLogin(launchAtLogin); err != nil {
-						log.Printf("[valet] SetOpenAtLogin(%v) failed: %v", launchAtLogin, err)
-					}
-				},
-				OnNotify: func(_kind, title, subtitle, body string) {
-					if !mygo.NotificationsSupported() {
-						return
-					}
-					n := mygo.NewNotification(mygo.NotificationOptions{
-						Title:    title,
-						Subtitle: subtitle,
-						Body:     body,
-						Group:    "valet.events",
-					})
-					if err := n.Show(); err != nil {
-						log.Printf("[valet] notification show failed: %v", err)
-					}
-				},
-				OnChatStream: func(payload types.ChatStreamPayload) {
-					_ = ChatStreamEvent.Emit(win, payload)
-				},
-				OnMetrics: func(m types.SystemMetrics) {
-					_ = MetricsUpdatedEvent.Emit(win, m)
-				},
-				OnState: func(n types.StateChangeNotice) {
-					_ = StateChangedEvent.Emit(win, n)
-				},
-			}); err != nil {
+			if err := backend.StartService(svc, startOpts); err != nil {
 				log.Printf("[valet] backend start failed: %v", err)
 			}
 		}()

@@ -754,58 +754,63 @@ export class ValetDurableRuntime {
 
       watch.start(async (call) => {
         if (call.kind !== "value") return;
-        collectEntriesIntoStepMap(call.value.entries);
+        try {
+          const prevStepCount = stepMap.size;
+          collectEntriesIntoStepMap(call.value.entries);
 
-        const live = call.value.docs["pi.live"] as LiveState | undefined;
-        if (!live) return;
-
-        let rawPartialText = "";
-        const partialMsg = live.generation?.message;
-        if (partialMsg && Array.isArray(partialMsg.content)) {
-          for (const block of partialMsg.content) {
-            if (block.type === "text") rawPartialText += block.text;
+          const live = call.value.docs["pi.live"] as LiveState | undefined;
+          if (!live && stepMap.size === prevStepCount && stepMap.size === 0 && !lastPartialText) {
+            return;
           }
-        }
 
-        const { cleanText: cleanPartialText } = stripThinkTags(rawPartialText);
-        if (cleanPartialText) {
-          lastPartialText = cleanPartialText;
-        }
+          let rawPartialText = "";
+          const partialMsg = live?.generation?.message;
+          if (partialMsg && Array.isArray(partialMsg.content)) {
+            for (const block of partialMsg.content) {
+              if (block.type === "text") rawPartialText += block.text;
+            }
+          }
 
-        for (const slot of live.tools ?? []) {
-          const prev = stepMap.get(slot.callId);
-          const status =
-            prev?.status === "done" || prev?.status === "error"
-              ? prev.status
-              : slot.status === "done"
-                ? "done"
-                : slot.status === "running"
-                  ? "running"
-                  : "pending";
-          stepMap.set(slot.callId, {
-            id: slot.callId,
-            name: slot.name,
-            label: prev?.label || humanizeToolStepLabel(slot.name),
-            status,
-            detail:
-              prev?.detail ||
-              (slot.output ? summarizeToolOutput(slot.output) : undefined),
-          });
-        }
+          const { cleanText: cleanPartialText } = stripThinkTags(rawPartialText);
+          if (cleanPartialText) {
+            lastPartialText = cleanPartialText;
+          }
 
-        const steps = [...stepMap.values()];
-        lastThinkingText = summarizeStreamStatus(
-          steps,
-          Boolean(cleanPartialText),
-        );
-        lastPhase = steps.some(
-          (s) => s.status === "running" || s.status === "pending",
-        )
-          ? "tools"
-          : cleanPartialText
-            ? "streaming"
-            : "thinking";
-        emitStream();
+          for (const slot of live?.tools ?? []) {
+            const prev = stepMap.get(slot.callId);
+            const status =
+              prev?.status === "done" || prev?.status === "error"
+                ? prev.status
+                : slot.status === "done"
+                  ? "done"
+                  : slot.status === "running"
+                    ? "running"
+                    : "pending";
+            stepMap.set(slot.callId, {
+              id: slot.callId,
+              name: slot.name,
+              label: prev?.label || humanizeToolStepLabel(slot.name),
+              status,
+              detail:
+                prev?.detail ||
+                (slot.output ? summarizeToolOutput(slot.output) : undefined),
+            });
+          }
+
+          const steps = [...stepMap.values()];
+          const hasText = Boolean(cleanPartialText || lastPartialText);
+          lastThinkingText = summarizeStreamStatus(steps, hasText);
+          lastPhase = steps.some(
+            (s) => s.status === "running" || s.status === "pending",
+          )
+            ? "tools"
+            : hasText
+              ? "streaming"
+              : "thinking";
+          emitStream();
+        } catch (err) {
+          console.error("[sidecar] watch stream error:", err);
+        }
       });
 
       this.permissionCoordinator.recordUserIntent(req.chatId, req.prompt);
