@@ -2,6 +2,9 @@ import { describe, expect, it } from "bun:test";
 import {
   AutoReviewEvaluator,
   type FetchLike,
+  JEV_MIN_BLOCK_CONFIDENCE,
+  JEV_RISK_THRESHOLDS,
+  LLM_MIN_ASK_CONFIDENCE,
   isGeminiDecisionModel,
   isGoogleDecisionsEndpoint,
   normalizeJevEndpoint,
@@ -299,7 +302,7 @@ describe("AutoReviewEvaluator Google Decisions & Jev support", () => {
     expect(askRes.approved).toBe(false);
     expect(askRes.engine).toBe("jev");
     expect(askRes.scores?.harmful).toBe(0.91);
-    expect(askRes.reason).toContain("harmful=0.91>0.65");
+    expect(askRes.reason).toContain("harmful=0.91>0.80");
 
     // 3. Reuses gemini provider apiKey when jevApiKey is empty (non-local command goes to Google Decisions)
     nextHarmful = 0.02;
@@ -675,5 +678,194 @@ describe("AutoReviewEvaluator Google Decisions & Jev support", () => {
     });
     expect(restored.approved).toBe(true);
     expect(capturedBodies.length).toBe(countBefore3 + 4);
+  });
+
+  it("includes diagnostic prompt guidance and filters borderline or low-confidence blocks", async () => {
+    const capturedBodies: Array<Record<string, unknown>> = [];
+    let mockAnswers: Record<
+      string,
+      { type: string; noul: number; confidence?: number }
+    > = {
+      harmful: { type: "noul", noul: 0.72, confidence: 0.95 },
+      sensitive: { type: "noul", noul: 0.7, confidence: 0.95 },
+      untrusted: { type: "noul", noul: 0.68, confidence: 0.95 },
+      obscured: { type: "noul", noul: 0.79, confidence: 0.95 },
+    };
+
+    const mockFetch: FetchLike = async (_input, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<
+        string,
+        unknown
+      >;
+      capturedBodies.push(body);
+      return new Response(
+        JSON.stringify({ answers: mockAnswers }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+
+    const evaluator = new AutoReviewEvaluator(new ValetModelManager(), mockFetch);
+    const state = makeTestState();
+    state.preferences.autoReview = baseAutoReviewCfg({
+      engine: "jev",
+      jevEndpoint: "https://generativelanguage.googleapis.com/v1beta/decisions",
+      jevApiKey: "AIza-confidence-filter-test",
+      jevModel: "gemini-decision-1",
+    });
+
+    expect(JEV_RISK_THRESHOLDS.harmful).toBe(0.8);
+    expect(JEV_RISK_THRESHOLDS.obscured).toBe(0.85);
+    expect(JEV_MIN_BLOCK_CONFIDENCE).toBe(0.8);
+    expect(LLM_MIN_ASK_CONFIDENCE).toBe(0.8);
+
+    // 1. Borderline scores below raised thresholds are allowed + inspect prompt guidance
+    const borderlineRes = await evaluator.evaluate({
+      toolName: "bash",
+      args: {
+        command:
+          "which valet; readlink -f $(which valet) 2>/dev/null; echo ---; ls /Applications | grep -i valet",
+      },
+      state,
+      isForeground: true,
+      userIntent: "看下怎么配置 exa mcp 的 auth token",
+      bypassCache: true,
+    });
+    expect(borderlineRes.approved).toBe(true);
+    expect(borderlineRes.engine).toBe("jev");
+
+    const questions = capturedBodies[0]!.questions as Record<
+      string,
+      { criteria?: Record<string, string> }
+    >;
+    const harmfulFalse = questions.harmful?.criteria?.false_description ?? "";
+    const obscuredFalse = questions.obscured?.criteria?.false_description ?? "";
+    expect(harmfulFalse).toContain("Read-only diagnostics");
+    expect(harmfulFalse).toContain("2>/dev/null");
+    expect(harmfulFalse).toContain("$(which ...)");
+    expect(harmfulFalse).toContain("/Applications");
+    expect(obscuredFalse).toContain("$(which ...)");
+    expect(obscuredFalse).toContain("2>/dev/null");
+    expect(obscuredFalse).toContain("/Applications");
+
+    // 2. High-confidence obscured above threshold (>0.85, conf=0.92) blocks
+    mockAnswers = {
+      harmful: { type: "noul", noul: 0.1, confidence: 0.98 },
+      sensitive: { type: "noul", noul: 0.1, confidence: 0.98 },
+      untrusted: { type: "noul", noul: 0.1, confidence: 0.98 },
+      obscured: { type: "noul", noul: 0.88, confidence: 0.92 },
+    };
+    const highConfObscured = await evaluator.evaluate({
+      toolName: "bash",
+      args: { command: "obscured-cmd" },
+      state,
+      isForeground: true,
+      bypassCache: true,
+    });
+    expect(highConfObscured.approved).toBe(false);
+    expect(highConfObscured.reason).toContain("obscured=0.88>0.85(conf=0.92)");
+
+    // 3. Explicit low-confidence flag (<0.80) is filtered out & does not trip circuit breaker
+    mockAnswers = {
+      harmful: { type: "noul", noul: 0.88, confidence: 0.62 },
+      sensitive: { type: "noul", noul: 0.05, confidence: 0.95 },
+      untrusted: { type: "noul", noul: 0.05, confidence: 0.95 },
+      obscured: { type: "noul", noul: 0.05, confidence: 0.95 },
+    };
+    for (let i = 0; i < 4; i += 1) {
+      const lowConfRes = await evaluator.evaluate({
+        toolName: "bash",
+        args: { command: `low-conf-cmd-${i}` },
+        state,
+        isForeground: true,
+        chatId: "chat-low-conf",
+        bypassCache: true,
+      });
+      expect(lowConfRes.approved).toBe(true);
+      expect(lowConfRes.reason).toContain("已忽略低置信拦截");
+      expect(lowConfRes.reason).toContain("harmful=0.88(conf=0.62<0.80)");
+    }
+
+    // 4. Missing confidence (TypeSafe /v1/systemone compatibility) still blocks when score > threshold
+    mockAnswers = {
+      harmful: { type: "noul", noul: 0.88 },
+      sensitive: { type: "noul", noul: 0.05 },
+      untrusted: { type: "noul", noul: 0.05 },
+      obscured: { type: "noul", noul: 0.05 },
+    };
+    const missingConfRes = await evaluator.evaluate({
+      toolName: "bash",
+      args: { command: "missing-conf-risky" },
+      state,
+      isForeground: true,
+      bypassCache: true,
+    });
+    expect(missingConfRes.approved).toBe(false);
+    expect(missingConfRes.reason).toContain("harmful=0.88>0.80");
+
+    // 5. Small-LLM fallback confidence and low-risk filtering
+    let nextLlmReply = "";
+    const models = new ValetModelManager();
+    models.completeReviewPrompt = async () => ({
+      ok: true,
+      modelLabel: "mock-small-reviewer",
+      text: nextLlmReply,
+      latencyMs: 12,
+    });
+    const llmEvaluator = new AutoReviewEvaluator(models, mockFetch);
+    const llmState = makeTestState();
+    llmState.preferences.autoReview = baseAutoReviewCfg({
+      engine: "llm",
+      fallbackModel: "mock-small-reviewer",
+    });
+
+    nextLlmReply =
+      '{"decision":"ask","risk":"medium","confidence":0.55,"reason":"命令含重定向"}';
+    const llmLowConf = await llmEvaluator.evaluate({
+      toolName: "bash",
+      args: { command: "ls /Applications 2>/dev/null" },
+      state: llmState,
+      isForeground: true,
+      bypassCache: true,
+    });
+    expect(llmLowConf.approved).toBe(true);
+    expect(llmLowConf.engine).toBe("llm");
+    expect(llmLowConf.reason).toContain("conf=0.55<0.80");
+
+    nextLlmReply =
+      '{"decision":"ask","risk":"low","confidence":0.95,"reason":"仅只读探测"}';
+    const llmLowRisk = await llmEvaluator.evaluate({
+      toolName: "bash",
+      args: { command: "which valet" },
+      state: llmState,
+      isForeground: true,
+      bypassCache: true,
+    });
+    expect(llmLowRisk.approved).toBe(true);
+    expect(llmLowRisk.reason).toContain("risk=low");
+
+    nextLlmReply =
+      '{"decision":"ask","risk":"high","confidence":0.93,"reason":"删除用户数据"}';
+    const llmHighConf = await llmEvaluator.evaluate({
+      toolName: "bash",
+      args: { command: "rm -rf ~/work" },
+      state: llmState,
+      isForeground: true,
+      bypassCache: true,
+    });
+    expect(llmHighConf.approved).toBe(false);
+    expect(llmHighConf.reason).toContain("conf=0.93");
+    expect(llmHighConf.reason).toContain("删除用户数据");
+
+    nextLlmReply =
+      '{"decision":"ask","risk":"high","reason":"无置信度字段的高危拦截"}';
+    const llmMissingConf = await llmEvaluator.evaluate({
+      toolName: "bash",
+      args: { command: "rm -rf ~/work2" },
+      state: llmState,
+      isForeground: true,
+      bypassCache: true,
+    });
+    expect(llmMissingConf.approved).toBe(false);
+    expect(llmMissingConf.reason).toContain("无置信度字段的高危拦截");
   });
 });
