@@ -71,6 +71,19 @@ type ChatSendResponse struct {
 	ProviderUsed     string            `json:"providerUsed"`
 }
 
+// GenerateTitleRequest asks the sidecar fast model to synthesize a concise session title.
+type GenerateTitleRequest struct {
+	ChatID      string                 `json:"chatId"`
+	Prompt      string                 `json:"prompt"`
+	Attachments []types.ChatAttachment `json:"attachments,omitempty"`
+}
+
+// GenerateTitleResponse returns the generated session title and model identifier.
+type GenerateTitleResponse struct {
+	Title     string `json:"title"`
+	UsedModel string `json:"usedModel,omitempty"`
+}
+
 // PluginEventRequest dispatches a real or simulated plugin event into Pi Durable.
 type PluginEventRequest struct {
 	PluginID  string         `json:"pluginId"`

@@ -1255,6 +1255,102 @@ export class ValetModelManager {
     return Boolean(targetProvider && !isMockOrEmptyKey(targetProvider));
   }
 
+  private async runSimplePrompt(
+    targetProvider: AgentProviderConfig,
+    requestedModelId: string,
+    systemPrompt: string,
+    userPrompt: string,
+    options: {
+      maxTokens: number;
+      timeoutMs: number;
+      emptyCatalogError: string;
+      upstreamErrorLabel: string;
+    },
+  ): Promise<{
+    ok: boolean;
+    modelLabel: string;
+    text: string;
+    latencyMs: number;
+    error?: string;
+  }> {
+    const piId = toPiProviderId(targetProvider.id);
+    const catalog = this.models
+      .getModels(piId)
+      .filter((m) => !m.id.startsWith("~"));
+    if (catalog.length === 0) {
+      return {
+        ok: false,
+        modelLabel: `${piId}/none`,
+        text: "",
+        latencyMs: 0,
+        error: options.emptyCatalogError,
+      };
+    }
+
+    const stripped = requestedModelId.replace(/^[^/]+\//, "");
+    const matched =
+      catalog.find((m) => m.id === requestedModelId) ??
+      catalog.find((m) => m.id === stripped) ??
+      catalog.find((m) => m.id.startsWith(stripped) || m.id.includes(stripped));
+    const model =
+      matched ??
+      (requestedModelId
+        ? { ...catalog[0]!, id: requestedModelId, name: requestedModelId }
+        : catalog[0]!);
+
+    const start = Date.now();
+    try {
+      const msg = await this.models.completeSimple(
+        model,
+        {
+          systemPrompt,
+          messages: [
+            {
+              role: "user",
+              content: userPrompt,
+              timestamp: Date.now(),
+            },
+          ],
+        },
+        {
+          maxTokens: options.maxTokens,
+          signal: AbortSignal.timeout(options.timeoutMs),
+        },
+      );
+      const latencyMs = Math.max(1, Date.now() - start);
+      if (msg.stopReason === "error" || msg.errorMessage) {
+        return {
+          ok: false,
+          modelLabel: `${model.provider}/${model.id}`,
+          text: "",
+          latencyMs,
+          error: msg.errorMessage || options.upstreamErrorLabel,
+        };
+      }
+      const replyText = msg.content
+        .filter((b): b is { type: "text"; text: string } => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "")
+        .replace(/<think(?:ing)?>[\s\S]*$/gi, "")
+        .trim();
+      return {
+        ok: true,
+        modelLabel: `${model.provider}/${model.id}`,
+        text: replyText,
+        latencyMs,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        modelLabel: `${model.provider}/${model.id}`,
+        text: "",
+        latencyMs: Math.max(1, Date.now() - start),
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
   /**
    * Resolves whether a live non-mock small LLM is available for Auto Review fallback
    * and executes a single structured review prompt without using `valet-local`.
@@ -1284,82 +1380,78 @@ export class ValetModelManager {
       };
     }
 
-    const piId = toPiProviderId(targetProvider.id);
-    const catalog = this.models
-      .getModels(piId)
-      .filter((m) => !m.id.startsWith("~"));
-    if (catalog.length === 0) {
-      return {
-        ok: false,
-        modelLabel: `${piId}/none`,
-        text: "",
-        latencyMs: 0,
-        error: `服务商 ${targetProvider.name} 暂无可用模型`,
-      };
-    }
-
     const rawFallback = ar?.fallbackModel?.trim() ?? "";
     const requestedModelId =
       !rawFallback || rawFallback === "同快速模型"
         ? state.preferences.models.fast || state.preferences.models.primary
         : rawFallback;
-    const stripped = requestedModelId.replace(/^[^/]+\//, "");
-    const matched =
-      catalog.find((m) => m.id === requestedModelId) ??
-      catalog.find((m) => m.id === stripped) ??
-      catalog.find((m) => m.id.startsWith(stripped) || m.id.includes(stripped));
-    const model =
-      matched ??
-      (requestedModelId
-        ? { ...catalog[0]!, id: requestedModelId, name: requestedModelId }
-        : catalog[0]!);
 
-    const start = Date.now();
-    try {
-      const msg = await this.models.completeSimple(
-        model,
-        {
-          systemPrompt,
-          messages: [
-            {
-              role: "user",
-              content: userPrompt,
-              timestamp: Date.now(),
-            },
-          ],
-        },
-        { maxTokens: 512, signal: AbortSignal.timeout(10_000) },
-      );
-      const latencyMs = Math.max(1, Date.now() - start);
-      if (msg.stopReason === "error" || msg.errorMessage) {
-        return {
-          ok: false,
-          modelLabel: `${model.provider}/${model.id}`,
-          text: "",
-          latencyMs,
-          error: msg.errorMessage || "审查模型返回错误",
-        };
-      }
-      const replyText = msg.content
-        .filter((b): b is { type: "text"; text: string } => b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-        .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "")
-        .trim();
-      return {
-        ok: true,
-        modelLabel: `${model.provider}/${model.id}`,
-        text: replyText,
-        latencyMs,
-      };
-    } catch (err) {
+    return this.runSimplePrompt(
+      targetProvider,
+      requestedModelId,
+      systemPrompt,
+      userPrompt,
+      {
+        maxTokens: 512,
+        timeoutMs: 10_000,
+        emptyCatalogError: `服务商 ${targetProvider.name} 暂无可用模型`,
+        upstreamErrorLabel: "审查模型返回错误",
+      },
+    );
+  }
+
+  /**
+   * Executes a single lightweight completion using the configured fast model (or primary model fallback).
+   */
+  async completeFastPrompt(
+    state: ValetSyncState,
+    systemPrompt: string,
+    userPrompt: string,
+    options?: { maxTokens?: number; timeoutMs?: number },
+  ): Promise<{
+    ok: boolean;
+    modelLabel: string;
+    text: string;
+    latencyMs: number;
+    error?: string;
+  }> {
+    const active =
+      this.providerConfigs.find(
+        (p) => p.id === state.preferences.activeProviderId,
+      ) ??
+      state.providers.find((p) => p.id === state.preferences.activeProviderId);
+    const targetProvider =
+      active && !isMockOrEmptyKey(active)
+        ? active
+        : this.providerConfigs.find(
+            (p) => p.connected && !isMockOrEmptyKey(p),
+          ) ??
+          state.providers.find((p) => p.connected && !isMockOrEmptyKey(p));
+
+    if (!targetProvider || isMockOrEmptyKey(targetProvider)) {
       return {
         ok: false,
-        modelLabel: `${model.provider}/${model.id}`,
+        modelLabel: "unconfigured",
         text: "",
-        latencyMs: Math.max(1, Date.now() - start),
-        error: err instanceof Error ? err.message : String(err),
+        latencyMs: 0,
+        error: "未配置可用模型",
       };
     }
+
+    const requestedModelId =
+      state.preferences.models.fast || state.preferences.models.primary;
+
+    return this.runSimplePrompt(
+      targetProvider,
+      requestedModelId,
+      systemPrompt,
+      userPrompt,
+      {
+        maxTokens: options?.maxTokens ?? 64,
+        timeoutMs: options?.timeoutMs ?? 12_000,
+        emptyCatalogError: `服务商 ${targetProvider.name} 暂无可用模型`,
+        upstreamErrorLabel: "快速模型返回错误",
+      },
+    );
   }
 }

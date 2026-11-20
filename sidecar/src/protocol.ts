@@ -571,6 +571,17 @@ export interface AnswerInboxQuestionResponse {
   providerUsed: string;
 }
 
+export interface GenerateTitleRequest {
+  chatId: string;
+  prompt: string;
+  attachments?: ChatAttachment[];
+}
+
+export interface GenerateTitleResponse {
+  title: string;
+  usedModel?: string;
+}
+
 /** Bridge interface allowing durable tools & hooks to invoke Go host capabilities. */
 export interface HostBridge {
   callHost<TResult = unknown>(

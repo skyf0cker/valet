@@ -65,7 +65,10 @@ function useSessionLiveStatus(thread: ChatThread | undefined) {
   };
 }
 
-export const InlineSessionChip: React.FC<{ sessionId: string }> = ({ sessionId }) => {
+export const InlineSessionChip: React.FC<{
+  sessionId: string;
+  onRemove?: () => void;
+}> = ({ sessionId, onRemove }) => {
   const { state, openProjectSession, pushToast } = useValet();
   const thread = state.chatThreads.find((t) => t.id === sessionId);
   const status = useSessionLiveStatus(thread);
@@ -80,42 +83,76 @@ export const InlineSessionChip: React.FC<{ sessionId: string }> = ({ sessionId }
           : "未找到";
 
   return (
-    <button
-      type="button"
-      onClick={(e) => {
-        e.stopPropagation();
-        if (!thread) {
-          pushToast("未找到关联会话，可能已被移除", "warning");
-          return;
-        }
-        openProjectSession(thread.id);
-      }}
-      title={thread ? `点击跳转到会话：${thread.title}` : "会话不存在"}
-      className={`mx-1 inline-flex cursor-pointer items-center gap-1.5 rounded-[6px] border px-2 py-[1.5px] align-baseline text-[12px] leading-[16px] transition-colors ${
+    <span
+      data-inline-interactive="true"
+      className={`mx-1 inline-flex items-center overflow-hidden rounded-[6px] border align-baseline text-[12px] leading-[16px] transition-colors ${
         status.kind === "pending"
           ? "border-[var(--amber-border)] bg-[var(--amber-bg)] text-[var(--ink-strong)] hover:border-[var(--amber-pill)]"
-          : "border-[var(--border-control)] bg-[var(--bg-subtle)] text-[var(--ink-strong)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]"
+          : "border-[var(--border-control)] bg-[var(--bg-subtle)] text-[var(--ink-strong)] hover:border-[var(--border-strong)]"
       }`}
     >
-      <span className="flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[4px] bg-[var(--brand-icon-bg)] text-[var(--brand-icon-fg)]">
-        <BowtieSvg size={10} />
-      </span>
-      <span className="max-w-[200px] truncate font-medium">
-        {thread?.title ?? "已移除会话"}
-      </span>
-      <span
-        className={`shrink-0 font-mono text-[10px] ${
-          status.kind === "pending"
-            ? "text-[var(--amber-text)]"
-            : status.kind === "running"
-              ? "text-[var(--ink-primary)]"
-              : "text-[var(--ink-muted)]"
-        }`}
+      <button
+        type="button"
+        onMouseDown={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!thread) {
+            pushToast("未找到关联会话，可能已被移除", "warning");
+            return;
+          }
+          openProjectSession(thread.id);
+        }}
+        onKeyDown={(e) => {
+          if ((e.key === "Backspace" || e.key === "Delete") && onRemove) {
+            e.preventDefault();
+            e.stopPropagation();
+            onRemove();
+          }
+        }}
+        title={thread ? `点击跳转到会话：${thread.title}` : "会话不存在"}
+        className="inline-flex cursor-pointer items-center gap-1.5 px-2 py-[1.5px] transition-colors hover:bg-[var(--bg-hover)] focus:outline-none focus-visible:bg-[var(--bg-hover)]"
       >
-        {shortStatus}
-      </span>
-      <span className="shrink-0 text-[11px] text-[var(--ink-subtle)]">↗</span>
-    </button>
+        <span className="flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[4px] bg-[var(--brand-icon-bg)] text-[var(--brand-icon-fg)]">
+          <BowtieSvg size={10} />
+        </span>
+        <span className="max-w-[200px] truncate font-medium">
+          {thread?.title ?? "已移除会话"}
+        </span>
+        <span
+          className={`shrink-0 font-mono text-[10px] ${
+            status.kind === "pending"
+              ? "text-[var(--amber-text)]"
+              : status.kind === "running"
+                ? "text-[var(--ink-primary)]"
+                : "text-[var(--ink-muted)]"
+          }`}
+        >
+          {shortStatus}
+        </span>
+        <span className="shrink-0 text-[11px] text-[var(--ink-subtle)]">↗</span>
+      </button>
+      {onRemove && (
+        <button
+          type="button"
+          aria-label="移除引用"
+          title="移除引用"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onRemove();
+          }}
+          className="inline-flex cursor-pointer items-center self-stretch border-l border-[var(--border-light)] px-1 text-[var(--ink-subtle)]/75 transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
+        >
+          <CloseIcon size={10} />
+        </button>
+      )}
+    </span>
   );
 };
 
@@ -153,6 +190,11 @@ export const SessionRefBlockCard: React.FC<{
       role="button"
       tabIndex={0}
       onKeyDown={(e) => {
+        if ((e.key === "Backspace" || e.key === "Delete") && onRemove) {
+          e.preventDefault();
+          onRemove();
+          return;
+        }
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           if (thread) openProjectSession(thread.id);

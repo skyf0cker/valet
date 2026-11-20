@@ -143,6 +143,116 @@ export function formatInlineTokensForMarkdown(text: string, threadsById: Map<str
     .replace(/\[\[timeline:([^\]]+)\]\]/g, (_m, id: string) => `[时间线: ${id}]`);
 }
 
+export interface NotebookContextOriginOptions {
+  originBlockId?: string;
+  originSection?: string;
+  originBeforeText?: string;
+  originAfterText?: string;
+}
+
+function toSingleLineSnippet(text: string, maxLen = 42): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (!collapsed) return "";
+  return collapsed.length > maxLen ? `${collapsed.slice(0, maxLen - 1)}…` : collapsed;
+}
+
+function getNotebookBlockTypeLabel(blk: NotebookBlock): string {
+  switch (blk.type) {
+    case "h1":
+      return "一级标题";
+    case "h2":
+      return "二级标题";
+    case "h3":
+      return "三级标题";
+    case "bullet":
+      return "无序列表";
+    case "numbered":
+      return "有序列表";
+    case "todo":
+      return blk.checked ? "已完成待办" : "未完成待办";
+    case "callout":
+      return "提示框";
+    case "quote":
+      return "引用块";
+    case "code":
+      return "代码块";
+    case "divider":
+      return "分割线";
+    case "session_ref":
+      return "关联会话卡片";
+    case "paragraph":
+    default:
+      return "正文段落";
+  }
+}
+
+function formatSingleBlockLines(
+  blk: NotebookBlock,
+  orderedNumber: number,
+  threadsById: Map<string, ChatThread>,
+  overrideText?: string
+): { lines: string[]; trailingBlank: boolean } {
+  const rawText = overrideText ?? blk.content ?? "";
+  const text = blk.type === "code" ? rawText : formatInlineTokensForMarkdown(rawText, threadsById);
+  switch (blk.type) {
+    case "h1":
+      return { lines: [`# ${text}`], trailingBlank: true };
+    case "h2":
+      return { lines: [`## ${text}`], trailingBlank: true };
+    case "h3":
+      return { lines: [`### ${text}`], trailingBlank: true };
+    case "bullet":
+      return { lines: [`- ${text}`], trailingBlank: false };
+    case "numbered":
+      return { lines: [`${orderedNumber}. ${text}`], trailingBlank: false };
+    case "todo":
+      return { lines: [`- [${blk.checked ? "x" : " "}] ${text}`], trailingBlank: false };
+    case "callout":
+      return {
+        lines: ["> [!note]", ...text.split("\n").map((l) => `> ${l}`)],
+        trailingBlank: true,
+      };
+    case "quote":
+      return {
+        lines: text.split("\n").map((l) => `> ${l}`),
+        trailingBlank: true,
+      };
+    case "code":
+      return {
+        lines: [`\`\`\`${blk.language ?? ""}`, rawText, "\`\`\`"],
+        trailingBlank: true,
+      };
+    case "divider":
+      return { lines: ["---"], trailingBlank: true };
+    case "session_ref": {
+      const linked = blk.sessionId ? threadsById.get(blk.sessionId) : undefined;
+      const title = linked?.title || text || "关联会话";
+      const summary = blk.summary || (linked ? extractThreadSummary(linked) : "");
+      return {
+        lines: [
+          `> **@valet 会话：${title}**`,
+          ...(summary ? [`> ${summary}`] : []),
+        ],
+        trailingBlank: true,
+      };
+    }
+    case "paragraph":
+    default:
+      return text.trim()
+        ? { lines: [text], trailingBlank: true }
+        : { lines: [], trailingBlank: false };
+  }
+}
+
+function formatSingleBlockMarkdown(
+  blk: NotebookBlock,
+  orderedNumber: number,
+  threadsById: Map<string, ChatThread>,
+  overrideText?: string
+): string {
+  return formatSingleBlockLines(blk, orderedNumber, threadsById, overrideText).lines.join("\n");
+}
+
 export function blocksToMarkdown(project: Project, threads: ChatThread[]): string {
   const threadsById = new Map(threads.map((t) => [t.id, t]));
   const lines: string[] = [`# ${project.title}`];
@@ -159,53 +269,15 @@ export function blocksToMarkdown(project: Project, threads: ChatThread[]): strin
   for (const blk of project.blocks) {
     if (blk.type !== "numbered") {
       orderedCounter = 0;
+    } else {
+      orderedCounter += 1;
     }
-    const text = formatInlineTokensForMarkdown(blk.content ?? "", threadsById);
-    switch (blk.type) {
-      case "h1":
-        lines.push(`# ${text}`, "");
-        break;
-      case "h2":
-        lines.push(`## ${text}`, "");
-        break;
-      case "h3":
-        lines.push(`### ${text}`, "");
-        break;
-      case "bullet":
-        lines.push(`- ${text}`);
-        break;
-      case "numbered":
-        orderedCounter += 1;
-        lines.push(`${orderedCounter}. ${text}`);
-        break;
-      case "todo":
-        lines.push(`- [${blk.checked ? "x" : " "}] ${text}`);
-        break;
-      case "callout":
-        lines.push(`> [!note]`, ...text.split("\n").map((l) => `> ${l}`), "");
-        break;
-      case "quote":
-        lines.push(...text.split("\n").map((l) => `> ${l}`), "");
-        break;
-      case "code":
-        lines.push(`\`\`\`${blk.language ?? ""}`, blk.content ?? "", "\`\`\`", "");
-        break;
-      case "divider":
-        lines.push("---", "");
-        break;
-      case "session_ref": {
-        const linked = blk.sessionId ? threadsById.get(blk.sessionId) : undefined;
-        const title = linked?.title || text || "关联会话";
-        const summary = blk.summary || (linked ? extractThreadSummary(linked) : "");
-        lines.push(`> **@valet 会话：${title}**${summary ? `\n> ${summary}` : ""}`, "");
-        break;
+    const formatted = formatSingleBlockLines(blk, orderedCounter, threadsById);
+    if (formatted.lines.length > 0) {
+      lines.push(...formatted.lines);
+      if (formatted.trailingBlank) {
+        lines.push("");
       }
-      case "paragraph":
-      default:
-        if (text.trim()) {
-          lines.push(text, "");
-        }
-        break;
     }
   }
 
@@ -215,21 +287,219 @@ export function blocksToMarkdown(project: Project, threads: ChatThread[]): strin
 export function buildNotebookContextAttachment(
   project: Project,
   threads: ChatThread[],
-  originSection?: string
+  origin?: string | NotebookContextOriginOptions
 ): ChatAttachment {
-  const md = blocksToMarkdown(project, threads);
-  const excerpt =
-    md.length <= MAX_NOTEBOOK_EXCERPT_CHARS
-      ? md
-      : `${md.slice(0, MAX_NOTEBOOK_EXCERPT_CHARS - 20)}\n…(Notebook 内容已截断)`;
+  const {
+    originBlockId,
+    originSection,
+    originBeforeText,
+    originAfterText,
+  } = typeof origin === "string" ? { originSection: origin } : (origin ?? {});
+
+  const threadsById = new Map(threads.map((t) => [t.id, t]));
+
+  interface AnnotatedEntry {
+    blockId: string;
+    lineNo: number;
+    typeLabel: string;
+    markdownText: string;
+    plainText: string;
+    isOrigin: boolean;
+    isBlankOrigin: boolean;
+    formattedBlock: string;
+  }
+
+  const entries: AnnotatedEntry[] = [];
+  let orderedCounter = 0;
+  let lineNo = 0;
+
+  for (const blk of project.blocks) {
+    if (blk.type !== "numbered") {
+      orderedCounter = 0;
+    } else {
+      orderedCounter += 1;
+    }
+
+    const isOrigin = Boolean(originBlockId && blk.id === originBlockId);
+    const rawContent = blk.content ?? "";
+
+    if (!isOrigin && blk.type === "paragraph" && !rawContent.trim()) {
+      continue;
+    }
+
+    const hasMidLineMarker =
+      isOrigin && Boolean(originBeforeText?.trim() && originAfterText?.trim());
+    let effectiveOverride: string | undefined;
+    if (hasMidLineMarker) {
+      const existingRefs = extractInlineRefs(rawContent);
+      effectiveOverride = joinTextWithInlineRefs(
+        `${originBeforeText!.trimEnd()} [@valet] ${originAfterText!.trimStart()}`,
+        existingRefs
+      );
+    } else if (isOrigin && !rawContent.trim() && (originBeforeText?.trim() || originAfterText?.trim())) {
+      effectiveOverride = `${originBeforeText ?? ""}${originAfterText ?? ""}`;
+    }
+
+    const effectiveRaw = effectiveOverride ?? rawContent;
+    const isBlankOrigin =
+      isOrigin &&
+      blk.type !== "divider" &&
+      blk.type !== "session_ref" &&
+      !effectiveRaw.trim();
+
+    lineNo += 1;
+    const typeLabel = getNotebookBlockTypeLabel(blk);
+    const markdownText = isBlankOrigin
+      ? "（空白行）"
+      : formatSingleBlockMarkdown(blk, orderedCounter, threadsById, effectiveOverride);
+
+    let plainText = "";
+    if (!isBlankOrigin) {
+      if (blk.type === "divider") {
+        plainText = "---";
+      } else if (blk.type === "session_ref") {
+        const linked = blk.sessionId ? threadsById.get(blk.sessionId) : undefined;
+        plainText = linked?.title || effectiveRaw || "关联会话";
+      } else if (blk.type === "code") {
+        plainText = effectiveRaw;
+      } else {
+        plainText = formatInlineTokensForMarkdown(effectiveRaw, threadsById);
+      }
+    }
+
+    const marker = isOrigin
+      ? isBlankOrigin
+        ? "  <<< [@valet 当前发起位置]"
+        : "  <<< [@valet 当前引用行]"
+      : "";
+    const formattedBlock = markdownText
+      .split("\n")
+      .map((line, i) => (i === 0 ? `L${lineNo}: ${line}${marker}` : `    ${line}`))
+      .join("\n");
+
+    entries.push({
+      blockId: blk.id,
+      lineNo,
+      typeLabel,
+      markdownText,
+      plainText,
+      isOrigin,
+      isBlankOrigin,
+      formattedBlock,
+    });
+  }
+
+  const originIdx = entries.findIndex((e) => e.isOrigin);
+  const originEntry = originIdx >= 0 ? entries[originIdx] : undefined;
+  let prevEntry: AnnotatedEntry | undefined;
+  if (originEntry?.isBlankOrigin) {
+    for (let i = originIdx - 1; i >= 0; i--) {
+      if (!entries[i]!.isBlankOrigin) {
+        prevEntry = entries[i];
+        break;
+      }
+    }
+  }
+
+  const headerLines: string[] = ["[发起定位]", `- 所属项目：${project.title}`];
+  if (originSection) {
+    headerLines.push(`- 所属章节：${originSection}`);
+  }
+  if (originEntry) {
+    if (originEntry.isBlankOrigin) {
+      headerLines.push(
+        `- 引用位置：第 ${originEntry.lineNo} 行（空白行${prevEntry ? `，紧接在第 ${prevEntry.lineNo} 行下方` : ""}）`
+      );
+      if (prevEntry) {
+        headerLines.push(
+          `- 上方紧邻内容（第 ${prevEntry.lineNo} 行）：${prevEntry.markdownText.replace(/\n+/g, " ")}`
+        );
+      }
+    } else {
+      headerLines.push(
+        `- 引用位置：第 ${originEntry.lineNo} 行（${originEntry.typeLabel}）`,
+        `- 当前引用行内容：${originEntry.markdownText.replace(/\n+/g, " ")}`
+      );
+    }
+  }
+
+  const bodyHeaderLines = ["", "[完整 Notebook 上下文（已标注当前引用行）]"];
+  const projectMetaParts: string[] = [];
+  if (project.tags.length > 0) projectMetaParts.push(`标签: ${project.tags.join(", ")}`);
+  if (project.workingDir) projectMetaParts.push(`工作目录: \`${project.workingDir}\``);
+  if (projectMetaParts.length > 0) {
+    bodyHeaderLines.push(projectMetaParts.join(" · "));
+  }
+
+  const prefix = `${headerLines.join("\n")}\n${bodyHeaderLines.join("\n")}`;
+  const fullBody = entries.map((e) => e.formattedBlock).join("\n");
+  const fullExcerpt = fullBody ? `${prefix}\n${fullBody}` : prefix;
+
+  let excerpt: string;
+  if (fullExcerpt.length <= MAX_NOTEBOOK_EXCERPT_CHARS) {
+    excerpt = fullExcerpt;
+  } else if (entries.length === 0) {
+    excerpt = prefix.slice(0, MAX_NOTEBOOK_EXCERPT_CHARS);
+  } else {
+    const budget = Math.max(0, MAX_NOTEBOOK_EXCERPT_CHARS - prefix.length - 1);
+    const anchorIdx = originIdx >= 0 ? originIdx : 0;
+    const renderWindow = (l: number, r: number): string => {
+      const parts: string[] = [];
+      if (l > 0) parts.push("…（前文已省略）");
+      for (let i = l; i <= r; i++) {
+        parts.push(entries[i]!.formattedBlock);
+      }
+      if (r < entries.length - 1) parts.push("…（后文已省略）");
+      return parts.join("\n");
+    };
+
+    let left = anchorIdx;
+    let right = anchorIdx;
+    while (true) {
+      let moved = false;
+      if (left > 0 && renderWindow(left - 1, right).length <= budget) {
+        left -= 1;
+        moved = true;
+      }
+      if (right < entries.length - 1 && renderWindow(left, right + 1).length <= budget) {
+        right += 1;
+        moved = true;
+      }
+      if (!moved) break;
+    }
+
+    let windowed = renderWindow(left, right);
+    if (windowed.length > budget) {
+      windowed = budget > 16 ? `${windowed.slice(0, budget - 14)}\n…（内容已截断）` : windowed.slice(0, budget);
+    }
+    excerpt = `${prefix}\n${windowed}`;
+  }
+
+  const name =
+    originSection && originSection !== project.title
+      ? `${project.title} / ${originSection}`
+      : project.title;
+
+  let meta: string;
+  if (originEntry) {
+    if (!originEntry.isBlankOrigin) {
+      meta = `第 ${originEntry.lineNo} 行 · ${toSingleLineSnippet(originEntry.plainText || originEntry.typeLabel, 42)}`;
+    } else if (prevEntry) {
+      meta = `第 ${originEntry.lineNo} 行（空白行，位于「${toSingleLineSnippet(prevEntry.plainText || prevEntry.typeLabel, 24)}」下方）`;
+    } else {
+      meta = `第 ${originEntry.lineNo} 行（空白行）`;
+    }
+  } else {
+    meta = originSection ? `章节 · ${originSection}` : `${project.blocks.length} 个内容块`;
+  }
 
   return {
     id: `ctx-notebook-${project.id}`,
     kind: "notebook_context",
     refId: project.id,
     badge: "Notebook",
-    name: project.title,
-    meta: originSection ? `章节 · ${originSection}` : `${project.blocks.length} 个内容块`,
+    name,
+    meta,
     textExcerpt: excerpt,
   };
 }
@@ -274,6 +544,120 @@ export function detectMarkdownShortcut(raw: string): {
     return { type: "code", content: "", language: codeFence[1] || "bash" };
   }
   return null;
+}
+
+export type InlineRefKind = "session" | "inbox" | "timeline";
+
+export interface InlineRefToken {
+  kind: InlineRefKind;
+  id: string;
+  raw: string;
+  start: number;
+  end: number;
+}
+
+const INLINE_REF_RE = /\[\[(session|inbox|timeline):([^\]]+)\]\]/g;
+
+/**
+ * Extracts all inline reference tokens (`[[session:...]]`, `[[inbox:...]]`, `[[timeline:...]]`)
+ * in appearance order with their exact character offsets.
+ */
+export function extractInlineRefs(content: string): InlineRefToken[] {
+  if (!content) return [];
+  const refs: InlineRefToken[] = [];
+  INLINE_REF_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = INLINE_REF_RE.exec(content)) !== null) {
+    const kind = match[1] as InlineRefKind;
+    const id = match[2] ?? "";
+    refs.push({
+      kind,
+      id,
+      raw: match[0],
+      start: match.index,
+      end: match.index + match[0].length,
+    });
+  }
+  return refs;
+}
+
+/**
+ * Separates a Notebook block's raw content into clean user-editable text and atomic reference tokens,
+ * stripping at most one separator space per token so user-entered spaces round-trip cleanly.
+ */
+export function splitInlineRefs(content: string): {
+  editableText: string;
+  refs: InlineRefToken[];
+} {
+  const refs = extractInlineRefs(content);
+  if (refs.length === 0) {
+    return { editableText: content, refs: [] };
+  }
+
+  let result = content.slice(0, refs[0]!.start);
+  for (let i = 0; i < refs.length; i++) {
+    const cur = refs[i]!;
+    const nextStart = refs[i + 1]?.start ?? content.length;
+    let nextChunk = content.slice(cur.end, nextStart);
+
+    let hasTextAfter = nextChunk.length > 0;
+    if (!hasTextAfter) {
+      for (let k = i + 1; k < refs.length; k++) {
+        const tailStart = refs[k]!.end;
+        const tailEnd = refs[k + 1]?.start ?? content.length;
+        if (tailEnd > tailStart) {
+          hasTextAfter = true;
+          break;
+        }
+      }
+    }
+
+    if (result.endsWith(" ") && nextChunk.startsWith(" ")) {
+      nextChunk = nextChunk.slice(1);
+    } else if (result.endsWith(" ") && !hasTextAfter) {
+      result = result.slice(0, -1);
+    } else if (result === "" && nextChunk.startsWith(" ")) {
+      nextChunk = nextChunk.slice(1);
+    }
+
+    result += nextChunk;
+  }
+
+  return { editableText: result, refs };
+}
+
+/**
+ * Recombines clean editable text with atomic inline reference tokens using canonical single-space separation.
+ */
+export function joinTextWithInlineRefs(
+  editableText: string,
+  refs: ReadonlyArray<Pick<InlineRefToken, "raw">>
+): string {
+  if (refs.length === 0) return editableText;
+  const suffix = refs.map((r) => r.raw).join(" ");
+  if (editableText === "") return suffix;
+  return `${editableText} ${suffix}`;
+}
+
+/**
+ * Removes a single inline reference token by index without leaving dangling or doubled separator spaces.
+ */
+export function removeInlineRefAt(content: string, refIndex: number): string {
+  const refs = extractInlineRefs(content);
+  if (refIndex < 0 || refIndex >= refs.length) return content;
+  const target = refs[refIndex]!;
+  let before = content.slice(0, target.start);
+  let after = content.slice(target.end);
+
+  if (before.endsWith(" ") && after.startsWith(" ")) {
+    after = after.slice(1);
+  } else if (before.endsWith(" ") && after === "") {
+    before = before.slice(0, -1);
+  } else if (before === "" && after.startsWith(" ")) {
+    after = after.slice(1);
+  }
+
+  return `${before}${after}`;
 }
 
 export type InlineSegment =
@@ -325,4 +709,90 @@ export function parseInlineNotebookText(text: string): InlineSegment[] {
     out.push({ kind: "text", text: text.slice(lastIndex) });
   }
   return out;
+}
+
+const DEICTIC_PROMPT_RE = /(这个|这里|这一条|这条|这项|上面|上述|该项|它)/;
+const GENERIC_VERB_RE =
+  /^(调研|查|看|分析|处理|总结|整理|了解|搜索|搜|核实|跟进|执行|解决|回答|解释|评估)(一下|下|看看)?$/;
+
+function cleanAttachmentTitleCandidate(raw: string): string {
+  return raw
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/^-\s*\[[xX\s]?\]\s*/, "")
+    .replace(/^[-*+]\s+/, "")
+    .replace(/^\d+\.\s+/, "")
+    .replace(/[？?！!。，,；;：:…]+$/u, "")
+    .trim();
+}
+
+function truncateCodePoints(text: string, maxChars: number): string {
+  const chars = Array.from(text);
+  return chars.length > maxChars ? chars.slice(0, maxChars).join("") : text;
+}
+
+/**
+ * Derives a clean, deictic-aware fallback session title from the user prompt and attached context.
+ */
+export function deriveFallbackSessionTitle(
+  prompt: string,
+  attachments?: ChatAttachment[]
+): string {
+  const collapsed = prompt.replace(/\s+/g, " ").trim();
+  const cleaned = collapsed
+    .replace(/^(?:请|麻烦|可以|能不能|帮我|请你|你帮我|你去|去|先)+/u, "")
+    .replace(/[？?！!。，,；;：:…]+$/u, "")
+    .trim();
+
+  const isDeictic =
+    cleaned.length === 0 ||
+    (Array.from(cleaned).length <= 16 && DEICTIC_PROMPT_RE.test(cleaned)) ||
+    GENERIC_VERB_RE.test(cleaned);
+
+  if (isDeictic && attachments && attachments.length > 0) {
+    const refAtt = attachments.find(
+      (a) =>
+        a.kind === "notebook_context" ||
+        a.kind === "inbox_item" ||
+        a.kind === "timeline_event"
+    );
+    if (refAtt) {
+      let candidate = "";
+      if (refAtt.kind === "notebook_context") {
+        const meta = refAtt.meta?.trim() ?? "";
+        const belowMatch = /位于「([^」]+)」下方/.exec(meta);
+        if (belowMatch?.[1]) {
+          candidate = belowMatch[1];
+        } else if (/^第\s*\d+\s*行\s*·\s*/.test(meta)) {
+          candidate = meta.replace(/^第\s*\d+\s*行\s*·\s*/, "");
+        } else if (/^章节\s*·\s*/.test(meta)) {
+          candidate = meta.replace(/^章节\s*·\s*/, "");
+        }
+        if (!candidate && refAtt.textExcerpt) {
+          const lineMatch =
+            /^- (?:当前引用行内容|上方紧邻内容（[^）]+）)：(.+)$/m.exec(
+              refAtt.textExcerpt
+            );
+          if (lineMatch?.[1]) {
+            candidate = lineMatch[1];
+          }
+        }
+        if (!candidate && refAtt.name) {
+          const parts = refAtt.name.split(" / ");
+          candidate = parts[parts.length - 1] ?? refAtt.name;
+        }
+      } else {
+        candidate = refAtt.name;
+      }
+
+      const cleanedCandidate = cleanAttachmentTitleCandidate(candidate);
+      if (cleanedCandidate) {
+        return truncateCodePoints(cleanedCandidate, 18);
+      }
+    }
+  }
+
+  const base = cleaned || collapsed;
+  return base ? truncateCodePoints(base, 18) : "新对话";
 }

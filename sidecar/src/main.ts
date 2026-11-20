@@ -10,6 +10,7 @@ import type {
   AnswerInboxQuestionRequest,
   DispatchPluginEventRequest,
   ExecuteApprovedToolRequest,
+  GenerateTitleRequest,
   HostBridge,
   ProbeMcpRequest,
   ResolvePermissionRequest,
@@ -145,6 +146,10 @@ class StdioJsonRpcServer implements HostBridge {
         return this.runtime.syncState(params.state as ValetSyncState);
       case "chat.send":
         return this.runtime.sendChat(params as unknown as SendChatRequest);
+      case "chat.generateTitle":
+        return this.runtime.generateChatTitle(
+          params as unknown as GenerateTitleRequest,
+        );
       case "chat.abort":
         return this.runtime.abortChat(String(params.chatId ?? ""));
       case "chat.resolvePermission":

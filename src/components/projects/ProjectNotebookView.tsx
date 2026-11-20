@@ -9,14 +9,20 @@ import type {
 import {
   blocksToMarkdown,
   detectMarkdownShortcut,
+  extractInlineRefs,
   findNearestHeading,
+  joinTextWithInlineRefs,
   makeBlockId,
   parseInlineNotebookText,
+  removeInlineRefAt,
+  splitInlineRefs,
+  type InlineRefToken,
 } from "../../utils/notebook";
 import {
   BowtieSvg,
   CheckIcon,
   ClockIcon,
+  CloseIcon,
   DownloadIcon,
   GripDotsIcon,
   InboxIcon,
@@ -136,6 +142,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     blockId: string;
     beforeText: string;
     afterText: string;
+    existingRefs?: InlineRefToken[];
   } | null>(null);
   const [blockMenuId, setBlockMenuId] = useState<string | null>(null);
   const [draggedBlockId, setDraggedBlockId] = useState<string | null>(null);
@@ -328,6 +335,11 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     updateProject(project.id, { tags: [...project.tags, trimmed] });
   };
 
+  const getBlockEditableLength = (block: NotebookBlock): number =>
+    block.type === "code"
+      ? block.content.length
+      : splitInlineRefs(block.content).editableText.length;
+
   const updateBlockContentOrProps = (
     blockId: string,
     patch: Partial<NotebookBlock>
@@ -336,6 +348,14 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       b.id === blockId ? { ...b, ...patch } : b
     );
     commitBlocks(next);
+  };
+
+  const handleRemoveInlineRef = (blockId: string, refIndex: number) => {
+    const blk = blocksRef.current.find((b) => b.id === blockId);
+    if (!blk) return;
+    updateBlockContentOrProps(blockId, {
+      content: removeInlineRefAt(blk.content, refIndex),
+    });
   };
 
   const deleteBlock = (blockId: string) => {
@@ -352,7 +372,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     commitBlocks(next);
     const neighbor = next[Math.max(0, idx - 1)];
     if (neighbor && !NON_TEXT_BLOCK_TYPES.has(neighbor.type)) {
-      focusBlockAt(neighbor.id, neighbor.content.length);
+      focusBlockAt(neighbor.id, getBlockEditableLength(neighbor));
     } else {
       setFocusedBlockId(null);
     }
@@ -379,7 +399,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     cur.splice(idx + 1, 0, clone);
     commitBlocks(cur);
     if (!NON_TEXT_BLOCK_TYPES.has(clone.type)) {
-      focusBlockAt(clone.id, clone.content.length);
+      focusBlockAt(clone.id, getBlockEditableLength(clone));
     }
   };
 
@@ -438,10 +458,19 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     rawVal: string,
     selectionStart: number
   ) => {
+    if (block.type === "code") {
+      updateBlockContentOrProps(block.id, { content: rawVal });
+      setMentionState(null);
+      setSlashState(null);
+      return;
+    }
+
+    const existingRefs = extractInlineRefs(block.content);
+
     // 1. Live Markdown prefix conversion on paragraphs
     if (block.type === "paragraph") {
       const shortcut = detectMarkdownShortcut(rawVal);
-      if (shortcut) {
+      if (shortcut && !(shortcut.type === "divider" && existingRefs.length > 0)) {
         setMentionState(null);
         setSlashState(null);
         const cur = blocksRef.current;
@@ -464,7 +493,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
             ? {
                 ...b,
                 type: shortcut.type,
-                content: shortcut.content,
+                content: joinTextWithInlineRefs(shortcut.content, existingRefs),
                 checked: shortcut.checked,
                 language: shortcut.language,
               }
@@ -476,14 +505,10 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       }
     }
 
-    // Persist normal text edit first
-    updateBlockContentOrProps(block.id, { content: rawVal });
-
-    if (block.type === "code") {
-      setMentionState(null);
-      setSlashState(null);
-      return;
-    }
+    // Persist normal text edit while preserving existing inline reference chips
+    updateBlockContentOrProps(block.id, {
+      content: joinTextWithInlineRefs(rawVal, existingRefs),
+    });
 
     const beforeCursor = rawVal.slice(0, selectionStart);
 
@@ -496,10 +521,17 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         valetSpaceMatch[1]!.length;
       const beforeText = rawVal.slice(0, tokenStart);
       const afterText = rawVal.slice(selectionStart);
-      updateBlockContentOrProps(block.id, { content: `${beforeText}${afterText}` });
+      updateBlockContentOrProps(block.id, {
+        content: joinTextWithInlineRefs(`${beforeText}${afterText}`, existingRefs),
+      });
       setMentionState(null);
       setSlashState(null);
-      setValetComposerState({ blockId: block.id, beforeText, afterText });
+      setValetComposerState({
+        blockId: block.id,
+        beforeText,
+        afterText,
+        existingRefs,
+      });
       return;
     }
 
@@ -521,7 +553,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     }
 
     // 4. Typing `/...` at start of paragraph opens Slash Block Menu
-    if (block.type === "paragraph") {
+    if (block.type === "paragraph" && existingRefs.length === 0) {
       const slashMatch = /^\/([^\s]*)$/.exec(rawVal);
       if (slashMatch) {
         setSlashState({
@@ -549,46 +581,53 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       return;
     }
 
-    const beforeText = blk.content.slice(0, atIndex);
-    const afterText = blk.content.slice(cursorIndex);
+    const { editableText, refs } = splitInlineRefs(blk.content);
+    const beforeText = editableText.slice(0, atIndex);
+    const afterText = editableText.slice(cursorIndex);
     setMentionState(null);
 
     if (action.kind === "new_valet_session") {
-      updateBlockContentOrProps(blockId, { content: `${beforeText}${afterText}` });
-      setValetComposerState({ blockId, beforeText, afterText });
+      updateBlockContentOrProps(blockId, {
+        content: joinTextWithInlineRefs(`${beforeText}${afterText}`, refs),
+      });
+      setValetComposerState({
+        blockId,
+        beforeText,
+        afterText,
+        existingRefs: refs,
+      });
       return;
     }
 
-    if (action.kind === "link_session") {
-      if (!beforeText.trim() && !afterText.trim()) {
-        const next = [...cur];
-        next[idx] = {
-          id: blk.id,
-          type: "session_ref",
-          sessionId: action.thread.id,
-          content: action.thread.title,
-        };
-        if (idx === next.length - 1) {
-          next.push({ id: makeBlockId("blk"), type: "paragraph", content: "" });
-        }
-        commitBlocks(next);
-        setFocusedBlockId(null);
-        return;
+    if (action.kind === "link_session" && !beforeText.trim() && !afterText.trim() && refs.length === 0) {
+      const next = [...cur];
+      next[idx] = {
+        id: blk.id,
+        type: "session_ref",
+        sessionId: action.thread.id,
+        content: action.thread.title,
+      };
+      if (idx === next.length - 1) {
+        next.push({ id: makeBlockId("blk"), type: "paragraph", content: "" });
       }
-      const token = `[[session:${action.thread.id}]] `;
-      const nextContent = `${beforeText}${token}${afterText.trimStart()}`;
-      updateBlockContentOrProps(blockId, { content: nextContent });
-      focusBlockAt(blockId, beforeText.length + token.length);
+      commitBlocks(next);
+      setFocusedBlockId(null);
       return;
     }
 
     const refToken =
-      action.kind === "link_inbox"
-        ? `[[inbox:${action.itemId}]] `
-        : `[[timeline:${action.eventId}]] `;
-    const nextContent = `${beforeText}${refToken}${afterText.trimStart()}`;
+      action.kind === "link_session"
+        ? `[[session:${action.thread.id}]]`
+        : action.kind === "link_inbox"
+          ? `[[inbox:${action.itemId}]]`
+          : `[[timeline:${action.eventId}]]`;
+    const cleanAfter = afterText.trimStart();
+    const mergedText = cleanAfter
+      ? `${beforeText}${cleanAfter}`
+      : beforeText.replace(/ $/, "");
+    const nextContent = joinTextWithInlineRefs(mergedText, [...refs, { raw: refToken }]);
     updateBlockContentOrProps(blockId, { content: nextContent });
-    focusBlockAt(blockId, beforeText.length + refToken.length);
+    focusBlockAt(blockId, cleanAfter ? beforeText.length : mergedText.length);
   };
 
   const handleSlashSelect = (choice: SlashBlockChoice) => {
@@ -724,19 +763,22 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       return;
     }
 
+    const { editableText, refs } = splitInlineRefs(block.content);
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       if (
         (block.type === "bullet" || block.type === "numbered" || block.type === "todo") &&
-        block.content.trim() === ""
+        editableText.trim() === "" &&
+        refs.length === 0
       ) {
         updateBlockContentOrProps(block.id, { type: "paragraph", checked: undefined });
         focusBlockAt(block.id, 0);
         return;
       }
 
-      const before = block.content.slice(0, selStart);
-      const after = block.content.slice(selEnd);
+      const before = editableText.slice(0, selStart);
+      const after = editableText.slice(selEnd);
       const continueType: NotebookBlockType =
         block.type === "bullet" || block.type === "numbered" || block.type === "todo"
           ? block.type
@@ -748,14 +790,35 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         checked: continueType === "todo" ? false : undefined,
       };
       const next = [...blocksRef.current];
-      next[blockIndex] = { ...block, content: before };
+      next[blockIndex] = {
+        ...block,
+        content: joinTextWithInlineRefs(before, refs),
+      };
       next.splice(blockIndex + 1, 0, newBlk);
       commitBlocks(next);
       focusBlockAt(newBlk.id, 0);
       return;
     }
 
+    if (
+      e.key === "Delete" &&
+      selStart === editableText.length &&
+      selEnd === selStart &&
+      refs.length > 0
+    ) {
+      e.preventDefault();
+      pendingCursorPosRef.current = { blockId: block.id, pos: editableText.length };
+      handleRemoveInlineRef(block.id, 0);
+      return;
+    }
+
     if (e.key === "Backspace" && selStart === 0 && selEnd === 0) {
+      if (editableText === "" && refs.length > 0) {
+        e.preventDefault();
+        pendingCursorPosRef.current = { blockId: block.id, pos: 0 };
+        handleRemoveInlineRef(block.id, refs.length - 1);
+        return;
+      }
       if (block.type !== "paragraph") {
         e.preventDefault();
         updateBlockContentOrProps(block.id, { type: "paragraph", checked: undefined });
@@ -763,7 +826,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         return;
       }
       const cur = blocksRef.current;
-      if (block.content === "" && cur.length > 1) {
+      if (editableText === "" && refs.length === 0 && cur.length > 1) {
         e.preventDefault();
         deleteBlock(block.id);
         return;
@@ -772,9 +835,16 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         const prev = cur[blockIndex - 1];
         if (prev && !NON_TEXT_BLOCK_TYPES.has(prev.type) && prev.type !== "code") {
           e.preventDefault();
-          const joinPos = prev.content.length;
+          const prevSplit = splitInlineRefs(prev.content);
+          const joinPos = prevSplit.editableText.length;
           const next = [...cur];
-          next[blockIndex - 1] = { ...prev, content: prev.content + block.content };
+          next[blockIndex - 1] = {
+            ...prev,
+            content: joinTextWithInlineRefs(
+              `${prevSplit.editableText}${editableText}`,
+              [...prevSplit.refs, ...refs]
+            ),
+          };
           next.splice(blockIndex, 1);
           commitBlocks(next);
           focusBlockAt(prev.id, joinPos);
@@ -789,14 +859,14 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         const candidate = cur[i];
         if (candidate && !NON_TEXT_BLOCK_TYPES.has(candidate.type)) {
           e.preventDefault();
-          focusBlockAt(candidate.id, candidate.content.length);
+          focusBlockAt(candidate.id, getBlockEditableLength(candidate));
           break;
         }
       }
       return;
     }
 
-    if (e.key === "ArrowDown" && selStart === block.content.length && selEnd === selStart) {
+    if (e.key === "ArrowDown" && selStart === editableText.length && selEnd === selStart) {
       const cur = blocksRef.current;
       for (let i = blockIndex + 1; i < cur.length; i++) {
         const candidate = cur[i];
@@ -809,11 +879,115 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     }
   };
 
+  const renderInlineRefChip = (
+    ref: Pick<InlineRefToken, "kind" | "id">,
+    blockId: string,
+    refIndex: number,
+    key: React.Key
+  ) => {
+    const onRemove = () => handleRemoveInlineRef(blockId, refIndex);
+
+    if (ref.kind === "session") {
+      return (
+        <InlineSessionChip
+          key={key}
+          sessionId={ref.id}
+          onRemove={onRemove}
+        />
+      );
+    }
+
+    const isInbox = ref.kind === "inbox";
+    const item = isInbox ? inboxById.get(ref.id) : undefined;
+    const ev = !isInbox ? timelineById.get(ref.id) : undefined;
+    const label = (isInbox ? item?.title : ev?.title) ?? ref.id;
+    const navigate = () => {
+      if (isInbox) {
+        if (!item) {
+          pushToast("该收件箱事项已清理", "warning");
+          return;
+        }
+        setActiveView("inbox");
+        selectInboxItem(item.id);
+        return;
+      }
+      if (!ev) {
+        pushToast("该时间线事件已不存在", "warning");
+        return;
+      }
+      setActiveView("timeline");
+      selectTimelineEvent(ev.id);
+    };
+
+    return (
+      <span
+        key={key}
+        data-inline-interactive="true"
+        className={`mx-1 inline-flex items-center overflow-hidden rounded-[6px] border align-baseline text-[12px] leading-[16px] transition-colors ${
+          isInbox
+            ? "border-[var(--amber-border)] bg-[var(--amber-bg)] text-[var(--amber-text)] hover:border-[var(--amber-pill)]"
+            : "border-[var(--border-control)] bg-[var(--bg-subtle)] text-[var(--ink-strong)] hover:border-[var(--border-strong)]"
+        }`}
+      >
+        <button
+          type="button"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            navigate();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Backspace" || e.key === "Delete") {
+              e.preventDefault();
+              e.stopPropagation();
+              onRemove();
+            }
+          }}
+          title={
+            isInbox
+              ? item
+                ? `点击跳转到收件箱：${item.title}`
+                : "该收件箱事项已清理"
+              : ev
+                ? `点击跳转到时间线：${ev.title}`
+                : "该时间线事件已不存在"
+          }
+          className="inline-flex cursor-pointer items-center gap-1 px-2 py-[1px] transition-colors hover:bg-[var(--bg-hover)] focus:outline-none focus-visible:bg-[var(--bg-hover)]"
+        >
+          {isInbox ? <InboxIcon size={11} /> : <ClockIcon size={11} />}
+          <span className="max-w-[180px] truncate font-medium">{label}</span>
+          <span className="shrink-0 text-[11px] opacity-65">↗</span>
+        </button>
+        <button
+          type="button"
+          aria-label="移除引用"
+          title="移除引用"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onRemove();
+          }}
+          className={`inline-flex cursor-pointer items-center self-stretch border-l px-1 opacity-75 transition-colors hover:bg-[var(--bg-hover)] hover:opacity-100 ${
+            isInbox ? "border-[var(--amber-border)]" : "border-[var(--border-light)]"
+          }`}
+        >
+          <CloseIcon size={10} />
+        </button>
+      </span>
+    );
+  };
+
   const renderInlineDisplay = (block: NotebookBlock) => {
     const segments = parseInlineNotebookText(block.content);
     if (segments.length === 0) {
       const placeholder =
-        blocks.length === 1 || focusedBlockId === null && block.id === blocks[blocks.length - 1]?.id
+        blocks.length === 1 || (focusedBlockId === null && block.id === blocks[blocks.length - 1]?.id)
           ? "输入笔记，键入 / 插入 Markdown 块，或输入 @valet 发起新会话…"
           : "";
       return (
@@ -823,6 +997,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       );
     }
 
+    let refIdx = 0;
     return segments.map((seg, i) => {
       switch (seg.kind) {
         case "bold":
@@ -856,9 +1031,11 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
           return (
             <a
               key={i}
+              data-inline-interactive="true"
               href={seg.href}
               target="_blank"
               rel="noreferrer"
+              onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
               className="underline decoration-[var(--border-strong)] underline-offset-2 hover:text-[var(--ink-strong)]"
             >
@@ -866,55 +1043,26 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
             </a>
           );
         case "session":
-          return <InlineSessionChip key={i} sessionId={seg.sessionId} />;
-        case "inbox": {
-          const item = inboxById.get(seg.itemId);
-          return (
-            <button
-              key={i}
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                if (!item) {
-                  pushToast("该收件箱事项已清理", "warning");
-                  return;
-                }
-                setActiveView("inbox");
-                selectInboxItem(item.id);
-              }}
-              className="mx-1 inline-flex cursor-pointer items-center gap-1 rounded-[6px] border border-[var(--amber-border)] bg-[var(--amber-bg)] px-2 py-[1px] align-baseline text-[12px] text-[var(--amber-text)] hover:border-[var(--amber-pill)]"
-            >
-              <InboxIcon size={11} />
-              <span className="max-w-[180px] truncate font-medium">
-                {item?.title ?? seg.itemId}
-              </span>
-            </button>
+          return renderInlineRefChip(
+            { kind: "session", id: seg.sessionId },
+            block.id,
+            refIdx++,
+            i
           );
-        }
-        case "timeline": {
-          const ev = timelineById.get(seg.eventId);
-          return (
-            <button
-              key={i}
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                if (!ev) {
-                  pushToast("该时间线事件已不存在", "warning");
-                  return;
-                }
-                setActiveView("timeline");
-                selectTimelineEvent(ev.id);
-              }}
-              className="mx-1 inline-flex cursor-pointer items-center gap-1 rounded-[6px] border border-[var(--border-control)] bg-[var(--bg-subtle)] px-2 py-[1px] align-baseline text-[12px] text-[var(--ink-strong)] hover:border-[var(--border-strong)]"
-            >
-              <ClockIcon size={11} />
-              <span className="max-w-[180px] truncate font-medium">
-                {ev?.title ?? seg.eventId}
-              </span>
-            </button>
+        case "inbox":
+          return renderInlineRefChip(
+            { kind: "inbox", id: seg.itemId },
+            block.id,
+            refIdx++,
+            i
           );
-        }
+        case "timeline":
+          return renderInlineRefChip(
+            { kind: "timeline", id: seg.eventId },
+            block.id,
+            refIdx++,
+            i
+          );
         case "text":
         default:
           return <React.Fragment key={i}>{seg.text}</React.Fragment>;
@@ -925,44 +1073,64 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
   const renderEditableTextOrDisplay = (block: NotebookBlock, blockIndex: number) => {
     const isFocused = focusedBlockId === block.id;
     const typoClass = getEditableTypographyClass(block.type, block.checked);
+    const { editableText, refs } = splitInlineRefs(block.content);
 
     if (isFocused) {
       return (
-        <textarea
-          ref={(el) => {
-            blockTextareaRefs.current[block.id] = el;
-          }}
-          rows={1}
-          value={block.content}
-          onChange={(e) =>
-            handleBlockChange(
-              block,
-              e.target.value,
-              e.target.selectionStart ?? e.target.value.length
-            )
-          }
-          onCompositionEnd={() => {
-            lastCompositionEndRef.current = performance.now();
-          }}
-          onKeyDown={(e) => handleTextareaKeyDown(e, block, blockIndex)}
-          onBlur={() => {
-            // Keep focusedBlockId briefly so clicks inside popovers don't flicker
-            window.setTimeout(() => {
-              setFocusedBlockId((cur) => {
-                if (cur !== block.id) return cur;
-                const activeEl = document.activeElement;
-                if (activeEl === blockTextareaRefs.current[block.id]) return cur;
-                return null;
-              });
-            }, 120);
-          }}
-          placeholder={
-            block.type === "paragraph"
-              ? "输入内容，键入 / 插入块，或 @valet 新建会话…"
-              : "输入内容…"
-          }
-          className={`w-full resize-none overflow-hidden bg-transparent outline-none placeholder:text-[var(--ink-subtle)] ${typoClass}`}
-        />
+        <div className="w-full">
+          <textarea
+            ref={(el) => {
+              blockTextareaRefs.current[block.id] = el;
+            }}
+            rows={1}
+            value={editableText}
+            onChange={(e) =>
+              handleBlockChange(
+                block,
+                e.target.value,
+                e.target.selectionStart ?? e.target.value.length
+              )
+            }
+            onCompositionEnd={() => {
+              lastCompositionEndRef.current = performance.now();
+            }}
+            onKeyDown={(e) => handleTextareaKeyDown(e, block, blockIndex)}
+            onBlur={() => {
+              // Keep focusedBlockId briefly so clicks inside popovers don't flicker
+              window.setTimeout(() => {
+                setFocusedBlockId((cur) => {
+                  if (cur !== block.id) return cur;
+                  const activeEl = document.activeElement;
+                  if (activeEl === blockTextareaRefs.current[block.id]) return cur;
+                  return null;
+                });
+              }, 120);
+            }}
+            placeholder={
+              refs.length > 0
+                ? "输入内容…（按 Backspace 可整块删除引用）"
+                : block.type === "paragraph"
+                  ? "输入内容，键入 / 插入块，或 @valet 新建会话…"
+                  : "输入内容…"
+            }
+            className={`w-full resize-none overflow-hidden bg-transparent outline-none placeholder:text-[var(--ink-subtle)] ${typoClass}`}
+          />
+          {refs.length > 0 && (
+            <div
+              className="mt-1 flex flex-wrap items-center gap-1"
+              data-inline-interactive="true"
+            >
+              {refs.map((ref, refIdx) =>
+                renderInlineRefChip(
+                  ref,
+                  block.id,
+                  refIdx,
+                  `${ref.kind}-${ref.id}-${refIdx}`
+                )
+              )}
+            </div>
+          )}
+        </div>
       );
     }
 
@@ -970,8 +1138,16 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       <div
         role="textbox"
         tabIndex={0}
-        onClick={() => focusBlockAt(block.id, block.content.length)}
-        onFocus={() => focusBlockAt(block.id, block.content.length)}
+        onClick={(e) => {
+          if ((e.target as HTMLElement).closest("[data-inline-interactive]")) {
+            return;
+          }
+          focusBlockAt(block.id, editableText.length);
+        }}
+        onFocus={(e) => {
+          if (e.target !== e.currentTarget) return;
+          focusBlockAt(block.id, editableText.length);
+        }}
         className={`min-h-[24px] w-full cursor-text whitespace-pre-wrap break-words ${typoClass}`}
       >
         {renderInlineDisplay(block)}
@@ -1264,7 +1440,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                                     opt.type === "code" ? block.language || "bash" : undefined,
                                   checked: opt.type === "todo" ? Boolean(block.checked) : undefined,
                                 });
-                                focusBlockAt(block.id, block.content.length);
+                                focusBlockAt(block.id, getBlockEditableLength(block));
                               }}
                               className={`flex w-full cursor-pointer items-center justify-between rounded-[6px] px-2.5 py-1.5 text-left text-[12px] ${
                                 current
@@ -1361,10 +1537,12 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                   )}
                   <InlineValetComposer
                     onCancel={() => {
-                      const restored = `${valetComposerState.beforeText}${valetComposerState.afterText}`;
+                      const existingRefs = valetComposerState.existingRefs ?? [];
+                      const mergedText = `${valetComposerState.beforeText}${valetComposerState.afterText}`;
+                      const restored = joinTextWithInlineRefs(mergedText, existingRefs);
                       updateBlockContentOrProps(block.id, { content: restored });
                       setValetComposerState(null);
-                      focusBlockAt(block.id, restored.length);
+                      focusBlockAt(block.id, mergedText.length);
                     }}
                     onSubmit={async ({ prompt, model, includeNotebookContext }) => {
                       const created = await spawnSessionFromNotebook({
@@ -1374,11 +1552,13 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                         includeNotebookContext,
                         originBlockId: block.id,
                         originSection: findNearestHeading(blocks, idx),
+                        originBeforeText: valetComposerState.beforeText,
+                        originAfterText: valetComposerState.afterText,
                         openImmediately: false,
                       });
                       if (!created) return;
 
-                      const { beforeText, afterText } = valetComposerState;
+                      const { beforeText, afterText, existingRefs = [] } = valetComposerState;
                       const next = [...blocksRef.current];
                       const curIdx = next.findIndex((b) => b.id === block.id);
                       if (curIdx === -1) {
@@ -1386,7 +1566,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                         return;
                       }
 
-                      if (!beforeText.trim() && !afterText.trim()) {
+                      if (!beforeText.trim() && !afterText.trim() && existingRefs.length === 0) {
                         next[curIdx] = {
                           id: block.id,
                           type: "session_ref",
@@ -1403,11 +1583,15 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                         }
                       } else {
                         const cleanAfter = afterText.trimStart();
+                        const mergedText = cleanAfter
+                          ? `${beforeText}${cleanAfter}`
+                          : beforeText.replace(/ $/, "");
                         next[curIdx] = {
                           ...next[curIdx]!,
-                          content: `${beforeText}[[session:${created.id}]]${
-                            cleanAfter ? ` ${cleanAfter}` : ""
-                          }`,
+                          content: joinTextWithInlineRefs(mergedText, [
+                            ...existingRefs,
+                            { raw: `[[session:${created.id}]]` },
+                          ]),
                         };
                       }
                       commitBlocks(next);

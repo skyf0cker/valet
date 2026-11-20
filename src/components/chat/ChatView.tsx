@@ -302,8 +302,12 @@ export const ChatView: React.FC = () => {
                                 att.refId || parentProject?.id
                               )
                             }
-                            title="点击跳转回项目 Notebook"
-                            className="flex max-w-[320px] cursor-pointer items-center gap-2 overflow-hidden rounded-[8px] border border-[var(--border-card)] bg-[var(--bg-subtle)] px-2.5 py-1.5 text-left shadow-[inset_3px_0_0_var(--ink-primary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]/65"
+                            title={
+                              att.meta
+                                ? `点击跳转回项目 Notebook（${att.meta}）`
+                                : "点击跳转回项目 Notebook"
+                            }
+                            className="flex max-w-[380px] cursor-pointer items-center gap-2 overflow-hidden rounded-[8px] border border-[var(--border-card)] bg-[var(--bg-subtle)] px-2.5 py-1.5 text-left shadow-[inset_3px_0_0_var(--ink-primary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]/65"
                           >
                             <div className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-primary)]">
                               <BookOpenIcon size={11.5} />

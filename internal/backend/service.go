@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -2104,28 +2105,37 @@ func (s *Service) SendChatMessage(ctx context.Context, params types.SendChatPara
 		Attachments: params.Attachments,
 	}
 
+	var isFirstUserTurn bool
+	var initialTitle string
 	snap := s.store.Update(func(st *types.ValetSnapshot) {
 		found := false
 		for i := range st.ChatThreads {
 			if st.ChatThreads[i].ID == params.ChatID {
 				found = true
-				if st.ChatThreads[i].Title == "新对话" && strings.TrimSpace(params.Prompt) != "" {
-					runes := []rune(strings.TrimSpace(params.Prompt))
-					if len(runes) > 18 {
-						st.ChatThreads[i].Title = string(runes[:18])
-					} else {
-						st.ChatThreads[i].Title = string(runes)
+				hasUserMsg := false
+				for _, m := range st.ChatThreads[i].Messages {
+					if m.Role == "user" {
+						hasUserMsg = true
+						break
 					}
 				}
+				isFirstUserTurn = !hasUserMsg
+				if st.ChatThreads[i].Title == "新对话" && strings.TrimSpace(params.Prompt) != "" {
+					st.ChatThreads[i].Title = deriveFallbackChatTitle(params.Prompt, params.Attachments)
+				}
+				initialTitle = st.ChatThreads[i].Title
 				st.ChatThreads[i].UpdatedAt = "刚刚"
 				st.ChatThreads[i].Messages = append(st.ChatThreads[i].Messages, usrMsg)
+				break
 			}
 		}
 		if !found {
+			isFirstUserTurn = true
+			initialTitle = deriveFallbackChatTitle(params.Prompt, params.Attachments)
 			st.ChatThreads = append([]types.ChatThread{{
 				ID:             params.ChatID,
 				ProjectID:      types.DefaultProjectID,
-				Title:          "新对话",
+				Title:          initialTitle,
 				Model:          params.Model,
 				UpdatedAt:      "刚刚",
 				LinkedEventIDs: []string{},
@@ -2135,6 +2145,17 @@ func (s *Service) SendChatMessage(ctx context.Context, params types.SendChatPara
 	})
 
 	s.syncSidecarBlocking(ctx, snap)
+
+	if isFirstUserTurn {
+		if trimmedPrompt := strings.TrimSpace(params.Prompt); trimmedPrompt != "" && !strings.HasPrefix(trimmedPrompt, "/") {
+			go s.generateChatTitleAsync(
+				params.ChatID,
+				trimmedPrompt,
+				append([]types.ChatAttachment(nil), params.Attachments...),
+				initialTitle,
+			)
+		}
+	}
 
 	req := sidecar.ChatSendRequest{
 		ChatID:          params.ChatID,
@@ -2204,6 +2225,157 @@ func (s *Service) SendChatMessage(ctx context.Context, params types.SendChatPara
 		ProviderUsed:   resp.ProviderUsed,
 		UsageCostDelta: resp.UsageCostDelta,
 	}, nil
+}
+
+var (
+	chatTitleFillerPrefixRE = regexp.MustCompile("^(?:请|麻烦|可以|能不能|帮我|请你|你帮我|你去|去|先)+")
+	chatTitleDeicticRE      = regexp.MustCompile("(这个|这里|这一条|这条|这项|上面|上述|该项|它)")
+	chatTitleGenericVerbRE  = regexp.MustCompile("^(?:调研|查|看|分析|处理|总结|整理|了解|搜索|搜|核实|跟进|执行|解决|回答|解释|评估)(?:一下|下|看看)?$")
+	chatTitleLocatedBelowRE = regexp.MustCompile("位于「([^」]+)」下方")
+	chatTitleLineMetaRE     = regexp.MustCompile(`^第\s*\d+\s*行\s*·\s*`)
+	chatTitleSectionMetaRE  = regexp.MustCompile(`^章节\s*·\s*`)
+	chatTitleExcerptLineRE  = regexp.MustCompile(`(?m)^- (?:当前引用行内容|上方紧邻内容（[^）]+）)：(.+)$`)
+	chatTitleMdPrefixRE     = regexp.MustCompile(`^(?:#{1,6}\s+|-\s*\[[xX\s]?\]\s*|[-*+]\s+|\d+\.\s+)`)
+)
+
+func truncateRunes(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		return string(runes[:maxLen])
+	}
+	return s
+}
+
+func deriveFallbackChatTitle(prompt string, attachments []types.ChatAttachment) string {
+	collapsed := strings.Join(strings.Fields(prompt), " ")
+	cleaned := strings.TrimSpace(strings.TrimRight(chatTitleFillerPrefixRE.ReplaceAllString(collapsed, ""), "？?！!。，,；;：:…"))
+
+	isDeictic := len([]rune(cleaned)) == 0 ||
+		(len([]rune(cleaned)) <= 16 && chatTitleDeicticRE.MatchString(cleaned)) ||
+		chatTitleGenericVerbRE.MatchString(cleaned)
+
+	if isDeictic && len(attachments) > 0 {
+		for _, att := range attachments {
+			if att.Kind != "notebook_context" && att.Kind != "inbox_item" && att.Kind != "timeline_event" {
+				continue
+			}
+			candidate := ""
+			if att.Kind == "notebook_context" {
+				meta := strings.TrimSpace(att.Meta)
+				if m := chatTitleLocatedBelowRE.FindStringSubmatch(meta); len(m) > 1 {
+					candidate = m[1]
+				} else if chatTitleLineMetaRE.MatchString(meta) {
+					candidate = chatTitleLineMetaRE.ReplaceAllString(meta, "")
+				} else if chatTitleSectionMetaRE.MatchString(meta) {
+					candidate = chatTitleSectionMetaRE.ReplaceAllString(meta, "")
+				}
+				if candidate == "" && att.TextExcerpt != "" {
+					if m := chatTitleExcerptLineRE.FindStringSubmatch(att.TextExcerpt); len(m) > 1 {
+						candidate = m[1]
+					}
+				}
+				if candidate == "" && att.Name != "" {
+					parts := strings.Split(att.Name, " / ")
+					candidate = parts[len(parts)-1]
+				}
+			} else {
+				candidate = att.Name
+			}
+			cleanedCandidate := strings.TrimSpace(strings.TrimRight(
+				chatTitleMdPrefixRE.ReplaceAllString(strings.Join(strings.Fields(candidate), " "), ""),
+				"？?！!。，,；;：:…",
+			))
+			if cleanedCandidate != "" {
+				return truncateRunes(cleanedCandidate, 18)
+			}
+			break
+		}
+	}
+
+	base := cleaned
+	if base == "" {
+		base = collapsed
+	}
+	if base == "" {
+		return "新对话"
+	}
+	return truncateRunes(base, 18)
+}
+
+func (s *Service) generateChatTitleAsync(chatID, prompt string, attachments []types.ChatAttachment, expectedTitle string) {
+	s.mu.Lock()
+	closed := s.closed
+	client := s.client
+	stopCh := s.stopMetrics
+	s.mu.Unlock()
+	if closed || client == nil {
+		return
+	}
+
+	titleCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if stopCh != nil {
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-stopCh:
+				cancel()
+			case <-done:
+			}
+		}()
+	}
+
+	var resp sidecar.GenerateTitleResponse
+	if err := client.Call(titleCtx, "chat.generateTitle", sidecar.GenerateTitleRequest{
+		ChatID:      chatID,
+		Prompt:      prompt,
+		Attachments: attachments,
+	}, &resp); err != nil {
+		return
+	}
+
+	newTitle := strings.TrimSpace(resp.Title)
+	if newTitle == "" || newTitle == "新对话" || newTitle == expectedTitle {
+		return
+	}
+
+	s.mu.Lock()
+	closed = s.closed
+	storeRef := s.store
+	s.mu.Unlock()
+	if closed || storeRef == nil {
+		return
+	}
+
+	updated := false
+	storeRef.Update(func(st *types.ValetSnapshot) {
+		for i := range st.ChatThreads {
+			if st.ChatThreads[i].ID == chatID {
+				if st.ChatThreads[i].Title == expectedTitle || st.ChatThreads[i].Title == "新对话" {
+					st.ChatThreads[i].Title = newTitle
+					updated = true
+				}
+				break
+			}
+		}
+		if !updated {
+			return
+		}
+		for pIdx := range st.Projects {
+			for bIdx := range st.Projects[pIdx].Blocks {
+				blk := &st.Projects[pIdx].Blocks[bIdx]
+				if blk.Type == "session_ref" && blk.SessionID == chatID {
+					if blk.Content == expectedTitle || blk.Content == "" {
+						blk.Content = newTitle
+					}
+				}
+			}
+		}
+	})
+	if updated {
+		s.emitStateChange("chat")
+	}
 }
 
 // AbortChat aborts any in-flight durable agent run on chatID.

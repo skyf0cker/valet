@@ -50,11 +50,14 @@ import { ValetModelManager } from "./models.ts";
 import type {
   AnswerInboxQuestionRequest,
   AnswerInboxQuestionResponse,
+  ChatAttachment,
   ChatMessage,
   ChatStreamPayload,
   ChatStreamStep,
   DispatchPluginEventRequest,
   ExecuteApprovedToolRequest,
+  GenerateTitleRequest,
+  GenerateTitleResponse,
   HostBridge,
   PendingPermissionRequest,
   PluginDraftSpec,
@@ -315,6 +318,158 @@ function emptySyncState(): ValetSyncState {
     plugins: [],
     memories: [],
   };
+}
+
+const TITLE_SYSTEM_PROMPT = [
+  "你是一个精炼的会话标题生成器。请根据用户提问与附带的上下文信息，生成 1 个简短清晰的中文会话标题。",
+  "规则：",
+  "1. 只输出标题文本本身，不要输出引号、书名号、序号、前缀（如“标题：”）或任何解释说明。",
+  "2. 长度控制在 6 到 16 个汉字（或 3 到 7 个英文单词）之间，不要包含句号、问号或感叹号。",
+  "3. 若用户提问包含“这个”“这里”“这一条”“上面”等指代词，请务必结合 [发起定位] 或引用事项中的具体任务主题来命名，严禁直接照搬“调研这个”等模糊表达。",
+].join("\n");
+
+const DEICTIC_TITLE_PROMPT_RE = /(这个|这里|这一条|这条|这项|上面|上述|该项|它)/;
+const GENERIC_TITLE_VERB_RE =
+  /^(调研|查|看|分析|处理|总结|整理|了解|搜索|搜|核实|跟进|执行|解决|回答|解释|评估)(一下|下|看看)?$/;
+
+function truncateCodePoints(text: string, maxChars: number): string {
+  const chars = Array.from(text);
+  return chars.length > maxChars ? chars.slice(0, maxChars).join("") : text;
+}
+
+/**
+ * Normalizes LLM-generated session titles by stripping thinking tags, prefixes, quotes, and punctuation.
+ */
+export function sanitizeGeneratedTitle(raw: string): string {
+  if (!raw) return "";
+  const stripped = raw
+    .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "")
+    .replace(/<think(?:ing)?>[\s\S]*$/gi, "")
+    .trim();
+  const firstLine =
+    stripped
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find(Boolean) ?? "";
+  if (!firstLine) return "";
+
+  let title = firstLine
+    .replace(/^(?:会话标题|标题|Title)\s*[:：]\s*/i, "")
+    .replace(/^[-*#•\d.)\s]+/, "")
+    .replace(/[。！？!?，,；;：:…]+$/u, "")
+    .trim();
+
+  const pairs: Array<[string, string]> = [
+    ['"', '"'],
+    ["'", "'"],
+    ["“", "”"],
+    ["《", "》"],
+    ["「", "」"],
+    ["`", "`"],
+  ];
+  let unwrapped = true;
+  while (unwrapped && title.length >= 2) {
+    unwrapped = false;
+    for (const [open, close] of pairs) {
+      if (title.startsWith(open) && title.endsWith(close)) {
+        title = title
+          .slice(open.length, title.length - close.length)
+          .replace(/[。！？!?，,；;：:…]+$/u, "")
+          .trim();
+        unwrapped = true;
+        break;
+      }
+    }
+  }
+
+  title = title
+    .replace(/[。！？!?，,；;：:…]+$/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  title = truncateCodePoints(title, 22);
+  if (
+    Array.from(title).length < 2 ||
+    title === "新对话" ||
+    title === "未命名" ||
+    title === "无标题"
+  ) {
+    return "";
+  }
+  return title;
+}
+
+/**
+ * Derives a clean, deictic-aware fallback session title when no fast LLM is available.
+ */
+export function deriveFallbackChatTitle(
+  prompt: string,
+  attachments?: ChatAttachment[],
+): string {
+  const collapsed = prompt.replace(/\s+/g, " ").trim();
+  const cleaned = collapsed
+    .replace(/^(?:请|麻烦|可以|能不能|帮我|请你|你帮我|你去|去|先)+/u, "")
+    .replace(/[？?！!。，,；;：:…]+$/u, "")
+    .trim();
+
+  const isDeictic =
+    cleaned.length === 0 ||
+    (Array.from(cleaned).length <= 16 && DEICTIC_TITLE_PROMPT_RE.test(cleaned)) ||
+    GENERIC_TITLE_VERB_RE.test(cleaned);
+
+  if (isDeictic && attachments && attachments.length > 0) {
+    const refAtt = attachments.find(
+      (a) =>
+        a.kind === "notebook_context" ||
+        a.kind === "inbox_item" ||
+        a.kind === "timeline_event",
+    );
+    if (refAtt) {
+      let candidate = "";
+      if (refAtt.kind === "notebook_context") {
+        const meta = refAtt.meta?.trim() ?? "";
+        const belowMatch = /位于「([^」]+)」下方/.exec(meta);
+        if (belowMatch?.[1]) {
+          candidate = belowMatch[1];
+        } else if (/^第\s*\d+\s*行\s*·\s*/.test(meta)) {
+          candidate = meta.replace(/^第\s*\d+\s*行\s*·\s*/, "");
+        } else if (/^章节\s*·\s*/.test(meta)) {
+          candidate = meta.replace(/^章节\s*·\s*/, "");
+        }
+        if (!candidate && refAtt.textExcerpt) {
+          const lineMatch =
+            /^- (?:当前引用行内容|上方紧邻内容（[^）]+）)：(.+)$/m.exec(
+              refAtt.textExcerpt,
+            );
+          if (lineMatch?.[1]) {
+            candidate = lineMatch[1];
+          }
+        }
+        if (!candidate && refAtt.name) {
+          const parts = refAtt.name.split(" / ");
+          candidate = parts[parts.length - 1] ?? refAtt.name;
+        }
+      } else {
+        candidate = refAtt.name;
+      }
+
+      const cleanedCandidate = candidate
+        .replace(/\s+/g, " ")
+        .trim()
+        .replace(/^#{1,6}\s+/, "")
+        .replace(/^-\s*\[[xX\s]?\]\s*/, "")
+        .replace(/^[-*+]\s+/, "")
+        .replace(/^\d+\.\s+/, "")
+        .replace(/[？?！!。，,；;：:…]+$/u, "")
+        .trim();
+      if (cleanedCandidate) {
+        return truncateCodePoints(cleanedCandidate, 18);
+      }
+    }
+  }
+
+  const base = cleaned || collapsed;
+  return base ? truncateCodePoints(base, 18) : "新对话";
 }
 
 export class ValetDurableRuntime {
@@ -857,20 +1012,26 @@ export class ValetDurableRuntime {
 
     const imageBlocks: Array<{ type: "image"; data: string; mimeType: string }> = [];
     const fileExcerpts: string[] = [];
-    const quoteExcerpts: string[] = [];
+    const itemQuoteExcerpts: string[] = [];
+    const notebookContextExcerpts: string[] = [];
     const nonQuoteAttachments: typeof req.attachments = [];
     for (const att of req.attachments ?? []) {
-      if (att.kind === "inbox_item" || att.kind === "timeline_event" || att.kind === "notebook_context") {
+      if (att.kind === "inbox_item" || att.kind === "timeline_event") {
         const kindLabel =
-          att.kind === "inbox_item"
-            ? "收件箱事项"
-            : att.kind === "timeline_event"
-              ? "时间线事件"
-              : "项目 Notebook 上下文";
+          att.kind === "inbox_item" ? "收件箱事项" : "时间线事件";
         const idTag = att.refId ? ` id=${att.refId}` : "";
         const quoteBody = (att.textExcerpt?.trim() || att.meta || "").slice(0, 12_000);
-        quoteExcerpts.push(
+        itemQuoteExcerpts.push(
           `[引用事项 · ${kindLabel}${idTag} · ${att.name}]${quoteBody ? `\n${quoteBody}` : ""}`,
+        );
+        continue;
+      }
+      if (att.kind === "notebook_context") {
+        const idTag = att.refId ? ` id=${att.refId}` : "";
+        const metaTag = att.meta ? ` · ${att.meta}` : "";
+        const quoteBody = (att.textExcerpt?.trim() || att.meta || "").slice(0, 12_000);
+        notebookContextExcerpts.push(
+          `[项目 Notebook 上下文${idTag} · ${att.name}${metaTag}]${quoteBody ? `\n${quoteBody}` : ""}`,
         );
         continue;
       }
@@ -932,12 +1093,16 @@ export class ValetDurableRuntime {
         : "";
     const excerptBlock =
       fileExcerpts.length > 0 ? `\n\n${fileExcerpts.join("\n\n")}` : "";
+    const notebookContextBlock =
+      notebookContextExcerpts.length > 0
+        ? `\n\n${notebookContextExcerpts.join("\n\n")}\n\n[Notebook 上下文定位说明]\n以上是用户在项目 Notebook 中通过 @valet 发起任务时携带的上下文，其中 [发起定位] 与 <<< [@valet ...] 标明了用户的精确引用行。当用户使用“这个”“这里”“这一条”“上面”等指代词时，请优先以该引用行（若为空白行则结合其上方紧邻内容）作为核心任务目标，并将完整 Notebook 其余内容作为背景参考。`
+        : "";
     const quoteBlock =
-      quoteExcerpts.length > 0
-        ? `\n\n${quoteExcerpts.join("\n\n")}\n\n[引用事项交互说明]\n以上是用户从收件箱或时间线引用的具体事项详情。若用户在提问或核实细节，请直接结合以上载荷、判断依据与只读探测工具解答；若用户明确指示批准、执行（含指定部分子项）、忽略或还原该事项，请调用 \`item_resolve\` 工具完成处理。`
+      itemQuoteExcerpts.length > 0
+        ? `\n\n${itemQuoteExcerpts.join("\n\n")}\n\n[引用事项交互说明]\n以上是用户从收件箱或时间线引用的具体事项详情。若用户在提问或核实细节，请直接结合以上载荷、判断依据与只读探测工具解答；若用户明确指示批准、执行（含指定部分子项）、忽略或还原该事项，请调用 \`item_resolve\` 工具完成处理。`
         : "";
     const mentionPrefix = mentionPlugin ? `@${mentionPlugin.name} ` : "";
-    const inputText = `${mentionPrefix}${req.prompt}${attachSummary}${excerptBlock}${quoteBlock}`;
+    const inputText = `${mentionPrefix}${req.prompt}${attachSummary}${excerptBlock}${notebookContextBlock}${quoteBlock}`;
     const submitContent =
       imageBlocks.length > 0
         ? [{ type: "text" as const, text: inputText }, ...imageBlocks]
@@ -1256,6 +1421,71 @@ export class ValetDurableRuntime {
     if (!conv) return { aborted: false };
     await conv.abort(BACKGROUND_CONTEXT);
     return { aborted: true };
+  }
+
+  async generateChatTitle(
+    req: GenerateTitleRequest,
+  ): Promise<GenerateTitleResponse> {
+    const contextParts: string[] = [
+      `用户提问：${req.prompt.trim().slice(0, 600)}`,
+    ];
+
+    for (const att of req.attachments ?? []) {
+      if (att.kind === "notebook_context") {
+        contextParts.push(
+          `附件（项目 Notebook）：${att.name}${att.meta ? ` · ${att.meta}` : ""}`,
+        );
+        const excerpt = att.textExcerpt?.trim() ?? "";
+        if (excerpt) {
+          const fullMarkerIdx = excerpt.indexOf("[完整 Notebook 上下文");
+          const snippet =
+            fullMarkerIdx > 0
+              ? excerpt.slice(0, Math.min(800, fullMarkerIdx)).trim()
+              : excerpt.slice(0, 800);
+          if (snippet) {
+            contextParts.push(snippet);
+          }
+        }
+      } else if (
+        att.kind === "inbox_item" ||
+        att.kind === "timeline_event"
+      ) {
+        const label = att.kind === "inbox_item" ? "收件箱" : "时间线";
+        contextParts.push(
+          `引用事项（${label}）：${att.name}${att.meta ? ` · ${att.meta}` : ""}`,
+        );
+        const excerpt = att.textExcerpt?.trim();
+        if (excerpt) {
+          contextParts.push(excerpt.slice(0, 400));
+        }
+      } else if (att.name) {
+        contextParts.push(
+          `附件：${att.name}${att.meta ? ` (${att.meta})` : ""}`,
+        );
+      }
+    }
+
+    const res = await this.models.completeFastPrompt(
+      this.state,
+      TITLE_SYSTEM_PROMPT,
+      contextParts.join("\n\n"),
+      { maxTokens: 64, timeoutMs: 12_000 },
+    );
+
+    if (res.ok && res.text) {
+      const sanitized = sanitizeGeneratedTitle(res.text);
+      if (sanitized) {
+        return {
+          title: sanitized,
+          usedModel: res.modelLabel,
+        };
+      }
+    }
+
+    return {
+      title: deriveFallbackChatTitle(req.prompt, req.attachments),
+      usedModel: "heuristic",
+    };
   }
 
   async dispatchPluginEvent(req: DispatchPluginEventRequest): Promise<{

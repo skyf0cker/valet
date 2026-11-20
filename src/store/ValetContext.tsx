@@ -36,6 +36,7 @@ import {
 import {
   buildNotebookContextAttachment,
   createDefaultProject,
+  deriveFallbackSessionTitle,
   extractThreadSummary,
   makeBlockId,
   normalizeProjectsState,
@@ -477,6 +478,8 @@ export interface ValetContextValue {
     includeNotebookContext: boolean;
     originBlockId: string;
     originSection?: string;
+    originBeforeText?: string;
+    originAfterText?: string;
     mentionPlugin?: PluginState | null;
     openImmediately?: boolean;
   }) => Promise<ChatThread | null>;
@@ -3007,7 +3010,9 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         chatThreads: prev.chatThreads.map((t) => {
           if (t.id !== chatId) return t;
           const nextTitle =
-            t.title === "新对话" ? params.prompt.slice(0, 18) : t.title;
+            t.title === "新对话"
+              ? deriveFallbackSessionTitle(params.prompt, params.attachments)
+              : t.title;
           return {
             ...t,
             title: nextTitle,
@@ -3297,6 +3302,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       includeNotebookContext: boolean;
       originBlockId: string;
       originSection?: string;
+      originBeforeText?: string;
+      originAfterText?: string;
       mentionPlugin?: PluginState | null;
       openImmediately?: boolean;
     }): Promise<ChatThread | null> => {
@@ -3306,7 +3313,6 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       const cur = stateRef.current;
       const proj = cur.projects.find((p) => p.id === params.projectId) ?? cur.projects[0];
       const projectId = proj?.id ?? DEFAULT_PROJECT_ID;
-      const titlePreview = trimmed.replace(/\s+/g, " ").slice(0, 22);
       const model = params.model || cur.preferences.models.primary || "claude-opus-4";
 
       const attachments: ChatAttachment[] = [];
@@ -3314,11 +3320,17 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         attachments.push(
           buildNotebookContextAttachment(
             proj,
-            cur.chatThreads.filter((t) => t.projectId === projectId),
-            params.originSection
+            cur.chatThreads.filter((t) => (t.projectId || DEFAULT_PROJECT_ID) === projectId),
+            {
+              originBlockId: params.originBlockId,
+              originSection: params.originSection,
+              originBeforeText: params.originBeforeText,
+              originAfterText: params.originAfterText,
+            }
           )
         );
       }
+      const titlePreview = deriveFallbackSessionTitle(trimmed, attachments);
 
       let createdThread: ChatThread;
       if (isMyGo()) {
