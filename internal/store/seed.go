@@ -34,6 +34,8 @@ func NewSeedSnapshot(homeDir string) types.ValetSnapshot {
 		IsOnDuty:                   true,
 		IsPaused:                   false,
 		ActivePluginDetailID:       nil,
+		ActiveProjectID:            types.DefaultProjectID,
+		ActiveProjectTab:           "sessions",
 		ActiveChatID:               "chat-default",
 		SelectedTimelineEventID:    nil,
 		SelectedInboxItemID:        nil,
@@ -45,6 +47,7 @@ func NewSeedSnapshot(homeDir string) types.ValetSnapshot {
 		Providers:                  seedProviders(),
 		InboxItems:                 []types.InboxApprovalItem{},
 		TimelineEvents:             []types.TimelineEvent{},
+		Projects:                   []types.Project{DefaultProject()},
 		ChatThreads:                seedChatThreads(prefs.Models.Primary, prefs.UserNickname),
 		Automations:                []types.AutomationRule{},
 		McpServers:                 []types.McpServerItem{},
@@ -338,11 +341,28 @@ func maskKey(k string) string {
 	return k[:6] + "••••" + k[len(k)-4:]
 }
 
+// DefaultProject returns the pinned system project used for unassigned/existing sessions.
+func DefaultProject() types.Project {
+	return types.Project{
+		ID:          types.DefaultProjectID,
+		Title:       "默认项目",
+		Description: "自动收纳所有快速发起与历史迁移的对话；可随时归类移入专属项目，或切换至 Notebook 用 Markdown 整理备忘。",
+		Icon:        "box",
+		Tags:        []string{},
+		IsDefault:   true,
+		UpdatedAt:   "刚刚",
+		CreatedAt:   time.Now().Format("2006-01-02"),
+		Blocks: []types.NotebookBlock{
+			{ID: "blk-default-1", Type: "paragraph", Content: ""},
+		},
+	}
+}
+
 func seedChatThreads(primaryModel, nick string) []types.ChatThread {
 	nowHHMM := time.Now().Format("15:04")
 	return []types.ChatThread{
 		{
-			ID: "chat-default", Title: "新对话", Model: primaryModel,
+			ID: "chat-default", ProjectID: types.DefaultProjectID, Title: "新对话", Model: primaryModel,
 			TimelineActionCount: 0, LinkedEventIDs: []string{}, UpdatedAt: "刚刚",
 			Messages: []types.ChatMessage{
 				{

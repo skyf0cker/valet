@@ -1,7 +1,10 @@
 import React, { useMemo, useState } from "react";
 import { useValet } from "../../store/ValetContext";
+import type { PluginExecutionMode } from "../../types/valet";
+import { buildDefaultWorkflowYaml } from "../../utils/workflowYaml";
 import { PluginBadgeIcon, SearchIcon } from "../ui/Icons";
 import { Modal } from "../ui/Modal";
+import { SegmentedControl } from "../ui/SegmentedControl";
 import { SelectMenu } from "../ui/SelectMenu";
 import { SparkBars } from "../ui/SparkBars";
 import { Switch } from "../ui/Switch";
@@ -137,8 +140,12 @@ export const PluginsView: React.FC = () => {
   const defaultTemplate = PLUGIN_SOURCE_TEMPLATES[0]!;
   const [newName, setNewName] = useState(defaultTemplate.name);
   const [newTagline, setNewTagline] = useState(defaultTemplate.tagline);
+  const [newMode, setNewMode] = useState<PluginExecutionMode>("skill");
   const [newYaml, setNewYaml] = useState(defaultTemplate.yaml);
   const [newSkill, setNewSkill] = useState(defaultTemplate.skillMarkdown);
+  const [newWorkflowYaml, setNewWorkflowYaml] = useState(() =>
+    buildDefaultWorkflowYaml(defaultTemplate.name, "deploy.failed")
+  );
 
   // Developer event simulator state
   const installedPlugins = useMemo(
@@ -334,6 +341,11 @@ export const PluginsView: React.FC = () => {
                           >
                             · {plugin.events.length} 事件
                           </span>
+                          {plugin.executionMode === "workflow" && (
+                            <span className="ml-1.5 inline-flex h-[16px] shrink-0 items-center rounded border border-[var(--amber-border)] bg-[var(--amber-bg)] px-1.5 font-mono text-[9.5px] font-medium align-middle text-[var(--amber-text)]">
+                              Workflow
+                            </span>
+                          )}
                         </div>
                         <div
                           className={`truncate ${
@@ -773,21 +785,52 @@ skill: |
               className="rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-code)] p-3 font-mono text-[11px] leading-[18px] text-[var(--ink-secondary)] outline-none focus:border-[var(--ink-primary)]"
             />
           </label>
-          <label className="flex flex-col gap-1">
+          <div className="flex items-center justify-between gap-2 pt-0.5">
             <span className="text-[12px] font-medium text-[var(--ink-strong)]">
-              SKILL.md（Agent 处理逻辑与闭环指令）
+              运行方式（互斥二选一）
             </span>
-            <textarea
-              rows={5}
-              value={newSkill}
-              onChange={(e) => setNewSkill(e.target.value)}
-              placeholder="定义事件到来时 Agent 应如何分析 payload、调用工具并闭环处置…"
-              autoCorrect="off"
-              autoCapitalize="off"
-              spellCheck={false}
-              className="rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] p-3 font-mono text-[11.5px] leading-[18px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+            <SegmentedControl<PluginExecutionMode>
+              size="sm"
+              value={newMode}
+              onChange={(m) => setNewMode(m)}
+              options={[
+                { value: "skill", label: "Skill 模式", widthClass: "w-[74px]" },
+                { value: "workflow", label: "Workflow 模式", widthClass: "w-[92px]" },
+              ]}
             />
-          </label>
+          </div>
+          {newMode === "workflow" ? (
+            <label className="flex flex-col gap-1">
+              <span className="text-[12px] font-medium text-[var(--ink-strong)]">
+                workflow.yaml（本地 Vercel Workflow DAG 定义）
+              </span>
+              <textarea
+                rows={7}
+                value={newWorkflowYaml}
+                onChange={(e) => setNewWorkflowYaml(e.target.value)}
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+                className="rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] p-3 font-mono text-[11px] leading-[17px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+              />
+            </label>
+          ) : (
+            <label className="flex flex-col gap-1">
+              <span className="text-[12px] font-medium text-[var(--ink-strong)]">
+                SKILL.md（Agent 处理逻辑与闭环指令）
+              </span>
+              <textarea
+                rows={5}
+                value={newSkill}
+                onChange={(e) => setNewSkill(e.target.value)}
+                placeholder="定义事件到来时 Agent 应如何分析 payload、调用工具并闭环处置…"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+                className="rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] p-3 font-mono text-[11.5px] leading-[18px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+              />
+            </label>
+          )}
         </div>
 
         <div className="mt-5 flex justify-end gap-2">
@@ -805,7 +848,9 @@ skill: |
                 name: newName,
                 tagline: newTagline,
                 yaml: newYaml,
-                skillMarkdown: newSkill,
+                executionMode: newMode,
+                skillMarkdown: newMode === "skill" ? newSkill : undefined,
+                workflowYaml: newMode === "workflow" ? newWorkflowYaml : undefined,
               });
               setInstallModalOpen(false);
               setTab("installed");

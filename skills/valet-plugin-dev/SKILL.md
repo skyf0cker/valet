@@ -158,6 +158,29 @@ triggers:
 
 ---
 
+## 三·五、可选运行模式：`execution_mode: workflow` (`workflow.yaml`)
+
+每个插件可在 `skill` 模式（挂载 `SKILL.md`）与 `workflow` 模式（本地执行声明式 `workflow.yaml`，二选一互斥）之间切换：
+
+```yaml
+# manifest.yaml
+execution_mode: workflow   # skill (默认) | workflow
+```
+
+`workflow.yaml` 采用有向无环图 (DAG)，支持以下节点类型 (`nodes[].type`)：
+- `trigger`：触发入口（注入 `{{trigger.event}}`、`{{trigger.payload}}`、`{{config.*}}`）
+- `script`：执行本地脚本 (`command`, `args`, `cwd`, `timeoutMs`, `parseJson`)
+- `http`：HTTP 请求 (`url`, `method`, `headers`, `body`, `timeoutMs`)
+- `tool`：调用 Valet 内置安全工具 (`tool`, `args`)
+- `agent`：单步 LLM 推理 (`prompt`, `systemPrompt`, `model`, `allowTools`)
+- `condition`：条件分支 (`expr: { path, op, value }`，边上使用 `when: "true"` / `when: "false"`)
+- `transform`：数据重组映射 (`output`)
+- `sleep`：持久化休眠 (`duration: "5s" | "10m"`)
+- `approval`：挂起工作流并在收件箱生成审批卡 (`title`, `detail`, `riskLevel`，边可用 `when: "approved"` / `when: "rejected"`)
+- `notify`：写入时间线或管家通知 (`title`, `message`, `level`, `kind: timeline | outbox | both`)
+
+---
+
 ## 四、Agent 自研并热加载插件的标准闭环工作流
 
 当用户要求你**编写并加载/启用一个新插件**，或者**修改优化已有插件**时，按以下 4 步执行：

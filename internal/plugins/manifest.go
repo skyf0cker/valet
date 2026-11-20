@@ -65,6 +65,8 @@ type ParsedManifest struct {
 	RequiredPermission      string                    `json:"requiredPermission,omitempty"`
 	RequiredPermissionLabel string                    `json:"requiredPermissionLabel,omitempty"`
 	Permissions             []string                  `json:"permissions,omitempty"`
+	ExecutionMode           string                    `json:"executionMode,omitempty"` // "skill" | "workflow"
+	WorkflowYAML            string                    `json:"workflowYaml,omitempty"`
 	Instructions            string                    `json:"instructions,omitempty"`
 	Skill                   string                    `json:"skill,omitempty"`
 	ConfigSchema            []types.PluginConfigField `json:"configSchema,omitempty"`
@@ -222,6 +224,13 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 				section = ""
 			case "required_permission_label", "requiredPermissionLabel":
 				out.RequiredPermissionLabel = val
+				section = ""
+			case "execution_mode", "executionMode":
+				if strings.EqualFold(val, "workflow") {
+					out.ExecutionMode = "workflow"
+				} else {
+					out.ExecutionMode = "skill"
+				}
 				section = ""
 			case "permissions":
 				if strings.HasPrefix(val, "[") {
@@ -405,8 +414,11 @@ func ParseManifestYAML(raw string) (ParsedManifest, error) {
 		}
 	}
 
-	if out.Name == "" && out.ID == "" && len(out.Events) == 0 && out.Skill == "" {
+	if out.Name == "" && out.ID == "" && len(out.Events) == 0 && out.Skill == "" && out.ExecutionMode == "" {
 		return out, fmt.Errorf("无效插件 manifest：缺少 name / id / triggers / skill 声明")
+	}
+	if out.ExecutionMode == "" {
+		out.ExecutionMode = "skill"
 	}
 	if len(out.Events) == 0 && len(out.TriggerSpecs) == 0 && out.Name == "" && out.ID == "" {
 		out.Events = []string{"custom.event_triggered"}
@@ -786,4 +798,99 @@ func sanitizeIdent(raw string) string {
 		}
 	}
 	return strings.Trim(b.String(), "_")
+}
+
+// NormalizeExecutionMode returns "workflow" or "skill" (default).
+func NormalizeExecutionMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "workflow") {
+		return "workflow"
+	}
+	return "skill"
+}
+
+// SetManifestExecutionMode updates or inserts a top-level `execution_mode` line in manifest YAML.
+func SetManifestExecutionMode(manifestYAML, mode string) string {
+	normalizedMode := NormalizeExecutionMode(mode)
+	norm := strings.ReplaceAll(strings.TrimSpace(manifestYAML), "\r\n", "\n")
+	if norm == "" {
+		return "execution_mode: " + normalizedMode
+	}
+	lines := strings.Split(norm, "\n")
+	replaced := false
+	insertIdx := -1
+	for i, line := range lines {
+		if len(line) == 0 || line[0] == ' ' || line[0] == '\t' || strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		key, _, ok := strings.Cut(trimmed, ":")
+		if !ok {
+			continue
+		}
+		k := strings.TrimSpace(key)
+		if k == "execution_mode" || k == "executionMode" {
+			lines[i] = "execution_mode: " + normalizedMode
+			replaced = true
+			break
+		}
+		if k == "id" || k == "name" || k == "version" {
+			insertIdx = i + 1
+		}
+	}
+	if !replaced {
+		newLine := "execution_mode: " + normalizedMode
+		if insertIdx < 0 || insertIdx > len(lines) {
+			lines = append([]string{newLine}, lines...)
+		} else {
+			out := make([]string, 0, len(lines)+1)
+			out = append(out, lines[:insertIdx]...)
+			out = append(out, newLine)
+			out = append(out, lines[insertIdx:]...)
+			lines = out
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// DefaultStarterWorkflowYAML returns a ready-to-run 3-node starter workflow.yaml definition.
+func DefaultStarterWorkflowYAML(name, eventCode string) string {
+	cleanName := strings.TrimSpace(name)
+	if cleanName == "" {
+		cleanName = "plugin-workflow"
+	}
+	cleanEvent := strings.TrimSpace(eventCode)
+	if cleanEvent == "" {
+		cleanEvent = "manual"
+	}
+	return fmt.Sprintf(`version: 1
+name: %s
+description: 声明式自动化工作流
+nodes:
+  - id: trigger
+    type: trigger
+    name: 事件触发
+    config:
+      event: %s
+  - id: prepare
+    type: transform
+    name: 整理上下文
+    config:
+      output:
+        event: "{{trigger.event}}"
+        summary: "{{trigger.summary}}"
+        payload: "{{trigger.payload}}"
+  - id: report
+    type: notify
+    name: 记录结果
+    config:
+      title: %s
+      message: "已处理事件 {{steps.prepare.output.event}}: {{steps.prepare.output.summary}}"
+      level: info
+      kind: timeline
+edges:
+  - from: trigger
+    to: prepare
+  - from: prepare
+    to: report
+`, cleanName, cleanEvent, cleanName)
 }

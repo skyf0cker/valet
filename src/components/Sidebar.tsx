@@ -1,17 +1,22 @@
 import React, { useEffect, useState } from "react";
 import { useValet } from "../store/ValetContext";
 import { getDarkThemeMeta } from "../constants/themes";
-import type { AppView } from "../types/valet";
+import { DEFAULT_PROJECT_ID, type AppView } from "../types/valet";
+import { CreateProjectModal } from "./projects/CreateProjectModal";
 import { DutyPulse } from "./ui/DutyPulse";
 import {
   ArchiveIcon,
-  ChatBubbleIcon,
+  BookOpenIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
   ClockIcon,
   InboxIcon,
   MoonIcon,
   PauseIcon,
   PlayIcon,
   PlugIcon,
+  PlusIcon,
+  ProjectGlyph,
   SettingsIcon,
   SidebarPanelIcon,
   SunIcon,
@@ -52,6 +57,9 @@ export const Sidebar: React.FC = () => {
     sidebarCollapsed,
     setActiveView,
     openSettingsSection,
+    selectProject,
+    openProjectSession,
+    createNewChat,
     selectChatThread,
     archiveChatThread,
     selectTimelineEvent,
@@ -61,6 +69,17 @@ export const Sidebar: React.FC = () => {
   } = useValet();
 
   const [archiveModalOpen, setArchiveModalOpen] = useState(false);
+  const [createProjectModalOpen, setCreateProjectModalOpen] = useState(false);
+  const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>(() => ({
+    [DEFAULT_PROJECT_ID]: true,
+  }));
+
+  useEffect(() => {
+    if (!state.activeProjectId) return;
+    setExpandedProjects((prev) =>
+      prev[state.activeProjectId] === false ? prev : { ...prev, [state.activeProjectId]: true }
+    );
+  }, [state.activeProjectId]);
 
   const [isSystemDark, setIsSystemDark] = useState<boolean>(() =>
     typeof window !== "undefined"
@@ -78,7 +97,8 @@ export const Sidebar: React.FC = () => {
   const enabledPluginsCount = state.plugins.filter(
     (p) => p.installed && p.enabled
   ).length;
-  const recentThreads = state.chatThreads.filter((t) => !t.archived).slice(0, 6);
+  const visibleProjects = state.projects.filter((p) => !p.archived);
+  const activeThreads = state.chatThreads.filter((t) => !t.archived);
   const archivedThreads = state.chatThreads.filter((t) => t.archived);
 
   const pendingInboxCount = state.inboxItems.filter(
@@ -197,10 +217,10 @@ export const Sidebar: React.FC = () => {
       icon: <ClockIcon size={16} />,
     },
     {
-      id: "chat",
-      label: "对话",
+      id: "projects",
+      label: "项目",
       shortcut: "⌘ 2",
-      icon: <ChatBubbleIcon size={16} />,
+      icon: <BookOpenIcon size={16} />,
     },
     {
       id: "plugins",
@@ -269,7 +289,9 @@ export const Sidebar: React.FC = () => {
         {/* Vertical Icon Navigation */}
         <nav className="flex w-10 flex-col items-center gap-1.5 border-t border-[var(--border-base)] pt-2.5">
           {navItems.map((item) => {
-            const active = state.activeView === item.id;
+            const active =
+              state.activeView === item.id ||
+              (item.id === "projects" && state.activeView === "chat");
             return (
               <button
                 key={item.id}
@@ -438,7 +460,9 @@ export const Sidebar: React.FC = () => {
         </div>
 
         {navItems.map((item) => {
-          const active = state.activeView === item.id;
+          const active =
+            state.activeView === item.id ||
+            (item.id === "projects" && state.activeView === "chat");
           return (
             <button
               key={item.id}
@@ -479,59 +503,210 @@ export const Sidebar: React.FC = () => {
         })}
       </div>
 
-      {/* Recent chats */}
-      <div className="flex min-h-0 flex-1 flex-col gap-[2px] pt-[22px]">
-        <div className="flex items-center justify-between px-2 pb-2">
+      {/* Projects tree */}
+      <div className="flex min-h-0 flex-1 flex-col gap-[2px] pt-[20px]">
+        <div className="flex items-center justify-between px-2 pb-1.5">
           <span className="font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--ink-subtle)]">
-            Recent chats
+            Projects
           </span>
-          {archivedThreads.length > 0 && (
+          <div className="flex items-center gap-1">
+            {archivedThreads.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setArchiveModalOpen(true)}
+                title="查看并恢复已归档对话"
+                className="cursor-pointer rounded-[5px] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-subtle)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
+              >
+                归档 {archivedThreads.length}
+              </button>
+            )}
             <button
               type="button"
-              onClick={() => setArchiveModalOpen(true)}
-              title="查看并恢复已归档对话"
-              className="cursor-pointer rounded-[5px] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-subtle)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
+              onClick={() => setCreateProjectModalOpen(true)}
+              title="新建项目"
+              aria-label="新建项目"
+              className="flex h-5 w-5 cursor-pointer items-center justify-center rounded-[5px] text-[var(--ink-muted)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
             >
-              已归档 {archivedThreads.length}
+              <PlusIcon size={12} />
             </button>
-          )}
+          </div>
         </div>
-        <div className="flex flex-col gap-[2px] overflow-y-auto">
-          {recentThreads.map((thread) => {
-            const active = state.activeView === "chat" && state.activeChatId === thread.id;
+
+        <div className="flex flex-col gap-[2px] overflow-y-auto pr-0.5">
+          {visibleProjects.map((project) => {
+            const projectThreads = activeThreads.filter(
+              (t) => (t.projectId || DEFAULT_PROJECT_ID) === project.id
+            );
+            const isExpanded = expandedProjects[project.id] ?? project.id === state.activeProjectId;
+            const inProjectsView =
+              state.activeView === "projects" || state.activeView === "chat";
+            const isProjectSelected =
+              inProjectsView &&
+              state.activeProjectId === project.id &&
+              state.activeProjectTab !== "session";
+
             return (
-              <div
-                key={thread.id}
-                className={`group flex h-[30px] w-full shrink-0 items-center rounded-[7px] transition-colors ${
-                  active
-                    ? "bg-[var(--bg-hover)] font-semibold text-[var(--ink-strong)]"
-                    : "text-[var(--ink-secondary)] hover:bg-[var(--bg-hover)]/50 hover:text-[var(--ink-strong)]"
-                }`}
-              >
-                <button
-                  type="button"
-                  onClick={() => selectChatThread(thread.id)}
-                  className="min-w-0 flex-1 cursor-pointer truncate px-2.5 text-left text-[13px] leading-[16px]"
+              <div key={project.id} className="flex flex-col gap-[1px]">
+                <div
+                  className={`group flex h-[30px] w-full shrink-0 items-center gap-1 rounded-[7px] px-1.5 transition-colors ${
+                    isProjectSelected
+                      ? "bg-[var(--bg-hover)] font-semibold text-[var(--ink-strong)]"
+                      : "text-[var(--ink-secondary)] hover:bg-[var(--bg-hover)]/50 hover:text-[var(--ink-strong)]"
+                  }`}
                 >
-                  {thread.title}
-                </button>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    archiveChatThread(thread.id, true);
-                  }}
-                  title="归档对话"
-                  aria-label={`归档对话 ${thread.title}`}
-                  className="mr-1.5 flex h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-[5px] text-[var(--ink-subtle)] opacity-0 transition-opacity hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] group-hover:opacity-100 focus:opacity-100"
-                >
-                  <ArchiveIcon size={12} />
-                </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setExpandedProjects((prev) => ({
+                        ...prev,
+                        [project.id]: !isExpanded,
+                      }))
+                    }
+                    aria-label={isExpanded ? `收起项目 ${project.title}` : `展开项目 ${project.title}`}
+                    className="flex h-5 w-[14px] shrink-0 cursor-pointer items-center justify-center text-[var(--ink-subtle)] hover:text-[var(--ink-strong)]"
+                  >
+                    {isExpanded ? <ChevronDownIcon size={11} /> : <ChevronRightIcon size={11} />}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExpandedProjects((prev) => ({ ...prev, [project.id]: true }));
+                      selectProject(project.id);
+                    }}
+                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+                  >
+                    <span className="flex h-4 w-4 shrink-0 items-center justify-center text-[var(--ink-muted)]">
+                      <ProjectGlyph
+                        icon={project.isDefault ? "box" : project.icon}
+                        size={13.5}
+                      />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-[12.5px] leading-[16px]">
+                      {project.title}
+                    </span>
+                  </button>
+
+                  {project.isDefault && (
+                    <span className="shrink-0 rounded-[4px] bg-[var(--bg-muted)] px-1 py-[1px] font-mono text-[9px] leading-[11px] text-[var(--ink-muted)] group-hover:hidden">
+                      默认
+                    </span>
+                  )}
+
+                  <span className="w-4 shrink-0 text-right font-mono text-[10px] text-[var(--ink-subtle)] group-hover:hidden">
+                    {projectThreads.length}
+                  </span>
+
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpandedProjects((prev) => ({ ...prev, [project.id]: true }));
+                      createNewChat(project.id);
+                    }}
+                    title={`在「${project.title}」中新建对话`}
+                    aria-label={`在「${project.title}」中新建对话`}
+                    className="hidden h-[20px] w-[20px] shrink-0 cursor-pointer items-center justify-center rounded-[5px] text-[var(--ink-muted)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] group-hover:flex"
+                  >
+                    <PlusIcon size={11} />
+                  </button>
+                </div>
+
+                {isExpanded && projectThreads.length > 0 && (
+                  <div className="pl-[13px]">
+                    <div className="flex flex-col gap-[1px] border-l border-[var(--border-control)] pl-2">
+                      {projectThreads.map((thread) => {
+                        const isSessionActive =
+                          inProjectsView &&
+                          state.activeProjectTab === "session" &&
+                          state.activeChatId === thread.id;
+                        const isRunning =
+                          (runningChatIds[thread.id] ?? 0) > 0 ||
+                          (chatStream?.chatId === thread.id &&
+                            chatStream.phase !== "done" &&
+                            chatStream.phase !== "error");
+                        const hasPending = state.inboxItems.some(
+                          (it) =>
+                            it.status === "pending" &&
+                            (it.sourceChatId === thread.id ||
+                              (it.linkedTimelineEventId &&
+                                thread.linkedEventIds.includes(it.linkedTimelineEventId)))
+                        );
+
+                        return (
+                          <div
+                            key={thread.id}
+                            className={`group flex h-[28px] w-full shrink-0 items-center rounded-[6px] transition-colors ${
+                              isSessionActive
+                                ? "bg-[var(--bg-hover)] font-semibold text-[var(--ink-strong)]"
+                                : "text-[var(--ink-secondary)] hover:bg-[var(--bg-hover)]/50 hover:text-[var(--ink-strong)]"
+                            }`}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => openProjectSession(thread.id)}
+                              className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-2 text-left text-[12px] leading-[16px]"
+                            >
+                              <span className="flex h-2.5 w-2.5 shrink-0 items-center justify-center">
+                                {isRunning ? (
+                                  <svg
+                                    width="9"
+                                    height="9"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    className="animate-valet-spin text-[var(--ink-primary)]"
+                                    aria-hidden="true"
+                                  >
+                                    <path
+                                      d="M12 3a9 9 0 109 9"
+                                      stroke="currentColor"
+                                      strokeWidth="3.2"
+                                      strokeLinecap="round"
+                                    />
+                                  </svg>
+                                ) : (
+                                  <span
+                                    className={`h-[5.5px] w-[5.5px] rounded-full ${
+                                      hasPending
+                                        ? "bg-[var(--amber-icon)]"
+                                        : isSessionActive
+                                          ? "bg-[var(--ink-primary)]"
+                                          : "bg-[var(--ink-subtle)]"
+                                    }`}
+                                  />
+                                )}
+                              </span>
+                              <span className="min-w-0 flex-1 truncate">{thread.title}</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                archiveChatThread(thread.id, true);
+                              }}
+                              title="归档对话"
+                              aria-label={`归档对话 ${thread.title}`}
+                              className="mr-1 flex h-[20px] w-[20px] shrink-0 cursor-pointer items-center justify-center rounded-[5px] text-[var(--ink-subtle)] opacity-0 transition-opacity hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] group-hover:opacity-100 focus:opacity-100"
+                            >
+                              <ArchiveIcon size={11} />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
       </div>
+
+      <CreateProjectModal
+        open={createProjectModalOpen}
+        onClose={() => setCreateProjectModalOpen(false)}
+      />
 
       <Modal
         open={archiveModalOpen}

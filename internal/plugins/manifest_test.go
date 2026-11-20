@@ -362,3 +362,62 @@ func TestCatalogBundlesActionLessAndScriptPollSensor(t *testing.T) {
 		t.Fatalf("timed out waiting for script_poll surge.error_detected sensor trigger")
 	}
 }
+
+func TestWorkflowExecutionModeAndBundleRoundTrip(t *testing.T) {
+	manifest := `id: local.valet.wf-sample
+name: Workflow 示例
+version: 1.0.0
+execution_mode: workflow
+triggers:
+  - id: manual.run
+    sensor: manual
+    policy: auto
+`
+	parsed, err := ParseManifestYAML(manifest)
+	if err != nil {
+		t.Fatalf("ParseManifestYAML workflow failed: %v", err)
+	}
+	if parsed.ExecutionMode != "workflow" {
+		t.Fatalf("expected ExecutionMode=workflow, got %q", parsed.ExecutionMode)
+	}
+
+	toggledSkill := SetManifestExecutionMode(manifest, "skill")
+	pSkill, err := ParseManifestYAML(toggledSkill)
+	if err != nil || pSkill.ExecutionMode != "skill" {
+		t.Fatalf("expected skill mode after SetManifestExecutionMode, got %q (err=%v)", pSkill.ExecutionMode, err)
+	}
+
+	tmpDir := t.TempDir()
+	wfYAML := DefaultStarterWorkflowYAML("wf-sample", "manual.run")
+	pluginDir, parsedWritten, err := WritePluginBundle(tmpDir, types.UpsertLocalPluginParams{
+		ID:            "wf-sample",
+		Slug:          "wf-sample",
+		Name:          "Workflow 示例",
+		ManifestYAML:  toggledSkill,
+		ExecutionMode: "workflow",
+		WorkflowYAML:  wfYAML,
+	})
+	if err != nil {
+		t.Fatalf("WritePluginBundle failed: %v", err)
+	}
+	if parsedWritten.ExecutionMode != "workflow" || parsedWritten.WorkflowYAML == "" {
+		t.Fatalf("expected workflow mode and workflowYaml, got mode=%q len=%d", parsedWritten.ExecutionMode, len(parsedWritten.WorkflowYAML))
+	}
+
+	_, _, readParsed, files, err := ReadPluginBundle(pluginDir)
+	if err != nil {
+		t.Fatalf("ReadPluginBundle failed: %v", err)
+	}
+	if readParsed.ExecutionMode != "workflow" || !strings.Contains(readParsed.WorkflowYAML, "type: trigger") {
+		t.Fatalf("unexpected ReadPluginBundle workflow fields: %+v", readParsed)
+	}
+	hasWorkflowFile := false
+	for _, f := range files {
+		if f == "workflow.yaml" {
+			hasWorkflowFile = true
+		}
+	}
+	if !hasWorkflowFile {
+		t.Fatalf("expected workflow.yaml in files list, got %+v", files)
+	}
+}

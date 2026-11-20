@@ -1,20 +1,22 @@
-import type {
-  AgentProviderConfig,
-  AutomationRule,
-  ChatThread,
-  CleanupPolicySettings,
-  InboxApprovalItem,
-  McpServerItem,
-  MemoryEntry,
-  MonitoringThresholds,
-  PermissionItem,
-  PluginRuntimeSettings,
-  PluginState,
-  ScanState,
-  SystemMetrics,
-  TimelineEvent,
-  ValetPreferences,
-  ValetSnapshot,
+import {
+  DEFAULT_PROJECT_ID,
+  type AgentProviderConfig,
+  type AutomationRule,
+  type ChatThread,
+  type CleanupPolicySettings,
+  type InboxApprovalItem,
+  type McpServerItem,
+  type MemoryEntry,
+  type MonitoringThresholds,
+  type PermissionItem,
+  type PluginRuntimeSettings,
+  type PluginState,
+  type Project,
+  type ScanState,
+  type SystemMetrics,
+  type TimelineEvent,
+  type ValetPreferences,
+  type ValetSnapshot,
 } from "../types/valet";
 
 export const DEFAULT_THRESHOLDS: MonitoringThresholds = {
@@ -1446,9 +1448,100 @@ export const INITIAL_TIMELINE_EVENTS: TimelineEvent[] = [
   },
 ];
 
+export const INITIAL_PROJECTS: Project[] = [
+  {
+    id: DEFAULT_PROJECT_ID,
+    title: "默认项目",
+    description:
+      "自动收纳所有快速发起与历史迁移的对话；可随时归类移入专属项目，或切换至 Notebook 用 Markdown 整理备忘。",
+    icon: "box",
+    tags: [],
+    isDefault: true,
+    updatedAt: "刚刚",
+    createdAt: "2026-11-15",
+    blocks: [
+      {
+        id: "blk-default-intro",
+        type: "callout",
+        content:
+          "这里记录零散灵感与日常巡检备忘；在任意空白行输入 @valet 可直接发起新对话并在原位引用，或输入 / 插入 Markdown 块。",
+      },
+      {
+        id: "blk-default-1",
+        type: "paragraph",
+        content: "",
+      },
+    ],
+  },
+  {
+    id: "proj-perf",
+    title: "Mac 性能与存储治理",
+    description: "集中追踪卡顿排查、开发缓存清理与自动巡检规则沉淀。",
+    icon: "book",
+    tags: ["性能诊断", "磁盘治理", "自动化"],
+    workingDir: "~/Projects/valet",
+    updatedAt: "刚刚",
+    createdAt: "2026-11-15",
+    blocks: [
+      {
+        id: "blk-perf-h2",
+        type: "h2",
+        content: "现象与排查线索",
+      },
+      {
+        id: "blk-perf-callout",
+        type: "callout",
+        content:
+          "本周连续两天切换窗口明显卡顿，磁盘剩余空间跌破 12%。所有诊断线索与修复动作统一记录在本页，需要执行排查时直接输入 `@valet` 发起会话。",
+      },
+      {
+        id: "blk-perf-p1",
+        type: "paragraph",
+        content:
+          "初步观察是后台开发服务 CPU 占用异常，已通过 [[session:chat-mac-slow]] 确认是未关闭的 `vite` 持续重编译吃掉 **2.4 核 CPU**。",
+      },
+      {
+        id: "blk-perf-todo-1",
+        type: "todo",
+        checked: true,
+        content: "终止失控的 node · vite 进程（已释放 1.9 GB 内存）",
+      },
+      {
+        id: "blk-perf-todo-2",
+        type: "todo",
+        checked: false,
+        content: "扫描并清理 ~/Library/Caches 与 Xcode DerivedData 超过 2 GB 的缓存目录",
+      },
+      {
+        id: "blk-perf-todo-3",
+        type: "todo",
+        checked: false,
+        content: "沉淀为每周自动巡检插件规则，磁盘低于 15% 时提醒",
+      },
+      {
+        id: "blk-perf-ref-1",
+        type: "session_ref",
+        sessionId: "chat-mac-slow",
+        content: "Mac 为什么变卡了",
+        summary: "主要是 node 在拖后腿：一个忘记关闭的 vite 开发服务在反复重新编译，吃掉了 2.4 个核。",
+      },
+      {
+        id: "blk-perf-code",
+        type: "code",
+        language: "bash",
+        content: "du -sh ~/Library/Caches/* ~/Library/Developer/Xcode/DerivedData/* | sort -rh | head -n 5",
+      },
+    ],
+  },
+];
+
 export const INITIAL_CHAT_THREADS: ChatThread[] = [
   {
     id: "chat-mac-slow",
+    projectId: "proj-perf",
+    originBlockId: "blk-perf-ref-1",
+    originSection: "现象与排查线索",
+    notebookContextInjected: true,
     title: "Mac 为什么变卡了",
     model: "claude-opus-4",
     timelineActionCount: 2,
@@ -1533,6 +1626,7 @@ condition:
   },
   {
     id: "chat-dmg-plugin",
+    projectId: DEFAULT_PROJECT_ID,
     title: "做一个 .dmg 自动清理插件",
     model: "claude-opus-4",
     timelineActionCount: 1,
@@ -1556,6 +1650,7 @@ condition:
   },
   {
     id: "chat-docker-remnants",
+    projectId: DEFAULT_PROJECT_ID,
     title: "Docker 残留清单",
     model: "claude-opus-4",
     timelineActionCount: 1,
@@ -1890,6 +1985,8 @@ export function createInitialSnapshot(): ValetSnapshot {
     isOnDuty: true,
     isPaused: false,
     activePluginDetailId: null,
+    activeProjectId: DEFAULT_PROJECT_ID,
+    activeProjectTab: "sessions",
     activeChatId: "chat-mac-slow",
     selectedTimelineEventId: null,
     selectedInboxItemId: null,
@@ -1901,6 +1998,7 @@ export function createInitialSnapshot(): ValetSnapshot {
     inboxProcessedHistoryCount: 9,
     timelineEvents: INITIAL_TIMELINE_EVENTS,
     earlierCountLabel: "昨天 · 22 个动作 ↓",
+    projects: INITIAL_PROJECTS,
     chatThreads: INITIAL_CHAT_THREADS,
     automations: INITIAL_AUTOMATIONS,
     mcpServers: INITIAL_MCP_SERVERS,

@@ -193,6 +193,15 @@ func BuildPluginStateFromParsed(
 		resolvedSkill = existing.SkillMarkdown
 	}
 
+	resolvedMode := NormalizeExecutionMode(parsed.ExecutionMode)
+	if strings.TrimSpace(parsed.ExecutionMode) == "" && existing != nil && strings.TrimSpace(existing.ExecutionMode) != "" {
+		resolvedMode = NormalizeExecutionMode(existing.ExecutionMode)
+	}
+	resolvedWorkflow := strings.TrimSpace(parsed.WorkflowYAML)
+	if resolvedWorkflow == "" && existing != nil {
+		resolvedWorkflow = strings.TrimSpace(existing.WorkflowYAML)
+	}
+
 	resolvedSource := strings.TrimSpace(parsed.Source)
 	if resolvedSource != "core" && resolvedSource != "community" && resolvedSource != "local" {
 		if existing != nil && existing.Source != "" {
@@ -304,7 +313,9 @@ func BuildPluginStateFromParsed(
 		ConfigSchema:            append([]types.PluginConfigField(nil), parsed.ConfigSchema...),
 		Config:                  cfg,
 		ManifestYAML:            manifestYAML,
+		ExecutionMode:           resolvedMode,
 		SkillMarkdown:           resolvedSkill,
+		WorkflowYAML:            resolvedWorkflow,
 		LocalDir:                localDir,
 	}
 
@@ -348,6 +359,9 @@ func WritePluginBundle(basePluginsDir string, params types.UpsertLocalPluginPara
 	if manifestYAML == "" {
 		return "", ParsedManifest{}, errors.New("manifestYaml 不能为空")
 	}
+	if strings.TrimSpace(params.ExecutionMode) != "" {
+		manifestYAML = SetManifestExecutionMode(manifestYAML, params.ExecutionMode)
+	}
 	parsed, err := ParseManifestYAML(manifestYAML)
 	if err != nil {
 		return "", ParsedManifest{}, err
@@ -384,6 +398,21 @@ func WritePluginBundle(basePluginsDir string, params types.UpsertLocalPluginPara
 	if skillMD != "" {
 		if err := writeFileAtomic(filepath.Join(pluginDir, "SKILL.md"), []byte(skillMD+"\n"), 0o644); err != nil {
 			return "", ParsedManifest{}, err
+		}
+	}
+
+	workflowYAML := strings.TrimSpace(params.WorkflowYAML)
+	if workflowYAML != "" {
+		if err := writeFileAtomic(filepath.Join(pluginDir, "workflow.yaml"), []byte(workflowYAML+"\n"), 0o644); err != nil {
+			return "", ParsedManifest{}, err
+		}
+		parsed.WorkflowYAML = workflowYAML
+	} else {
+		for _, wfName := range []string{"workflow.yaml", "workflow.yml"} {
+			if rawWF, wErr := os.ReadFile(filepath.Join(pluginDir, wfName)); wErr == nil {
+				parsed.WorkflowYAML = strings.TrimSpace(string(rawWF))
+				break
+			}
 		}
 	}
 
@@ -467,6 +496,13 @@ func ReadPluginBundle(path string) (manifestYAML string, skillMD string, parsed 
 	if skillMD == "" && strings.TrimSpace(parsed.Skill) != "" {
 		skillMD = strings.TrimSpace(parsed.Skill)
 	}
+	for _, wfName := range []string{"workflow.yaml", "workflow.yml"} {
+		wp := filepath.Join(pluginDir, wfName)
+		if rawWF, wErr := os.ReadFile(wp); wErr == nil {
+			parsed.WorkflowYAML = strings.TrimSpace(string(rawWF))
+			break
+		}
+	}
 
 	_ = filepath.WalkDir(pluginDir, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -542,6 +578,11 @@ func LoadCatalogFromFS(fsys fs.FS) ([]types.PluginState, error) {
 		}
 		skillBytes, _ := fs.ReadFile(fsys, dirName+"/SKILL.md")
 		skillMD := strings.TrimSpace(string(skillBytes))
+		if wfBytes, wErr := fs.ReadFile(fsys, dirName+"/workflow.yaml"); wErr == nil {
+			parsed.WorkflowYAML = strings.TrimSpace(string(wfBytes))
+		} else if wfBytes, wErr := fs.ReadFile(fsys, dirName+"/workflow.yml"); wErr == nil {
+			parsed.WorkflowYAML = strings.TrimSpace(string(wfBytes))
+		}
 
 		var files []string
 		_ = fs.WalkDir(fsys, dirName, func(p string, d fs.DirEntry, wErr error) error {
@@ -649,7 +690,7 @@ func CopyPluginDirToStore(srcDir, basePluginsDir, slugOverride string) (string, 
 	extraFiles := make(map[string]string)
 	for _, rel := range files {
 		low := strings.ToLower(rel)
-		if low == "manifest.yaml" || low == "manifest.yml" || low == "plugin.yaml" || low == "plugin.yml" || low == "skill.md" {
+		if low == "manifest.yaml" || low == "manifest.yml" || low == "plugin.yaml" || low == "plugin.yml" || low == "skill.md" || low == "workflow.yaml" || low == "workflow.yml" {
 			continue
 		}
 		data, rErr := os.ReadFile(filepath.Join(resolvedSrcDir, filepath.FromSlash(rel)))
@@ -663,7 +704,9 @@ func CopyPluginDirToStore(srcDir, basePluginsDir, slugOverride string) (string, 
 		Slug:          slug,
 		Name:          parsed.Name,
 		ManifestYAML:  manifestYAML,
+		ExecutionMode: parsed.ExecutionMode,
 		SkillMarkdown: skillMD,
+		WorkflowYAML:  parsed.WorkflowYAML,
 		Files:         extraFiles,
 	})
 	if wErr != nil {

@@ -27,6 +27,9 @@ var MetricsUpdatedEvent = mygo.NewEvent[types.SystemMetrics]("metrics:updated")
 // StateChangedEvent notifies the UI when background agent/plugin work updates stored state.
 var StateChangedEvent = mygo.NewEvent[types.StateChangeNotice]("state:changed")
 
+// WorkflowUpdatedEvent notifies the UI when a local Vercel Workflow run changes status or node state.
+var WorkflowUpdatedEvent = mygo.NewEvent[types.WorkflowUpdatedPayload]("workflow:updated")
+
 func main() {
 	svc := backend.NewService()
 	mygo.BindAs("Valet", svc)
@@ -161,6 +164,9 @@ func main() {
 			},
 			OnState: func(n types.StateChangeNotice) {
 				_ = StateChangedEvent.Emit(win, n)
+			},
+			OnWorkflowUpdated: func(p types.WorkflowUpdatedPayload) {
+				_ = WorkflowUpdatedEvent.Emit(win, p)
 			},
 		}
 		backend.ConfigureService(svc, startOpts)

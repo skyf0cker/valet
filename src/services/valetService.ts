@@ -1,4 +1,5 @@
 import { isMyGo } from "mygo-runtime";
+import { parse as parseYaml } from "yaml";
 import {
   Valet,
   type AgentProviderConfig as MyGoProviderConfig,
@@ -12,8 +13,16 @@ import type {
   InboxApprovalItem,
   PermissionId,
   PluginState,
+  ResumeWorkflowHookParams,
+  StartWorkflowParams,
   TimelineEvent,
+  WorkflowGraphDefinition,
+  WorkflowGraphResponse,
+  WorkflowNodeType,
+  WorkflowRunDetail,
+  WorkflowRunSummary,
 } from "../types/valet";
+import { buildDefaultWorkflowYaml } from "../utils/workflowYaml";
 import { isQuoteAttachment } from "../utils/chatQuotes";
 
 export interface ProviderVerifyResult {
@@ -66,6 +75,12 @@ export interface ValetService {
     event: TimelineEvent;
     inboxItem?: InboxApprovalItem;
   };
+  getPluginWorkflowGraph(plugin: PluginState): Promise<WorkflowGraphResponse>;
+  listPluginWorkflowRuns(pluginId: string, limit?: number): Promise<WorkflowRunSummary[]>;
+  getWorkflowRunDetail(runId: string): Promise<WorkflowRunDetail>;
+  triggerPluginWorkflow(plugin: PluginState, params: StartWorkflowParams): Promise<WorkflowRunDetail>;
+  cancelWorkflowRun(runId: string): Promise<WorkflowRunDetail>;
+  resumeWorkflowHook(params: ResumeWorkflowHookParams): Promise<WorkflowRunDetail>;
 }
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -523,6 +538,205 @@ triggers:
 
     return { event: evt, inboxItem };
   }
+
+  private readonly mockWorkflowRuns = new Map<string, WorkflowRunDetail>();
+
+  private parseMockDefinition(plugin: PluginState): {
+    yaml: string;
+    valid: boolean;
+    errors: string[];
+    definition?: WorkflowGraphDefinition;
+  } {
+    const yamlText =
+      plugin.workflowYaml?.trim() ||
+      buildDefaultWorkflowYaml(plugin.name, plugin.events[0]?.id || "manual");
+    try {
+      const parsed = parseYaml(yamlText) as Record<string, unknown> | null;
+      if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.nodes)) {
+        return { yaml: yamlText, valid: false, errors: ["workflow.yaml 缺少 nodes 节点列表"] };
+      }
+      const nodes = (parsed.nodes as Array<Record<string, unknown>>).map((n, idx) => ({
+        id: String(n.id ?? `node_${idx}`),
+        type: String(n.type ?? "transform") as WorkflowNodeType,
+        name: typeof n.name === "string" ? n.name : undefined,
+        description: typeof n.description === "string" ? n.description : undefined,
+        config:
+          n.config && typeof n.config === "object" && !Array.isArray(n.config)
+            ? (n.config as Record<string, unknown>)
+            : {},
+      }));
+      const edges = Array.isArray(parsed.edges)
+        ? (parsed.edges as Array<Record<string, unknown>>).map((e, idx) => ({
+            id: typeof e.id === "string" ? e.id : `e-${e.from}-${e.to}-${idx}`,
+            from: String(e.from ?? ""),
+            to: String(e.to ?? ""),
+            when: typeof e.when === "string" ? e.when : undefined,
+            label: typeof e.label === "string" ? e.label : undefined,
+          }))
+        : [];
+      return {
+        yaml: yamlText,
+        valid: true,
+        errors: [],
+        definition: {
+          version: typeof parsed.version === "number" ? parsed.version : 1,
+          name: typeof parsed.name === "string" ? parsed.name : plugin.name,
+          description:
+            typeof parsed.description === "string" ? parsed.description : undefined,
+          nodes,
+          edges,
+        },
+      };
+    } catch (err) {
+      return {
+        yaml: yamlText,
+        valid: false,
+        errors: [err instanceof Error ? err.message : String(err)],
+      };
+    }
+  }
+
+  async getPluginWorkflowGraph(plugin: PluginState): Promise<WorkflowGraphResponse> {
+    const parsed = this.parseMockDefinition(plugin);
+    return {
+      pluginId: plugin.id,
+      executionMode: plugin.executionMode ?? "skill",
+      workflowYaml: parsed.yaml,
+      valid: parsed.valid,
+      errors: parsed.errors,
+      definition: parsed.definition,
+      topologicalOrder: parsed.definition?.nodes.map((n) => n.id) ?? [],
+      entryNodeIds: parsed.definition?.nodes.slice(0, 1).map((n) => n.id) ?? [],
+    };
+  }
+
+  async listPluginWorkflowRuns(pluginId: string): Promise<WorkflowRunSummary[]> {
+    return [...this.mockWorkflowRuns.values()]
+      .filter((r) => r.summary.pluginId === pluginId)
+      .map((r) => r.summary)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async getWorkflowRunDetail(runId: string): Promise<WorkflowRunDetail> {
+    const found = this.mockWorkflowRuns.get(runId);
+    if (!found) {
+      throw new Error(`未找到 Workflow 运行记录: ${runId}`);
+    }
+    return found;
+  }
+
+  async triggerPluginWorkflow(
+    plugin: PluginState,
+    params: StartWorkflowParams
+  ): Promise<WorkflowRunDetail> {
+    await delay(220);
+    const parsed = this.parseMockDefinition(plugin);
+    const def: WorkflowGraphDefinition = parsed.definition ?? {
+      version: 1,
+      nodes: [],
+      edges: [],
+    };
+    const now = new Date();
+    const runId = makeId("wrun-mock");
+    const triggerPayload = {
+      event: params.event || plugin.events[0]?.id || "manual",
+      source: params.source || "manual",
+      summary: params.summary || `${plugin.name} 预览触发`,
+      payload: params.payload ?? { sample: true },
+      triggeredAt: now.toISOString(),
+    };
+    const hasApproval = def.nodes.find((n) => n.type === "approval");
+    const detail: WorkflowRunDetail = {
+      summary: {
+        runId,
+        pluginId: plugin.id,
+        pluginName: plugin.name,
+        triggerEvent: triggerPayload.event,
+        triggerSource: triggerPayload.source,
+        status: hasApproval ? "waiting_approval" : "completed",
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+        completedAt: hasApproval ? undefined : new Date(now.getTime() + 180).toISOString(),
+        durationMs: hasApproval ? undefined : 180,
+      },
+      definition: def,
+      triggerInput: triggerPayload,
+      nodes: def.nodes.map((n, idx) => ({
+        nodeId: n.id,
+        nodeType: n.type,
+        nodeName: n.name || n.id,
+        status:
+          hasApproval && n.id === hasApproval.id
+            ? "waiting_approval"
+            : hasApproval && idx > def.nodes.findIndex((x) => x.id === hasApproval.id)
+              ? "pending"
+              : "completed",
+        startedAt: now.toISOString(),
+        completedAt:
+          hasApproval && idx >= def.nodes.findIndex((x) => x.id === hasApproval.id)
+            ? undefined
+            : new Date(now.getTime() + (idx + 1) * 45).toISOString(),
+        durationMs: hasApproval ? undefined : 45,
+        input: { trigger: triggerPayload, nodeConfig: n.config ?? {} },
+        output:
+          n.type === "approval"
+            ? { waitingApproval: true, hookToken: `mock:${runId}:${n.id}` }
+            : { ok: true, nodeId: n.id },
+        hookToken: n.type === "approval" ? `mock:${runId}:${n.id}` : undefined,
+      })),
+      edges: def.edges.map((e) => ({
+        edgeId: e.id,
+        from: e.from,
+        to: e.to,
+        status: hasApproval ? "pending" : "taken",
+      })),
+    };
+    this.mockWorkflowRuns.set(runId, detail);
+    return detail;
+  }
+
+  async cancelWorkflowRun(runId: string): Promise<WorkflowRunDetail> {
+    const cur = await this.getWorkflowRunDetail(runId);
+    const updated: WorkflowRunDetail = {
+      ...cur,
+      summary: {
+        ...cur.summary,
+        status: "cancelled",
+        completedAt: new Date().toISOString(),
+      },
+    };
+    this.mockWorkflowRuns.set(runId, updated);
+    return updated;
+  }
+
+  async resumeWorkflowHook(params: ResumeWorkflowHookParams): Promise<WorkflowRunDetail> {
+    for (const [id, run] of this.mockWorkflowRuns.entries()) {
+      const target = run.nodes.find((n) => n.hookToken === params.token);
+      if (target) {
+        const next: WorkflowRunDetail = {
+          ...run,
+          summary: {
+            ...run.summary,
+            status: "completed",
+            completedAt: new Date().toISOString(),
+            durationMs: 260,
+          },
+          nodes: run.nodes.map((n) => ({
+            ...n,
+            status: "completed",
+            output:
+              n.hookToken === params.token
+                ? { approved: params.approved, comment: params.comment ?? "" }
+                : n.output ?? { ok: true },
+          })),
+          edges: run.edges.map((e) => ({ ...e, status: "taken" })),
+        };
+        this.mockWorkflowRuns.set(id, next);
+        return next;
+      }
+    }
+    throw new Error(`未找到 Hook Token: ${params.token}`);
+  }
 }
 
 class MyGoValetService implements ValetService {
@@ -594,6 +808,33 @@ class MyGoValetService implements ValetService {
   createSimulatedPluginEvent(plugin: PluginState, eventCode: string) {
     return this.fallback.createSimulatedPluginEvent(plugin, eventCode);
   }
+
+  async getPluginWorkflowGraph(plugin: PluginState): Promise<WorkflowGraphResponse> {
+    return (await Valet.getPluginWorkflowGraph(plugin.id)) as unknown as WorkflowGraphResponse;
+  }
+
+  async listPluginWorkflowRuns(pluginId: string, limit = 30): Promise<WorkflowRunSummary[]> {
+    return (await Valet.listPluginWorkflowRuns(pluginId, limit)) as unknown as WorkflowRunSummary[];
+  }
+
+  async getWorkflowRunDetail(runId: string): Promise<WorkflowRunDetail> {
+    return (await Valet.getWorkflowRunDetail(runId)) as unknown as WorkflowRunDetail;
+  }
+
+  async triggerPluginWorkflow(
+    _plugin: PluginState,
+    params: StartWorkflowParams
+  ): Promise<WorkflowRunDetail> {
+    return (await Valet.triggerPluginWorkflow(params)) as unknown as WorkflowRunDetail;
+  }
+
+  async cancelWorkflowRun(runId: string): Promise<WorkflowRunDetail> {
+    return (await Valet.cancelWorkflowRun(runId)) as unknown as WorkflowRunDetail;
+  }
+
+  async resumeWorkflowHook(params: ResumeWorkflowHookParams): Promise<WorkflowRunDetail> {
+    return (await Valet.resumeWorkflowHook(params)) as unknown as WorkflowRunDetail;
+  }
 }
 
 const mockService = new MockValetService();
@@ -621,4 +862,16 @@ export const valetService: ValetService = {
     ),
   createSimulatedPluginEvent: (plugin, eventCode) =>
     (isMyGo() ? mygoService : mockService).createSimulatedPluginEvent(plugin, eventCode),
+  getPluginWorkflowGraph: (plugin) =>
+    (isMyGo() ? mygoService : mockService).getPluginWorkflowGraph(plugin),
+  listPluginWorkflowRuns: (pluginId, limit) =>
+    (isMyGo() ? mygoService : mockService).listPluginWorkflowRuns(pluginId, limit),
+  getWorkflowRunDetail: (runId) =>
+    (isMyGo() ? mygoService : mockService).getWorkflowRunDetail(runId),
+  triggerPluginWorkflow: (plugin, params) =>
+    (isMyGo() ? mygoService : mockService).triggerPluginWorkflow(plugin, params),
+  cancelWorkflowRun: (runId) =>
+    (isMyGo() ? mygoService : mockService).cancelWorkflowRun(runId),
+  resumeWorkflowHook: (params) =>
+    (isMyGo() ? mygoService : mockService).resumeWorkflowHook(params),
 };

@@ -60,12 +60,15 @@ export function compilePluginExtension(options: {
     parsed.condition && parsed.condition.length > 0
       ? `条件：${parsed.condition.join(", ")}`
       : "";
-  const skillText = (
-    plugin.skillMarkdown ||
-    parsed.skill ||
-    parsed.instructions ||
-    ""
-  ).trim();
+  const isWorkflowMode = plugin.executionMode === "workflow";
+  const skillText = isWorkflowMode
+    ? ""
+    : (
+        plugin.skillMarkdown ||
+        parsed.skill ||
+        parsed.instructions ||
+        ""
+      ).trim();
 
   const slug = plugin.slug || plugin.id;
   const pluginDir =
@@ -101,6 +104,9 @@ export function compilePluginExtension(options: {
       section(`plugin_${sanitizeIdentifier(plugin.id)}`, () => {
         const lines = [
           `已挂载插件「${plugin.name}」(${plugin.id} ${plugin.version})：${plugin.description}`,
+          isWorkflowMode
+            ? "运行模式：workflow（通过 workflow.yaml 由本地 Vercel Workflow 引擎自动编排执行；不再挂载 SKILL.md）"
+            : "",
           policySummary ? `事件策略与传感器：[${policySummary}]` : "",
           conditionNote,
           pluginDir ? `插件目录 (VALET_PLUGIN_DIR): ${pluginDir}` : "",

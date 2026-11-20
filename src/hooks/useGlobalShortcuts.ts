@@ -40,7 +40,7 @@ export function useGlobalShortcuts() {
 
       if (meta && e.key === "2") {
         e.preventDefault();
-        setActiveView("chat");
+        setActiveView("projects");
         return;
       }
 

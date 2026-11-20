@@ -319,7 +319,7 @@ export function createBuiltinSkillsExtension(options: {
   const pluginInspectTool = defineTool({
     name: "plugin_inspect",
     description:
-      "Inspect full details of a plugin by ID or slug, including manifestYaml, skillMarkdown, localDir, and bundled files.",
+      "Inspect full details of a plugin by ID or slug, including executionMode, manifestYaml, skillMarkdown, workflowYaml, localDir, and bundled files.",
     parameters: obj({
       id: str({ description: "Plugin ID or slug." }),
     }),
@@ -362,13 +362,25 @@ export function createBuiltinSkillsExtension(options: {
       manifestYaml: opt(
         str({
           description:
-            "Action-less plugin manifest.yaml content declaring triggers (sensors) and optional config_schema.",
+            "Action-less plugin manifest.yaml content declaring triggers (sensors), optional execution_mode (skill | workflow), and optional config_schema.",
+        }),
+      ),
+      executionMode: opt(
+        str({
+          description:
+            "Execution mode: 'skill' (default, mounts SKILL.md) or 'workflow' (executes workflow.yaml via local Vercel Workflow SDK).",
         }),
       ),
       skillMarkdown: opt(
         str({
           description:
-            "SKILL.md content explaining how Valet handles events using core tools.",
+            "SKILL.md content explaining how Valet handles events using core tools (used when executionMode is 'skill').",
+        }),
+      ),
+      workflowYaml: opt(
+        str({
+          description:
+            "workflow.yaml DAG definition (used when executionMode is 'workflow').",
         }),
       ),
       files: opt(
@@ -425,15 +437,21 @@ export function createBuiltinSkillsExtension(options: {
         tagline: args.tagline ?? "",
         description: args.description ?? "",
         manifestYaml: args.manifestYaml,
+        executionMode: args.executionMode ?? "",
         skillMarkdown: args.skillMarkdown ?? "",
+        workflowYaml: args.workflowYaml ?? "",
         ...(Object.keys(fileMap).length > 0 ? { files: fileMap } : {}),
         ...(args.enabled !== undefined ? { enabled: args.enabled } : {}),
       });
       if (Array.isArray(res?.plugins)) {
         onPluginsUpdated(res.plugins);
       }
+      const modeLabel =
+        res.plugin.executionMode === "workflow"
+          ? "已验证并加载 workflow.yaml"
+          : "已触发传感器刷新并实时挂载 <plugin_skill>";
       return textResult(
-        `已写入并热加载插件「${res.plugin.name}」(${res.plugin.id}) -> ${res.plugin.localDir ?? ""}\n已触发传感器刷新并实时挂载 <plugin_skill>。`,
+        `已写入并热加载插件「${res.plugin.name}」(${res.plugin.id}) -> ${res.plugin.localDir ?? ""}\n${modeLabel}。`,
         { plugin: res.plugin as never },
       );
     },

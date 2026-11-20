@@ -33,6 +33,13 @@ import {
   buildInboxQuoteAttachment,
   buildTimelineQuoteAttachment,
 } from "../utils/chatQuotes";
+import {
+  buildNotebookContextAttachment,
+  createDefaultProject,
+  extractThreadSummary,
+  makeBlockId,
+  normalizeProjectsState,
+} from "../utils/notebook";
 import { findLinkedTimelineEvent } from "../utils/timelineLinks";
 import {
   getInboxQuestionOptions,
@@ -40,30 +47,42 @@ import {
   isQuestionInboxItem,
   isReversibleTrashInboxItem,
 } from "../utils/inbox";
-import type {
-  AgentProviderConfig,
-  AppView,
-  AutonomyLevel,
-  AutomationRule,
-  ChatAttachment,
-  ChatMessage,
-  ChatThread,
-  EventPolicyMode,
-  InboxApprovalItem,
-  McpServerItem,
-  ModelSelection,
-  OnboardingStepId,
-  PermissionId,
-  PluginConfig,
-  PluginDraftSpec,
-  PluginState,
-  ProviderId,
-  QueuedChatMessage,
-  ScanTaskItem,
-  SettingsSectionId,
-  TimelineEvent,
-  ValetPreferences,
-  ValetSnapshot,
+import { buildDefaultWorkflowYaml } from "../utils/workflowYaml";
+import {
+  DEFAULT_PROJECT_ID,
+  type AgentProviderConfig,
+  type AppView,
+  type AutonomyLevel,
+  type AutomationRule,
+  type ChatAttachment,
+  type ChatMessage,
+  type ChatThread,
+  type EventPolicyMode,
+  type InboxApprovalItem,
+  type McpServerItem,
+  type ModelSelection,
+  type OnboardingStepId,
+  type PermissionId,
+  type PluginConfig,
+  type PluginDraftSpec,
+  type PluginExecutionMode,
+  type PluginState,
+  type Project,
+  type ProjectIconKind,
+  type ProjectTab,
+  type ProviderId,
+  type QueuedChatMessage,
+  type ResumeWorkflowHookParams,
+  type ScanTaskItem,
+  type SettingsSectionId,
+  type StartWorkflowParams,
+  type TimelineEvent,
+  type ValetPreferences,
+  type ValetSnapshot,
+  type WorkflowGraphResponse,
+  type WorkflowRunDetail,
+  type WorkflowRunSummary,
+  type WorkflowUpdatedPayload,
 } from "../types/valet";
 
 const STORAGE_KEY = "valet.mvp.state.v2";
@@ -99,10 +118,14 @@ function createCleanSlateShell(): ValetSnapshot {
     mcpServers: [],
     memories: [],
     heartbeatLogs: [],
+    activeProjectId: DEFAULT_PROJECT_ID,
+    activeProjectTab: "sessions",
     activeChatId: "chat-default",
+    projects: [createDefaultProject()],
     chatThreads: [
       {
         id: "chat-default",
+        projectId: DEFAULT_PROJECT_ID,
         title: "新对话",
         model: base.preferences.models.primary,
         updatedAt: "刚刚",
@@ -178,7 +201,7 @@ function loadInitialState(): ValetSnapshot {
         ? [...missingSeedEvents, ...parsedTimeline]
         : parsedTimeline;
 
-    return {
+    return normalizeProjectsState({
       ...base,
       ...parsed,
       inboxItems,
@@ -221,9 +244,9 @@ function loadInitialState(): ValetSnapshot {
         ...base.scan,
         ...(parsed.scan ?? {}),
       },
-    };
+    });
   } catch {
-    return createInitialSnapshot();
+    return normalizeProjectsState(createInitialSnapshot());
   }
 }
 
@@ -291,16 +314,33 @@ function reconcileProviderModelSelection(
 
 function mergeBackendSnapshot(
   prev: ValetSnapshot,
-  remoteRaw: MyGoSnapshot
+  remoteRaw: MyGoSnapshot,
+  pendingProjectIds?: Set<string>
 ): ValetSnapshot {
-  const remote = remoteRaw as unknown as ValetSnapshot;
+  const remote = normalizeProjectsState(remoteRaw as unknown as ValetSnapshot);
   const hasActiveChat = remote.chatThreads.some(
     (t) => t.id === prev.activeChatId && !t.archived
   );
+  const hasActiveProject = remote.projects.some(
+    (p) => p.id === prev.activeProjectId && !p.archived
+  );
+  const prevProjectsById = new Map(prev.projects.map((p) => [p.id, p]));
+  const mergedProjects =
+    pendingProjectIds && pendingProjectIds.size > 0
+      ? remote.projects.map((rp) => {
+          if (!pendingProjectIds.has(rp.id)) return rp;
+          const local = prevProjectsById.get(rp.id);
+          return local ? { ...rp, blocks: local.blocks, updatedAt: local.updatedAt } : rp;
+        })
+      : remote.projects;
+
   return {
     ...prev,
     ...remote,
-    activeView: prev.activeView,
+    projects: mergedProjects,
+    activeView: prev.activeView === "chat" ? "projects" : prev.activeView,
+    activeProjectId: hasActiveProject ? prev.activeProjectId : remote.activeProjectId,
+    activeProjectTab: prev.activeProjectTab ?? remote.activeProjectTab,
     activeSettingsSection: prev.activeSettingsSection,
     activePluginDetailId: prev.activePluginDetailId,
     selectedInboxItemId: prev.selectedInboxItemId,
@@ -366,10 +406,21 @@ export interface ValetContextValue {
     name: string;
     tagline: string;
     yaml: string;
+    executionMode?: PluginExecutionMode;
     skillMarkdown?: string;
+    workflowYaml?: string;
   }) => void;
   updatePluginManifest: (pluginId: string, yaml: string) => void;
   updatePluginSkill: (pluginId: string, skillMarkdown: string) => void;
+  updatePluginExecutionMode: (pluginId: string, mode: PluginExecutionMode) => Promise<void>;
+  updatePluginWorkflow: (pluginId: string, workflowYaml: string) => Promise<void>;
+  lastWorkflowUpdate: { tick: number; payload: WorkflowUpdatedPayload } | null;
+  getPluginWorkflowGraph: (pluginId: string) => Promise<WorkflowGraphResponse>;
+  listPluginWorkflowRuns: (pluginId: string, limit?: number) => Promise<WorkflowRunSummary[]>;
+  getWorkflowRunDetail: (runId: string) => Promise<WorkflowRunDetail>;
+  triggerPluginWorkflow: (params: StartWorkflowParams) => Promise<WorkflowRunDetail>;
+  cancelWorkflowRun: (runId: string) => Promise<WorkflowRunDetail>;
+  resumeWorkflowHook: (params: ResumeWorkflowHookParams) => Promise<WorkflowRunDetail>;
   reloadPlugin: (pluginId: string) => void;
   fixPluginAuth: (pluginId: string) => void;
   updatePluginEventPolicy: (pluginId: string, eventId: string, policy: EventPolicyMode) => void;
@@ -399,6 +450,37 @@ export interface ValetContextValue {
   ignoreTimelineEvent: (eventId: string) => void;
   restoreTimelineEvent: (eventId: string) => void;
 
+  // Projects & Notebook
+  focusedNotebookBlock: { tick: number; projectId: string; blockId: string } | null;
+  selectProject: (projectId: string, tab?: "notebook" | "sessions") => void;
+  setProjectTab: (tab: ProjectTab) => void;
+  openProjectSession: (chatId: string) => void;
+  returnToProjectNotebook: (highlightBlockId?: string, projectId?: string) => void;
+  createProject: (params: {
+    title: string;
+    description?: string;
+    icon?: ProjectIconKind;
+    tags?: string[];
+    workingDir?: string;
+  }) => Promise<Project | null>;
+  updateProject: (
+    projectId: string,
+    patch: Partial<Pick<Project, "title" | "description" | "icon" | "tags" | "workingDir" | "blocks" | "archived">>
+  ) => void;
+  deleteProject: (projectId: string) => void;
+  moveChatThreadToProject: (chatId: string, targetProjectId: string) => void;
+  syncSessionSummaryToNotebook: (chatId: string) => void;
+  spawnSessionFromNotebook: (params: {
+    projectId: string;
+    prompt: string;
+    model?: string;
+    includeNotebookContext: boolean;
+    originBlockId: string;
+    originSection?: string;
+    mentionPlugin?: PluginState | null;
+    openImmediately?: boolean;
+  }) => Promise<ChatThread | null>;
+
   // Chat
   composerQuoteSignal: { tick: number; chatId: string } | null;
   getComposerDraft: (chatId: string) => ComposerDraft;
@@ -406,7 +488,7 @@ export interface ValetContextValue {
   quoteInboxItemToChat: (itemId: string) => void;
   quoteTimelineEventToChat: (eventId: string) => void;
   selectChatThread: (chatId: string) => void;
-  createNewChat: () => void;
+  createNewChat: (projectId?: string) => void;
   archiveChatThread: (chatId: string, archived?: boolean) => void;
   updateChatThreadModel: (chatId: string, model: string) => void;
   sendChatMessage: (params: {
@@ -481,8 +563,18 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     tick: number;
     eventId: string;
   } | null>(null);
+  const [focusedNotebookBlock, setFocusedNotebookBlock] = useState<{
+    tick: number;
+    projectId: string;
+    blockId: string;
+  } | null>(null);
+  const pendingProjectSaveTimersRef = useRef<Record<string, number>>({});
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [nodTick, setNodTick] = useState(0);
+  const [lastWorkflowUpdate, setLastWorkflowUpdate] = useState<{
+    tick: number;
+    payload: WorkflowUpdatedPayload;
+  } | null>(null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [arrivalNotice, setArrivalNotice] = useState<ArrivalNotice | null>(null);
 
@@ -552,7 +644,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     void Valet.getSnapshot()
       .then((snap) => {
         if (!active) return;
-        setState(snap as unknown as ValetSnapshot);
+        setState(normalizeProjectsState(snap as unknown as ValetSnapshot));
       })
       .catch(() => {
         // Ignore startup errors if window closes early
@@ -582,11 +674,20 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       void Valet.getSnapshot()
         .then((snap) => {
           if (!active) return;
-          setState((prev) => mergeBackendSnapshot(prev, snap));
+          const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
+          setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds));
         })
         .catch(() => {
           // Ignore refresh error
         });
+    });
+
+    const offWorkflowUpdated = events.workflowUpdated.on((payload) => {
+      if (!active || !payload?.pluginId) return;
+      setLastWorkflowUpdate({
+        tick: Date.now(),
+        payload: payload as unknown as WorkflowUpdatedPayload,
+      });
     });
 
     return () => {
@@ -594,6 +695,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       offMetrics();
       offChatStream();
       offStateChanged();
+      offWorkflowUpdated();
     };
   }, []);
 
@@ -640,8 +742,11 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     (promise: Promise<MyGoSnapshot>, replaceNav = false) => {
       void promise
         .then((snap) => {
+          const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
           setState((prev) =>
-            replaceNav ? (snap as unknown as ValetSnapshot) : mergeBackendSnapshot(prev, snap)
+            replaceNav
+              ? normalizeProjectsState(snap as unknown as ValetSnapshot)
+              : mergeBackendSnapshot(prev, snap, pendingIds)
           );
         })
         .catch((err: unknown) => {
@@ -1327,7 +1432,14 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   );
 
   const installCustomPlugin = useCallback(
-    (params: { name: string; tagline: string; yaml: string; skillMarkdown?: string }) => {
+    (params: {
+      name: string;
+      tagline: string;
+      yaml: string;
+      executionMode?: PluginExecutionMode;
+      skillMarkdown?: string;
+      workflowYaml?: string;
+    }) => {
       if (isMyGo()) {
         void Valet.installCustomPlugin(params)
           .then((snap) => {
@@ -1341,13 +1453,15 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         return;
       }
 
+      const mode: PluginExecutionMode =
+        params.executionMode === "workflow" ? "workflow" : "skill";
       const slug = `local-${Date.now().toString(36).slice(-4)}`;
       const newPlugin: PluginState = {
         id: slug,
         slug,
         name: params.name.trim() || "自定义本地插件",
         tagline: params.tagline.trim() || "~/Valet/plugins/custom · 本地开发",
-        description: "通过本地 Manifest YAML 与 Skill 创建的自定义事件处理插件。",
+        description: "通过本地 Manifest YAML 与 Skill / Workflow 创建的自定义事件处理插件。",
         version: "v0.1.0",
         bundleId: `local.valet.${slug}`,
         iconKind: "code",
@@ -1368,7 +1482,12 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         ],
         config: { values: {} },
         manifestYaml: params.yaml,
+        executionMode: mode,
         skillMarkdown: params.skillMarkdown?.trim() || undefined,
+        workflowYaml:
+          mode === "workflow"
+            ? params.workflowYaml?.trim() || buildDefaultWorkflowYaml(params.name, "custom.event_triggered")
+            : params.workflowYaml?.trim() || undefined,
       };
       setState((prev) => ({
         ...prev,
@@ -1468,6 +1587,163 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }));
       triggerNod();
       pushToast("已保存插件 Skill 处理逻辑并热重载", "success");
+    },
+    [pushToast, triggerNod]
+  );
+
+  const updatePluginExecutionMode = useCallback(
+    async (pluginId: string, mode: PluginExecutionMode) => {
+      if (isMyGo()) {
+        try {
+          const snap = await Valet.updatePluginExecutionMode(pluginId, mode);
+          setState((prev) => mergeBackendSnapshot(prev, snap));
+          triggerNod();
+          pushToast(
+            mode === "workflow"
+              ? "已切换为 Workflow 模式并加载 DAG 编排"
+              : "已切换为 Skill 模式并挂载 SKILL.md",
+            "success"
+          );
+        } catch (err) {
+          pushToast(err instanceof Error ? err.message : String(err), "danger");
+        }
+        return;
+      }
+
+      setState((prev) => ({
+        ...prev,
+        plugins: prev.plugins.map((pl) =>
+          pl.id === pluginId
+            ? {
+                ...pl,
+                executionMode: mode,
+                workflowYaml:
+                  mode === "workflow" && !pl.workflowYaml?.trim()
+                    ? buildDefaultWorkflowYaml(pl.name, pl.events[0]?.id || "manual")
+                    : pl.workflowYaml,
+                statusSubtitle:
+                  mode === "workflow"
+                    ? "运行模式已切换为 Workflow · 本地编排就绪"
+                    : "运行模式已切换为 Skill · SKILL.md 已挂载",
+              }
+            : pl
+        ),
+      }));
+      triggerNod();
+      pushToast(
+        mode === "workflow" ? "已切换为 Workflow 模式" : "已切换为 Skill 模式",
+        "success"
+      );
+    },
+    [pushToast, triggerNod]
+  );
+
+  const updatePluginWorkflow = useCallback(
+    async (pluginId: string, workflowYaml: string) => {
+      if (isMyGo()) {
+        try {
+          const snap = await Valet.updatePluginWorkflow(pluginId, workflowYaml);
+          setState((prev) => mergeBackendSnapshot(prev, snap));
+          triggerNod();
+          pushToast("已校验并保存 workflow.yaml", "success");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          pushToast(msg, "danger");
+          throw err;
+        }
+        return;
+      }
+
+      setState((prev) => ({
+        ...prev,
+        plugins: prev.plugins.map((pl) =>
+          pl.id === pluginId
+            ? {
+                ...pl,
+                workflowYaml: workflowYaml.trim(),
+                statusSubtitle: "刚刚更新 workflow.yaml · 本地 DAG 已就绪",
+              }
+            : pl
+        ),
+      }));
+      triggerNod();
+      pushToast("已保存 workflow.yaml", "success");
+    },
+    [pushToast, triggerNod]
+  );
+
+  const getPluginWorkflowGraph = useCallback(async (pluginId: string) => {
+    const plugin = stateRef.current.plugins.find((p) => p.id === pluginId);
+    if (!plugin) {
+      throw new Error(`未找到插件: ${pluginId}`);
+    }
+    return await valetService.getPluginWorkflowGraph(plugin);
+  }, []);
+
+  const listPluginWorkflowRuns = useCallback(async (pluginId: string, limit = 30) => {
+    return await valetService.listPluginWorkflowRuns(pluginId, limit);
+  }, []);
+
+  const getWorkflowRunDetail = useCallback(async (runId: string) => {
+    return await valetService.getWorkflowRunDetail(runId);
+  }, []);
+
+  const triggerPluginWorkflow = useCallback(
+    async (params: StartWorkflowParams) => {
+      const plugin = stateRef.current.plugins.find((p) => p.id === params.pluginId);
+      if (!plugin) {
+        throw new Error(`未找到插件: ${params.pluginId}`);
+      }
+      const detail = await valetService.triggerPluginWorkflow(plugin, params);
+      triggerNod();
+      setLastWorkflowUpdate({
+        tick: Date.now(),
+        payload: {
+          pluginId: params.pluginId,
+          runId: detail.summary.runId,
+          status: detail.summary.status,
+          error: detail.summary.errorMessage,
+        },
+      });
+      return detail;
+    },
+    [triggerNod]
+  );
+
+  const cancelWorkflowRun = useCallback(async (runId: string) => {
+    const detail = await valetService.cancelWorkflowRun(runId);
+    setLastWorkflowUpdate({
+      tick: Date.now(),
+      payload: {
+        pluginId: detail.summary.pluginId,
+        runId: detail.summary.runId,
+        status: detail.summary.status,
+        error: detail.summary.errorMessage,
+      },
+    });
+    return detail;
+  }, []);
+
+  const resumeWorkflowHook = useCallback(
+    async (params: ResumeWorkflowHookParams) => {
+      const detail = await valetService.resumeWorkflowHook(params);
+      triggerNod();
+      pushToast(
+        params.approved ? "已批准继续执行工作流" : "已拒绝审批节点并通知工作流",
+        "success"
+      );
+      if (detail?.summary?.runId) {
+        setLastWorkflowUpdate({
+          tick: Date.now(),
+          payload: {
+            pluginId: detail.summary.pluginId,
+            runId: detail.summary.runId,
+            status: detail.summary.status,
+            error: detail.summary.errorMessage,
+          },
+        });
+      }
+      return detail;
     },
     [pushToast, triggerNod]
   );
@@ -2202,7 +2478,9 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     setState((prev) => ({
       ...prev,
-      activeView: "chat",
+      activeView: "projects",
+      activeProjectId: preferred?.projectId || prev.activeProjectId || DEFAULT_PROJECT_ID,
+      activeProjectTab: "session",
       activeChatId: targetChatId,
       selectedInboxItemId: null,
       selectedTimelineEventId: null,
@@ -2262,47 +2540,360 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     [pushToast]
   );
 
-  const selectChatThread = useCallback((chatId: string) => {
+  const openProjectSession = useCallback((chatId: string) => {
+    setState((prev) => {
+      const target = prev.chatThreads.find((t) => t.id === chatId);
+      const nextProjectId = target?.projectId || prev.activeProjectId || DEFAULT_PROJECT_ID;
+      return {
+        ...prev,
+        activeView: "projects",
+        activeProjectId: nextProjectId,
+        activeProjectTab: "session",
+        activeChatId: chatId,
+        selectedInboxItemId: null,
+        selectedTimelineEventId: null,
+        activePluginDetailId: null,
+      };
+    });
+  }, []);
+
+  const selectChatThread = useCallback(
+    (chatId: string) => {
+      openProjectSession(chatId);
+    },
+    [openProjectSession]
+  );
+
+  const selectProject = useCallback((projectId: string, tab?: "notebook" | "sessions") => {
+    setState((prev) => {
+      const exists = prev.projects.some((p) => p.id === projectId);
+      const nextId = exists ? projectId : DEFAULT_PROJECT_ID;
+      const nextTab = tab ?? (nextId === DEFAULT_PROJECT_ID ? "sessions" : "notebook");
+      return {
+        ...prev,
+        activeView: "projects",
+        activeProjectId: nextId,
+        activeProjectTab: nextTab,
+        selectedInboxItemId: null,
+        selectedTimelineEventId: null,
+        activePluginDetailId: null,
+      };
+    });
+  }, []);
+
+  const setProjectTab = useCallback((tab: ProjectTab) => {
     setState((prev) => ({
       ...prev,
-      activeView: "chat",
-      activeChatId: chatId,
+      activeView: "projects",
+      activeProjectTab: tab,
     }));
   }, []);
 
-  const createNewChat = useCallback(() => {
-    if (isMyGo()) {
-      syncFromBackend(Valet.createChatThread(), true);
-      return;
-    }
-
-    const newId = `chat-${Date.now().toString(36)}`;
-    setState((prev) => {
-      const thread: ChatThread = {
-        id: newId,
-        title: "新对话",
-        model: prev.preferences.models.primary,
-        timelineActionCount: 0,
-        linkedEventIds: [],
-        updatedAt: "刚刚",
-        messages: [
-          {
-            id: `welcome-${newId}`,
-            role: "assistant",
-            metaLabel: `${prev.preferences.models.primary} · 就绪`,
-            createdAt: new Date().toTimeString().slice(0, 5),
-            content: `${prev.preferences.userNickname || "你"}好，我是驻留在你 Mac 上的事件管家。我可以监听本机与外部事件、按策略自动响应异常，或用自然语言为你编排专属插件与 Skill。`,
-          },
-        ],
-      };
-      return {
+  const returnToProjectNotebook = useCallback(
+    (highlightBlockId?: string, projectId?: string) => {
+      const cur = stateRef.current;
+      const targetProjectId = projectId || cur.activeProjectId || DEFAULT_PROJECT_ID;
+      setState((prev) => ({
         ...prev,
-        activeView: "chat",
-        activeChatId: newId,
-        chatThreads: [thread, ...prev.chatThreads],
+        activeView: "projects",
+        activeProjectId: targetProjectId,
+        activeProjectTab: "notebook",
+      }));
+      if (highlightBlockId) {
+        setFocusedNotebookBlock({
+          tick: Date.now(),
+          projectId: targetProjectId,
+          blockId: highlightBlockId,
+        });
+      }
+    },
+    []
+  );
+
+  const createProject = useCallback(
+    async (params: {
+      title: string;
+      description?: string;
+      icon?: ProjectIconKind;
+      tags?: string[];
+      workingDir?: string;
+    }): Promise<Project | null> => {
+      const title = params.title.trim() || "未命名项目";
+      if (isMyGo()) {
+        try {
+          const snap = await Valet.createProject({
+            title,
+            description: params.description?.trim() || undefined,
+            icon: params.icon || "book",
+            tags: params.tags ?? [],
+            workingDir: params.workingDir?.trim() || undefined,
+          });
+          const normalized = normalizeProjectsState(snap as unknown as ValetSnapshot);
+          setState(normalized);
+          const created = normalized.projects.find((p) => p.id === normalized.activeProjectId) ?? null;
+          pushToast(`已创建项目「${title}」`, "success");
+          return created;
+        } catch (err: unknown) {
+          pushToast(err instanceof Error ? err.message : String(err), "danger");
+          return null;
+        }
+      }
+
+      const proj: Project = {
+        id: `proj-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+        title,
+        description: params.description?.trim() || undefined,
+        icon: params.icon || "book",
+        tags: params.tags ?? [],
+        workingDir: params.workingDir?.trim() || undefined,
+        isDefault: false,
+        updatedAt: "刚刚",
+        createdAt: new Date().toISOString().slice(0, 10),
+        blocks: [{ id: makeBlockId("blk"), type: "paragraph", content: "" }],
       };
-    });
-  }, [syncFromBackend]);
+      setState((prev) => ({
+        ...prev,
+        activeView: "projects",
+        activeProjectId: proj.id,
+        activeProjectTab: "notebook",
+        projects: [...prev.projects, proj],
+      }));
+      pushToast(`已创建项目「${title}」`, "success");
+      return proj;
+    },
+    [pushToast]
+  );
+
+  const updateProject = useCallback(
+    (
+      projectId: string,
+      patch: Partial<
+        Pick<Project, "title" | "description" | "icon" | "tags" | "workingDir" | "blocks" | "archived">
+      >
+    ) => {
+      setState((prev) => ({
+        ...prev,
+        projects: prev.projects.map((p) => {
+          if (p.id !== projectId) return p;
+          return {
+            ...p,
+            ...patch,
+            isDefault: p.id === DEFAULT_PROJECT_ID ? true : p.isDefault,
+            archived: p.id === DEFAULT_PROJECT_ID ? false : (patch.archived ?? p.archived),
+            updatedAt: "刚刚",
+          };
+        }),
+      }));
+
+      if (!isMyGo()) return;
+
+      const payload = {
+        projectId,
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        ...(patch.description !== undefined ? { description: patch.description } : {}),
+        ...(patch.icon !== undefined ? { icon: patch.icon } : {}),
+        ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
+        ...(patch.workingDir !== undefined ? { workingDir: patch.workingDir } : {}),
+        ...(patch.blocks !== undefined ? { blocks: patch.blocks } : {}),
+        ...(patch.archived !== undefined ? { archived: patch.archived } : {}),
+      };
+
+      const prevTimer = pendingProjectSaveTimersRef.current[projectId];
+      if (prevTimer !== undefined) {
+        window.clearTimeout(prevTimer);
+        delete pendingProjectSaveTimersRef.current[projectId];
+      }
+
+      const flush = () => {
+        delete pendingProjectSaveTimersRef.current[projectId];
+        void Valet.updateProject(payload)
+          .then((snap) => {
+            const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
+            setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds));
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+      };
+
+      if (patch.blocks !== undefined && Object.keys(patch).length === 1) {
+        pendingProjectSaveTimersRef.current[projectId] = window.setTimeout(flush, 420);
+      } else {
+        flush();
+      }
+    },
+    [pushToast]
+  );
+
+  const deleteProject = useCallback(
+    (projectId: string) => {
+      if (projectId === DEFAULT_PROJECT_ID) {
+        pushToast("默认项目无法删除", "warning");
+        return;
+      }
+      const prevTimer = pendingProjectSaveTimersRef.current[projectId];
+      if (prevTimer !== undefined) {
+        window.clearTimeout(prevTimer);
+        delete pendingProjectSaveTimersRef.current[projectId];
+      }
+      if (isMyGo()) {
+        syncFromBackend(Valet.deleteProject(projectId), true);
+        pushToast("已删除项目，所属会话已移入默认项目", "success");
+        return;
+      }
+      setState((prev) => ({
+        ...prev,
+        projects: prev.projects.filter((p) => p.id !== projectId),
+        chatThreads: prev.chatThreads.map((t) =>
+          t.projectId === projectId ? { ...t, projectId: DEFAULT_PROJECT_ID } : t
+        ),
+        activeProjectId:
+          prev.activeProjectId === projectId ? DEFAULT_PROJECT_ID : prev.activeProjectId,
+        activeProjectTab:
+          prev.activeProjectId === projectId ? "sessions" : prev.activeProjectTab,
+      }));
+      pushToast("已删除项目，所属会话已移入默认项目", "success");
+    },
+    [pushToast, syncFromBackend]
+  );
+
+  const moveChatThreadToProject = useCallback(
+    (chatId: string, targetProjectId: string) => {
+      const targetProj = stateRef.current.projects.find((p) => p.id === targetProjectId);
+      if (!targetProj) return;
+      setState((prev) => ({
+        ...prev,
+        chatThreads: prev.chatThreads.map((t) =>
+          t.id === chatId ? { ...t, projectId: targetProjectId } : t
+        ),
+      }));
+      pushToast(`已移至项目「${targetProj.title}」`, "success");
+      if (isMyGo()) {
+        syncFromBackend(Valet.moveChatThreadToProject(chatId, targetProjectId));
+      }
+    },
+    [pushToast, syncFromBackend]
+  );
+
+  const syncSessionSummaryToNotebook = useCallback(
+    (chatId: string) => {
+      if (isMyGo()) {
+        syncFromBackend(Valet.syncSessionSummaryToNotebook(chatId));
+        pushToast("已将当前会话摘要同步到项目 Notebook", "success");
+        return;
+      }
+
+      setState((prev) => {
+        const thread = prev.chatThreads.find((t) => t.id === chatId);
+        if (!thread) return prev;
+        const pid = thread.projectId || DEFAULT_PROJECT_ID;
+        const summary = extractThreadSummary(thread) || "会话已同步，点击进入查看完整上下文";
+
+        return {
+          ...prev,
+          projects: prev.projects.map((p) => {
+            if (p.id !== pid) return p;
+            let updatedExisting = false;
+            const nextBlocks = p.blocks.map((b) => {
+              if (b.type === "session_ref" && b.sessionId === chatId) {
+                updatedExisting = true;
+                return {
+                  ...b,
+                  content: b.content?.trim() || thread.title,
+                  summary,
+                };
+              }
+              return b;
+            });
+            if (!updatedExisting) {
+              const newBlk = {
+                id: makeBlockId("blk-ref"),
+                type: "session_ref" as const,
+                sessionId: chatId,
+                content: thread.title,
+                summary,
+              };
+              const originIdx = thread.originBlockId
+                ? nextBlocks.findIndex((b) => b.id === thread.originBlockId)
+                : -1;
+              if (originIdx >= 0) {
+                nextBlocks.splice(originIdx + 1, 0, newBlk);
+              } else {
+                nextBlocks.push(newBlk);
+              }
+            }
+            return {
+              ...p,
+              updatedAt: "刚刚",
+              blocks: nextBlocks,
+            };
+          }),
+        };
+      });
+      pushToast("已将当前会话摘要同步到项目 Notebook", "success");
+    },
+    [pushToast, syncFromBackend]
+  );
+
+  const createNewChat = useCallback(
+    (projectId?: string) => {
+      const targetProjectId = projectId || stateRef.current.activeProjectId || DEFAULT_PROJECT_ID;
+      if (isMyGo()) {
+        void Valet.createProjectChatThread({
+          projectId: targetProjectId,
+          switchToSession: true,
+        })
+          .then((res) => {
+            const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
+            setState((prev) => {
+              const merged = mergeBackendSnapshot(prev, res.snapshot, pendingIds);
+              return {
+                ...merged,
+                activeView: "projects",
+                activeProjectId: targetProjectId,
+                activeProjectTab: "session",
+                activeChatId: res.thread.id,
+              };
+            });
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+        return;
+      }
+
+      const newId = `chat-${Date.now().toString(36)}`;
+      setState((prev) => {
+        const thread: ChatThread = {
+          id: newId,
+          projectId: targetProjectId,
+          title: "新对话",
+          model: prev.preferences.models.primary,
+          timelineActionCount: 0,
+          linkedEventIds: [],
+          updatedAt: "刚刚",
+          messages: [
+            {
+              id: `welcome-${newId}`,
+              role: "assistant",
+              metaLabel: `${prev.preferences.models.primary} · 就绪`,
+              createdAt: new Date().toTimeString().slice(0, 5),
+              content: `${prev.preferences.userNickname || "你"}好，我是驻留在你 Mac 上的事件管家。我可以监听本机与外部事件、按策略自动响应异常，或用自然语言为你编排专属插件与 Skill。`,
+            },
+          ],
+        };
+        return {
+          ...prev,
+          activeView: "projects",
+          activeProjectId: targetProjectId,
+          activeProjectTab: "session",
+          activeChatId: newId,
+          chatThreads: [thread, ...prev.chatThreads],
+        };
+      });
+    },
+    [pushToast]
+  );
 
   const archiveChatThread = useCallback(
     (chatId: string, archived = true) => {
@@ -2455,7 +3046,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
         if (isMyGo()) {
           const snap = await Valet.getSnapshot();
-          setState((prev) => mergeBackendSnapshot(prev, snap));
+          const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
+          setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds));
         } else {
           setState((prev) => {
             let nextInbox = outcome.createdInboxItem
@@ -2695,6 +3287,96 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       await executeChatTurn(activeId, params, "followUp");
     },
     [executeChatTurn]
+  );
+
+  const spawnSessionFromNotebook = useCallback(
+    async (params: {
+      projectId: string;
+      prompt: string;
+      model?: string;
+      includeNotebookContext: boolean;
+      originBlockId: string;
+      originSection?: string;
+      mentionPlugin?: PluginState | null;
+      openImmediately?: boolean;
+    }): Promise<ChatThread | null> => {
+      const trimmed = params.prompt.trim();
+      if (!trimmed) return null;
+
+      const cur = stateRef.current;
+      const proj = cur.projects.find((p) => p.id === params.projectId) ?? cur.projects[0];
+      const projectId = proj?.id ?? DEFAULT_PROJECT_ID;
+      const titlePreview = trimmed.replace(/\s+/g, " ").slice(0, 22);
+      const model = params.model || cur.preferences.models.primary || "claude-opus-4";
+
+      const attachments: ChatAttachment[] = [];
+      if (params.includeNotebookContext && proj) {
+        attachments.push(
+          buildNotebookContextAttachment(
+            proj,
+            cur.chatThreads.filter((t) => t.projectId === projectId),
+            params.originSection
+          )
+        );
+      }
+
+      let createdThread: ChatThread;
+      if (isMyGo()) {
+        try {
+          const res = await Valet.createProjectChatThread({
+            projectId,
+            title: titlePreview,
+            model,
+            originBlockId: params.originBlockId,
+            originSection: params.originSection,
+            notebookContextInjected: params.includeNotebookContext,
+            switchToSession: Boolean(params.openImmediately),
+          });
+          createdThread = res.thread as unknown as ChatThread;
+          const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
+          setState((prev) => mergeBackendSnapshot(prev, res.snapshot, pendingIds));
+        } catch (err: unknown) {
+          pushToast(err instanceof Error ? err.message : String(err), "danger");
+          return null;
+        }
+      } else {
+        const newId = `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+        createdThread = {
+          id: newId,
+          projectId,
+          title: titlePreview,
+          model,
+          timelineActionCount: 0,
+          linkedEventIds: [],
+          updatedAt: "刚刚",
+          originBlockId: params.originBlockId,
+          originSection: params.originSection,
+          notebookContextInjected: params.includeNotebookContext,
+          messages: [],
+        };
+        setState((prev) => ({
+          ...prev,
+          chatThreads: [createdThread, ...prev.chatThreads],
+          ...(params.openImmediately
+            ? {
+                activeView: "projects",
+                activeProjectId: projectId,
+                activeProjectTab: "session",
+                activeChatId: createdThread.id,
+              }
+            : {}),
+        }));
+      }
+
+      void executeChatTurn(createdThread.id, {
+        prompt: trimmed,
+        mentionPlugin: params.mentionPlugin ?? null,
+        attachments,
+      });
+
+      return createdThread;
+    },
+    [executeChatTurn, pushToast]
   );
 
   const removeQueuedMessage = useCallback(
@@ -3185,17 +3867,31 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   }, [pushToast, syncFromBackend]);
 
+  useEffect(() => {
+    return () => {
+      for (const t of Object.values(pendingProjectSaveTimersRef.current)) {
+        window.clearTimeout(t);
+      }
+      pendingProjectSaveTimersRef.current = {};
+    };
+  }, []);
+
   const resetAllData = useCallback(() => {
+    for (const t of Object.values(pendingProjectSaveTimersRef.current)) {
+      window.clearTimeout(t);
+    }
+    pendingProjectSaveTimersRef.current = {};
     composerDraftsRef.current = {};
     setComposerQuoteSignal(null);
     setTimelineFocusSignal(null);
+    setFocusedNotebookBlock(null);
     if (isMyGo()) {
       syncFromBackend(Valet.resetAllData(), true);
       pushToast("已重置全部本地数据", "warning");
       return;
     }
     localStorage.removeItem(STORAGE_KEY);
-    setState(createInitialSnapshot());
+    setState(normalizeProjectsState(createInitialSnapshot()));
     pushToast("已重置全部本地数据", "warning");
   }, [pushToast, syncFromBackend]);
 
@@ -3267,6 +3963,17 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setComposerDraft,
       quoteInboxItemToChat,
       quoteTimelineEventToChat,
+      focusedNotebookBlock,
+      selectProject,
+      setProjectTab,
+      openProjectSession,
+      returnToProjectNotebook,
+      createProject,
+      updateProject,
+      deleteProject,
+      moveChatThreadToProject,
+      syncSessionSummaryToNotebook,
+      spawnSessionFromNotebook,
       selectChatThread,
       createNewChat,
       archiveChatThread,
@@ -3294,6 +4001,15 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       triggerHeartbeatNow,
       clearHeartbeatLogs,
       resetAllData,
+      updatePluginExecutionMode,
+      updatePluginWorkflow,
+      lastWorkflowUpdate,
+      getPluginWorkflowGraph,
+      listPluginWorkflowRuns,
+      getWorkflowRunDetail,
+      triggerPluginWorkflow,
+      cancelWorkflowRun,
+      resumeWorkflowHook,
     }),
     [
       abortChatMessage,
@@ -3305,6 +4021,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       approveInboxItem,
       archiveChatThread,
       arrivalNotice,
+      cancelWorkflowRun,
       chatStream,
       chatStreams,
       queuedMessages,
@@ -3316,23 +4033,32 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       completeOnboarding,
       composerQuoteSignal,
       createNewChat,
+      createProject,
       deleteAutomationRule,
       deleteMcpServer,
       deleteMemory,
+      deleteProject,
       dismissInboxItem,
       dismissToast,
       executeTimelineEventActions,
       fixPluginAuth,
+      focusedNotebookBlock,
       getComposerDraft,
+      getPluginWorkflowGraph,
+      getWorkflowRunDetail,
       ignoreTimelineEvent,
       importExistingConfig,
       installCustomPlugin,
       installMarketplacePlugin,
       installPluginDraft,
       isCompactViewport,
+      lastWorkflowUpdate,
+      listPluginWorkflowRuns,
+      moveChatThreadToProject,
       nodTick,
       openInboxItemInTimeline,
       openPluginDetail,
+      openProjectSession,
       openSettingsSection,
       performProcessAction,
       pushToast,
@@ -3348,10 +4074,13 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       resolveChatPermission,
       restoreApprovedInboxItem,
       restoreTimelineEvent,
+      resumeWorkflowHook,
+      returnToProjectNotebook,
       runAutomationNow,
       runFirstScan,
       selectChatThread,
       selectInboxItem,
+      selectProject,
       selectProvider,
       selectTimelineEvent,
       sendChatMessage,
@@ -3362,10 +4091,13 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setComposerDraft,
       setOnboardingStep,
       setPermissionGranted,
+      setProjectTab,
       setTimelinePluginFilter,
       sidebarCollapsed,
       simulatePluginEvent,
+      spawnSessionFromNotebook,
       state,
+      syncSessionSummaryToNotebook,
       timelineFocusSignal,
       toasts,
       toggleAutomation,
@@ -3379,14 +4111,18 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       triggerCustomPluginEvent,
       triggerHeartbeatNow,
       triggerNod,
+      triggerPluginWorkflow,
       uninstallPlugin,
       updateChatThreadModel,
       updateModels,
       updatePluginConfig,
       updatePluginEventPolicy,
+      updatePluginExecutionMode,
       updatePluginManifest,
       updatePluginSkill,
+      updatePluginWorkflow,
       updatePreferences,
+      updateProject,
       updateProvider,
     ]
   );

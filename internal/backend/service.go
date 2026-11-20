@@ -40,9 +40,10 @@ type StartOptions struct {
 	OnNotify     func(kind, title, subtitle, body string)
 	OnSyncTray   func(show bool, paused bool)
 	OnSyncLogin  func(launchAtLogin bool)
-	OnChatStream func(types.ChatStreamPayload)
-	OnMetrics    func(types.SystemMetrics)
-	OnState      func(types.StateChangeNotice)
+	OnChatStream      func(types.ChatStreamPayload)
+	OnMetrics         func(types.SystemMetrics)
+	OnState           func(types.StateChangeNotice)
+	OnWorkflowUpdated func(types.WorkflowUpdatedPayload)
 }
 
 // Service implements the bound `Valet` MyGo service coordinating native macOS capabilities,
@@ -225,15 +226,23 @@ func (s *Service) start(opts StartOptions) error {
 					if len(matFiles) > 0 {
 						snapMut.Plugins[i].BundledFiles = matFiles
 					}
-					if strings.TrimSpace(snapMut.Plugins[i].SkillMarkdown) == "" {
-						if _, skillMD, _, _, rErr := plugins.ReadPluginBundle(matDir); rErr == nil && strings.TrimSpace(skillMD) != "" {
+					if _, skillMD, parsedMat, _, rErr := plugins.ReadPluginBundle(matDir); rErr == nil {
+						if strings.TrimSpace(snapMut.Plugins[i].SkillMarkdown) == "" && strings.TrimSpace(skillMD) != "" {
 							snapMut.Plugins[i].SkillMarkdown = skillMD
+						}
+						if strings.TrimSpace(snapMut.Plugins[i].WorkflowYAML) == "" && strings.TrimSpace(parsedMat.WorkflowYAML) != "" {
+							snapMut.Plugins[i].WorkflowYAML = parsedMat.WorkflowYAML
 						}
 					}
 				}
-			} else if snapMut.Plugins[i].LocalDir != "" && len(snapMut.Plugins[i].BundledFiles) == 0 {
-				if _, _, _, files, rErr := plugins.ReadPluginBundle(snapMut.Plugins[i].LocalDir); rErr == nil && len(files) > 0 {
-					snapMut.Plugins[i].BundledFiles = files
+			} else if snapMut.Plugins[i].LocalDir != "" {
+				if _, _, parsedLocal, files, rErr := plugins.ReadPluginBundle(snapMut.Plugins[i].LocalDir); rErr == nil {
+					if len(snapMut.Plugins[i].BundledFiles) == 0 && len(files) > 0 {
+						snapMut.Plugins[i].BundledFiles = files
+					}
+					if strings.TrimSpace(snapMut.Plugins[i].WorkflowYAML) == "" && strings.TrimSpace(parsedLocal.WorkflowYAML) != "" {
+						snapMut.Plugins[i].WorkflowYAML = parsedLocal.WorkflowYAML
+					}
 				}
 			}
 
@@ -242,6 +251,9 @@ func (s *Service) start(opts StartOptions) error {
 				snapMut.Plugins[i].SkillMarkdown = parsed.Skill
 			}
 			if pErr == nil {
+				if strings.TrimSpace(snapMut.Plugins[i].ExecutionMode) == "" {
+					snapMut.Plugins[i].ExecutionMode = parsed.ExecutionMode
+				}
 				evs, _ := plugins.ManifestSpecsToPoliciesAndActions(parsed, snapMut.Plugins[i].Events)
 				if len(evs) > 0 {
 					snapMut.Plugins[i].Events = evs
@@ -249,6 +261,9 @@ func (s *Service) start(opts StartOptions) error {
 				if len(snapMut.Plugins[i].ConfigSchema) == 0 && len(parsed.ConfigSchema) > 0 {
 					snapMut.Plugins[i].ConfigSchema = parsed.ConfigSchema
 				}
+			}
+			if strings.TrimSpace(snapMut.Plugins[i].ExecutionMode) == "" {
+				snapMut.Plugins[i].ExecutionMode = "skill"
 			}
 		}
 
@@ -682,6 +697,18 @@ func (s *Service) handleSidecarNotify(method string, params json.RawMessage) {
 			return
 		}
 		s.handleAlwaysOnOutboxNotify(payload)
+	case "host.workflowUpdate":
+		var payload types.WorkflowUpdatedPayload
+		if err := json.Unmarshal(params, &payload); err != nil {
+			fmt.Fprintf(os.Stderr, "[valet] workflowUpdate unmarshal error: %v\n", err)
+			return
+		}
+		s.mu.Lock()
+		onWorkflowUpdated := s.opts.OnWorkflowUpdated
+		s.mu.Unlock()
+		if onWorkflowUpdated != nil {
+			onWorkflowUpdated(payload)
+		}
 	}
 }
 
@@ -794,6 +821,31 @@ func (s *Service) enqueuePluginEventAlwaysOn(
 	}
 	reqPayload["bundle"] = plugin.BundleID
 	reqPayload["policy"] = policy
+
+	if strings.EqualFold(plugin.ExecutionMode, "workflow") {
+		s.syncSidecarBlocking(ctx, s.store.Snapshot())
+		var wfDetail types.WorkflowRunDetail
+		if err := s.client.Call(ctx, "workflow.start", types.StartWorkflowParams{
+			PluginID: plugin.ID,
+			Event:    eventCode,
+			Source:   source,
+			Payload:  reqPayload,
+		}, &wfDetail); err != nil {
+			return sidecar.AlwaysOnIngestResponse{}, err
+		}
+		pid := plugin.ID
+		return sidecar.AlwaysOnIngestResponse{
+			Item: types.AlwaysOnInboxItem{
+				ID:        "wf:" + wfDetail.Summary.RunID,
+				Source:    source,
+				PluginID:  &pid,
+				EventType: eventCode,
+				Status:    "done",
+			},
+			Immediate: true,
+		}, nil
+	}
+
 	payloadBytes, _ := json.Marshal(reqPayload)
 
 	title := fmt.Sprintf("%s · %s", plugin.Name, eventCode)
@@ -1705,6 +1757,7 @@ func (s *Service) recordTimelineFromAgent(req sidecar.RecordTimelineRequest) map
 		ReclaimedGB:         req.ReclaimedGB,
 		Intercepted:         req.Intercepted,
 		CanRestore:          req.CanRestore,
+		WorkflowRunID:       req.WorkflowRunID,
 		TraceSteps: []types.TraceStep{
 			{ID: "tr1", Time: nowHHMM, Stage: "自动执行", Detail: req.Summary, Status: "done"},
 		},
@@ -1919,18 +1972,24 @@ func (s *Service) RunFirstScan(ctx context.Context) (types.ValetSnapshot, error)
 }
 
 func makeWelcomeChatThread(primaryModel, nick string) types.ChatThread {
+	return makeProjectChatThread(types.DefaultProjectID, "新对话", primaryModel, nick, true)
+}
+
+func makeProjectChatThread(projectID, title, primaryModel, nick string, withWelcome bool) types.ChatThread {
+	if strings.TrimSpace(projectID) == "" {
+		projectID = types.DefaultProjectID
+	}
+	if strings.TrimSpace(title) == "" {
+		title = "新对话"
+	}
 	if strings.TrimSpace(nick) == "" {
 		nick = "你"
 	}
 	nowHHMM := time.Now().Format("15:04")
 	newID := fmt.Sprintf("chat-%d", time.Now().UnixNano())
-	return types.ChatThread{
-		ID:             newID,
-		Title:          "新对话",
-		Model:          primaryModel,
-		UpdatedAt:      "刚刚",
-		LinkedEventIDs: []string{},
-		Messages: []types.ChatMessage{
+	var msgs []types.ChatMessage
+	if withWelcome {
+		msgs = []types.ChatMessage{
 			{
 				ID:        "welcome-" + newID,
 				Role:      "assistant",
@@ -1938,18 +1997,35 @@ func makeWelcomeChatThread(primaryModel, nick string) types.ChatThread {
 				CreatedAt: nowHHMM,
 				Content:   fmt.Sprintf("%s好，我是驻留在你 Mac 上的事件管家。我可以监听本机与外部事件、按策略自动响应异常，或用自然语言为你编排专属插件与 Skill。", nick),
 			},
-		},
+		}
+	} else {
+		msgs = []types.ChatMessage{}
+	}
+	return types.ChatThread{
+		ID:             newID,
+		ProjectID:      projectID,
+		Title:          title,
+		Model:          primaryModel,
+		UpdatedAt:      "刚刚",
+		LinkedEventIDs: []string{},
+		Messages:       msgs,
 	}
 }
 
-// CreateChatThread creates and activates a new conversation thread.
+// CreateChatThread creates and activates a new conversation thread inside the active project (or default project).
 func (s *Service) CreateChatThread() (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
 	next := s.store.Update(func(st *types.ValetSnapshot) {
-		thread := makeWelcomeChatThread(st.Preferences.Models.Primary, st.Preferences.UserNickname)
-		st.ActiveView = string(types.ViewChat)
+		pid := st.ActiveProjectID
+		if strings.TrimSpace(pid) == "" {
+			pid = types.DefaultProjectID
+		}
+		thread := makeProjectChatThread(pid, "新对话", st.Preferences.Models.Primary, st.Preferences.UserNickname, true)
+		st.ActiveView = string(types.ViewProjects)
+		st.ActiveProjectID = pid
+		st.ActiveProjectTab = "session"
 		st.ActiveChatID = thread.ID
 		st.ChatThreads = append([]types.ChatThread{thread}, st.ChatThreads...)
 	})
@@ -1963,8 +2039,12 @@ func (s *Service) ArchiveChatThread(chatID string, archived bool) (types.ValetSn
 	}
 	nowHHMM := time.Now().Format("15:04")
 	next := s.store.Update(func(st *types.ValetSnapshot) {
+		archivedProjectID := types.DefaultProjectID
 		for i := range st.ChatThreads {
 			if st.ChatThreads[i].ID == chatID {
+				if st.ChatThreads[i].ProjectID != "" {
+					archivedProjectID = st.ChatThreads[i].ProjectID
+				}
 				st.ChatThreads[i].Archived = archived
 				if archived {
 					st.ChatThreads[i].ArchivedAt = nowHHMM
@@ -1983,7 +2063,7 @@ func (s *Service) ArchiveChatThread(chatID string, archived bool) (types.ValetSn
 				}
 			}
 			if fallbackID == "" {
-				thread := makeWelcomeChatThread(st.Preferences.Models.Primary, st.Preferences.UserNickname)
+				thread := makeProjectChatThread(archivedProjectID, "新对话", st.Preferences.Models.Primary, st.Preferences.UserNickname, true)
 				st.ChatThreads = append([]types.ChatThread{thread}, st.ChatThreads...)
 				fallbackID = thread.ID
 			}
@@ -2044,6 +2124,7 @@ func (s *Service) SendChatMessage(ctx context.Context, params types.SendChatPara
 		if !found {
 			st.ChatThreads = append([]types.ChatThread{{
 				ID:             params.ChatID,
+				ProjectID:      types.DefaultProjectID,
 				Title:          "新对话",
 				Model:          params.Model,
 				UpdatedAt:      "刚刚",
@@ -2567,6 +2648,29 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 	}
 
 	switch {
+	case target.ToolName == "workflow_resume_hook":
+		hookToken, _ := target.ToolArgs["hookToken"].(string)
+		if strings.TrimSpace(hookToken) == "" {
+			hookToken, _ = target.Payload["hookToken"].(string)
+		}
+		if strings.TrimSpace(hookToken) == "" {
+			return snap, errors.New("审批卡缺少 workflow hookToken，无法恢复工作流")
+		}
+		if s.client == nil {
+			return snap, errors.New("sidecar not running")
+		}
+		var res struct {
+			Resumed bool   `json:"resumed"`
+			RunID   string `json:"runId"`
+		}
+		if err := s.client.Call(ctx, "workflow.resumeHook", types.ResumeWorkflowHookParams{
+			Token:     hookToken,
+			Approved:  true,
+			DecidedBy: "user",
+		}, &res); err != nil {
+			return snap, err
+		}
+		approvedToolSummary = "已批准并恢复工作流继续执行"
 	case target.ToolName == "disk_empty_trash":
 		if s.client != nil {
 			var execRes struct {
@@ -2789,8 +2893,20 @@ func (s *Service) DismissInboxItem(itemID string) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
+	snapBefore := s.store.Snapshot()
+	var workflowToken string
+	for _, it := range snapBefore.InboxItems {
+		if it.ID == itemID && it.Status == "pending" && it.ToolName == "workflow_resume_hook" {
+			workflowToken, _ = it.ToolArgs["hookToken"].(string)
+			if strings.TrimSpace(workflowToken) == "" {
+				workflowToken, _ = it.Payload["hookToken"].(string)
+			}
+			break
+		}
+	}
+
 	nowHHMM := time.Now().Format("15:04")
-	return s.store.Update(func(st *types.ValetSnapshot) {
+	next := s.store.Update(func(st *types.ValetSnapshot) {
 		var linked string
 		for i := range st.InboxItems {
 			if st.InboxItems[i].ID == itemID && st.InboxItems[i].Status == "pending" {
@@ -2809,7 +2925,16 @@ func (s *Service) DismissInboxItem(itemID string) (types.ValetSnapshot, error) {
 				}
 			}
 		}
-	}), nil
+	})
+
+	if strings.TrimSpace(workflowToken) != "" && s.client != nil {
+		_ = s.client.Call(context.Background(), "workflow.resumeHook", types.ResumeWorkflowHookParams{
+			Token:     workflowToken,
+			Approved:  false,
+			DecidedBy: "user",
+		}, nil)
+	}
+	return next, nil
 }
 
 // ApproveAllReversible approves every pending 7-day reversible Inbox card sequentially.
@@ -3365,9 +3490,11 @@ func (s *Service) InstallCustomPlugin(params types.InstallCustomPluginParams) (t
 		Slug:          slug,
 		Name:          name,
 		Tagline:       tagline,
-		Description:   "通过本地 Manifest 与 Skill 创建的自定义事件处理插件。",
+		Description:   "通过本地 Manifest 与 Skill / Workflow 创建的自定义事件处理插件。",
 		ManifestYAML:  params.YAML,
+		ExecutionMode: params.ExecutionMode,
 		SkillMarkdown: params.SkillMarkdown,
+		WorkflowYAML:  params.WorkflowYAML,
 	})
 	if uErr != nil {
 		return s.store.Snapshot(), uErr
@@ -3397,6 +3524,7 @@ func (s *Service) UpdatePluginManifest(pluginID, manifestYAML string) (types.Val
 			st.Plugins[i].Actions = nil
 			st.Plugins[i].ConfigSchema = parsed.ConfigSchema
 			st.Plugins[i].ManifestYAML = manifestYAML
+			st.Plugins[i].ExecutionMode = plugins.NormalizeExecutionMode(parsed.ExecutionMode)
 			if strings.TrimSpace(parsed.Skill) != "" {
 				st.Plugins[i].SkillMarkdown = strings.TrimSpace(parsed.Skill)
 			}
@@ -3407,7 +3535,9 @@ func (s *Service) UpdatePluginManifest(pluginID, manifestYAML string) (types.Val
 					Slug:          st.Plugins[i].Slug,
 					Name:          st.Plugins[i].Name,
 					ManifestYAML:  manifestYAML,
+					ExecutionMode: st.Plugins[i].ExecutionMode,
 					SkillMarkdown: st.Plugins[i].SkillMarkdown,
+					WorkflowYAML:  st.Plugins[i].WorkflowYAML,
 				}); wErr == nil {
 					st.Plugins[i].LocalDir = dir
 				}
@@ -3435,7 +3565,9 @@ func (s *Service) UpdatePluginSkill(pluginID, skillMarkdown string) (types.Valet
 						Slug:          st.Plugins[i].Slug,
 						Name:          st.Plugins[i].Name,
 						ManifestYAML:  st.Plugins[i].ManifestYAML,
+						ExecutionMode: st.Plugins[i].ExecutionMode,
 						SkillMarkdown: trimmed,
+						WorkflowYAML:  st.Plugins[i].WorkflowYAML,
 					}); wErr == nil {
 						st.Plugins[i].LocalDir = dir
 					}
@@ -3445,6 +3577,210 @@ func (s *Service) UpdatePluginSkill(pluginID, skillMarkdown string) (types.Valet
 	})
 	s.syncRuntime(next)
 	return next, nil
+}
+
+// UpdatePluginExecutionMode switches a plugin between mutually exclusive "skill" and "workflow" execution modes.
+func (s *Service) UpdatePluginExecutionMode(pluginID, mode string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	targetMode := plugins.NormalizeExecutionMode(mode)
+	found := false
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Plugins {
+			if st.Plugins[i].ID != pluginID && st.Plugins[i].Slug != pluginID {
+				continue
+			}
+			found = true
+			st.Plugins[i].ExecutionMode = targetMode
+			st.Plugins[i].ManifestYAML = plugins.SetManifestExecutionMode(st.Plugins[i].ManifestYAML, targetMode)
+			if targetMode == "workflow" && strings.TrimSpace(st.Plugins[i].WorkflowYAML) == "" {
+				firstEvent := "manual"
+				if len(st.Plugins[i].Events) > 0 && st.Plugins[i].Events[0].ID != "" {
+					firstEvent = st.Plugins[i].Events[0].ID
+				}
+				st.Plugins[i].WorkflowYAML = plugins.DefaultStarterWorkflowYAML(st.Plugins[i].Name, firstEvent)
+			}
+			if targetMode == "workflow" {
+				st.Plugins[i].StatusSubtitle = "运行模式已切换为 Workflow · 本地编排就绪"
+			} else {
+				st.Plugins[i].StatusSubtitle = "运行模式已切换为 Skill · SKILL.md 已挂载"
+			}
+			if (st.Plugins[i].Source == "local" || st.Plugins[i].LocalDir != "") && s.opts.DataDir != "" && strings.TrimSpace(st.Plugins[i].ManifestYAML) != "" {
+				if dir, _, wErr := plugins.WritePluginBundle(filepath.Join(s.opts.DataDir, "plugins"), types.UpsertLocalPluginParams{
+					ID:            st.Plugins[i].ID,
+					Slug:          st.Plugins[i].Slug,
+					Name:          st.Plugins[i].Name,
+					ManifestYAML:  st.Plugins[i].ManifestYAML,
+					ExecutionMode: targetMode,
+					SkillMarkdown: st.Plugins[i].SkillMarkdown,
+					WorkflowYAML:  st.Plugins[i].WorkflowYAML,
+				}); wErr == nil {
+					st.Plugins[i].LocalDir = dir
+				}
+			}
+		}
+	})
+	if !found {
+		return s.store.Snapshot(), fmt.Errorf("未找到插件: %q", pluginID)
+	}
+	s.syncRuntime(next)
+	s.emitStateChange("plugins")
+	return next, nil
+}
+
+// UpdatePluginWorkflow validates and updates a plugin's workflow.yaml definition and persists it on disk.
+func (s *Service) UpdatePluginWorkflow(ctx context.Context, pluginID, workflowYAML string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	trimmed := strings.TrimSpace(workflowYAML)
+	if trimmed == "" {
+		return s.store.Snapshot(), errors.New("workflow.yaml 不能为空")
+	}
+	if s.client != nil {
+		var valRes types.WorkflowValidationResult
+		if err := s.client.Call(ctx, "workflow.validate", map[string]any{"yaml": trimmed}, &valRes); err != nil {
+			return s.store.Snapshot(), err
+		}
+		if !valRes.Valid {
+			return s.store.Snapshot(), fmt.Errorf("workflow.yaml 校验失败: %s", strings.Join(valRes.Errors, "; "))
+		}
+	}
+
+	found := false
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Plugins {
+			if st.Plugins[i].ID != pluginID && st.Plugins[i].Slug != pluginID {
+				continue
+			}
+			found = true
+			st.Plugins[i].WorkflowYAML = trimmed
+			st.Plugins[i].StatusSubtitle = "刚刚更新 workflow.yaml · 本地 DAG 已就绪"
+			if (st.Plugins[i].Source == "local" || st.Plugins[i].LocalDir != "") && s.opts.DataDir != "" && strings.TrimSpace(st.Plugins[i].ManifestYAML) != "" {
+				if dir, _, wErr := plugins.WritePluginBundle(filepath.Join(s.opts.DataDir, "plugins"), types.UpsertLocalPluginParams{
+					ID:            st.Plugins[i].ID,
+					Slug:          st.Plugins[i].Slug,
+					Name:          st.Plugins[i].Name,
+					ManifestYAML:  st.Plugins[i].ManifestYAML,
+					ExecutionMode: st.Plugins[i].ExecutionMode,
+					SkillMarkdown: st.Plugins[i].SkillMarkdown,
+					WorkflowYAML:  trimmed,
+				}); wErr == nil {
+					st.Plugins[i].LocalDir = dir
+				}
+			}
+		}
+	})
+	if !found {
+		return s.store.Snapshot(), fmt.Errorf("未找到插件: %q", pluginID)
+	}
+	s.syncRuntime(next)
+	s.emitStateChange("plugins")
+	return next, nil
+}
+
+// GetPluginWorkflowGraph validates and returns the parsed DAG graph structure for a plugin.
+func (s *Service) GetPluginWorkflowGraph(ctx context.Context, pluginID string) (types.WorkflowGraphResponse, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.WorkflowGraphResponse{}, err
+	}
+	if s.client == nil {
+		return types.WorkflowGraphResponse{}, errors.New("sidecar not running")
+	}
+	s.syncSidecarBlocking(ctx, s.store.Snapshot())
+	var out types.WorkflowGraphResponse
+	if err := s.client.Call(ctx, "workflow.getGraph", map[string]any{"pluginId": pluginID}, &out); err != nil {
+		return types.WorkflowGraphResponse{}, err
+	}
+	return out, nil
+}
+
+// ListPluginWorkflowRuns lists recent local Vercel Workflow execution runs for a plugin.
+func (s *Service) ListPluginWorkflowRuns(ctx context.Context, pluginID string, limit int) ([]types.WorkflowRunSummary, error) {
+	if err := s.ensureStarted(); err != nil {
+		return nil, err
+	}
+	if s.client == nil {
+		return nil, errors.New("sidecar not running")
+	}
+	if limit <= 0 {
+		limit = 30
+	}
+	var out []types.WorkflowRunSummary
+	if err := s.client.Call(ctx, "workflow.listRuns", map[string]any{"pluginId": pluginID, "limit": limit}, &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []types.WorkflowRunSummary{}
+	}
+	return out, nil
+}
+
+// GetWorkflowRunDetail returns hydrated run status, node states, edge states, and node inputs/outputs.
+func (s *Service) GetWorkflowRunDetail(ctx context.Context, runID string) (types.WorkflowRunDetail, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.WorkflowRunDetail{}, err
+	}
+	if s.client == nil {
+		return types.WorkflowRunDetail{}, errors.New("sidecar not running")
+	}
+	var out types.WorkflowRunDetail
+	if err := s.client.Call(ctx, "workflow.getRun", map[string]any{"runId": runID}, &out); err != nil {
+		return types.WorkflowRunDetail{}, err
+	}
+	return out, nil
+}
+
+// TriggerPluginWorkflow manually starts a plugin's workflow.yaml via the local Vercel Workflow runtime.
+func (s *Service) TriggerPluginWorkflow(ctx context.Context, params types.StartWorkflowParams) (types.WorkflowRunDetail, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.WorkflowRunDetail{}, err
+	}
+	if s.client == nil {
+		return types.WorkflowRunDetail{}, errors.New("sidecar not running")
+	}
+	s.syncSidecarBlocking(ctx, s.store.Snapshot())
+	var out types.WorkflowRunDetail
+	if err := s.client.Call(ctx, "workflow.start", params, &out); err != nil {
+		return types.WorkflowRunDetail{}, err
+	}
+	return out, nil
+}
+
+// CancelWorkflowRun cancels an in-progress local Vercel Workflow execution run.
+func (s *Service) CancelWorkflowRun(ctx context.Context, runID string) (types.WorkflowRunDetail, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.WorkflowRunDetail{}, err
+	}
+	if s.client == nil {
+		return types.WorkflowRunDetail{}, errors.New("sidecar not running")
+	}
+	if err := s.client.Call(ctx, "workflow.cancelRun", map[string]any{"runId": runID}, nil); err != nil {
+		return types.WorkflowRunDetail{}, err
+	}
+	return s.GetWorkflowRunDetail(ctx, runID)
+}
+
+// ResumeWorkflowHook delivers an approval/rejection decision to a suspended Vercel Workflow createHook() token.
+func (s *Service) ResumeWorkflowHook(ctx context.Context, params types.ResumeWorkflowHookParams) (types.WorkflowRunDetail, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.WorkflowRunDetail{}, err
+	}
+	if s.client == nil {
+		return types.WorkflowRunDetail{}, errors.New("sidecar not running")
+	}
+	var res struct {
+		Resumed bool   `json:"resumed"`
+		RunID   string `json:"runId"`
+	}
+	if err := s.client.Call(ctx, "workflow.resumeHook", params, &res); err != nil {
+		return types.WorkflowRunDetail{}, err
+	}
+	if strings.TrimSpace(res.RunID) == "" {
+		return types.WorkflowRunDetail{}, nil
+	}
+	return s.GetWorkflowRunDetail(ctx, res.RunID)
 }
 
 // ReloadPlugin reloads one local plugin from disk (or all local plugins when pluginID is empty) and hot-reloads the runtime.
@@ -3726,7 +4062,7 @@ func (s *Service) installPluginFromDir(dir, slugOverride, nameOverride, taglineO
 	extraFiles := make(map[string]string)
 	for _, rel := range files {
 		low := strings.ToLower(rel)
-		if low == "manifest.yaml" || low == "manifest.yml" || low == "plugin.yaml" || low == "plugin.yml" || low == "skill.md" {
+		if low == "manifest.yaml" || low == "manifest.yml" || low == "plugin.yaml" || low == "plugin.yml" || low == "skill.md" || low == "workflow.yaml" || low == "workflow.yml" {
 			continue
 		}
 		if data, rErr := os.ReadFile(filepath.Join(resolvedDir, filepath.FromSlash(rel))); rErr == nil && len(data) <= 512*1024 {
@@ -3740,7 +4076,9 @@ func (s *Service) installPluginFromDir(dir, slugOverride, nameOverride, taglineO
 		Name:          strings.TrimSpace(nameOverride),
 		Tagline:       strings.TrimSpace(taglineOverride),
 		ManifestYAML:  manifestYAML,
+		ExecutionMode: parsed.ExecutionMode,
 		SkillMarkdown: skillMD,
+		WorkflowYAML:  parsed.WorkflowYAML,
 		Files:         extraFiles,
 	})
 }
@@ -3963,7 +4301,11 @@ func (s *Service) dispatchPluginEventInternal(
 			})
 			s.emitStateChange("timeline")
 		}
-		return types.SimulateEventResult{Event: *createdEvt, InboxItem: createdInbox}, nil
+		wfRunID := resp.WorkflowRunID
+		if wfRunID == "" {
+			wfRunID = createdEvt.WorkflowRunID
+		}
+		return types.SimulateEventResult{Event: *createdEvt, InboxItem: createdInbox, WorkflowRunID: wfRunID}, nil
 	}
 
 	now := time.Now()
@@ -5592,6 +5934,349 @@ func extractImportedLogLines(payload map[string]any) []types.LogLine {
 		return out
 	}
 	return nil
+}
+
+// CreateProject creates a new Project container with a starter Notebook and activates it.
+func (s *Service) CreateProject(params types.CreateProjectParams) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	title := strings.TrimSpace(params.Title)
+	if title == "" {
+		title = "未命名项目"
+	}
+	icon := strings.TrimSpace(params.Icon)
+	if icon == "" {
+		icon = "book"
+	}
+	tags := make([]string, 0, len(params.Tags))
+	for _, t := range params.Tags {
+		if trimmed := strings.TrimSpace(t); trimmed != "" {
+			tags = append(tags, trimmed)
+		}
+	}
+	projID := fmt.Sprintf("proj-%d", time.Now().UnixNano())
+	proj := types.Project{
+		ID:          projID,
+		Title:       title,
+		Description: strings.TrimSpace(params.Description),
+		Icon:        icon,
+		Tags:        tags,
+		WorkingDir:  strings.TrimSpace(params.WorkingDir),
+		IsDefault:   false,
+		UpdatedAt:   "刚刚",
+		CreatedAt:   time.Now().Format("2006-01-02"),
+		Blocks: []types.NotebookBlock{
+			{
+				ID:      fmt.Sprintf("blk-%d", time.Now().UnixNano()),
+				Type:    "paragraph",
+				Content: "",
+			},
+		},
+	}
+
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		st.Projects = append(st.Projects, proj)
+		st.ActiveView = string(types.ViewProjects)
+		st.ActiveProjectID = proj.ID
+		st.ActiveProjectTab = "notebook"
+	})
+	return next, nil
+}
+
+// UpdateProject persists metadata or Notebook block edits on an existing Project.
+func (s *Service) UpdateProject(params types.UpdateProjectParams) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	pid := strings.TrimSpace(params.ProjectID)
+	if pid == "" {
+		return types.ValetSnapshot{}, errors.New("projectId is required")
+	}
+
+	var found bool
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Projects {
+			if st.Projects[i].ID != pid {
+				continue
+			}
+			found = true
+			if params.Title != nil {
+				if t := strings.TrimSpace(*params.Title); t != "" {
+					st.Projects[i].Title = t
+				}
+			}
+			if params.Description != nil {
+				st.Projects[i].Description = strings.TrimSpace(*params.Description)
+			}
+			if params.Icon != nil && strings.TrimSpace(*params.Icon) != "" {
+				st.Projects[i].Icon = strings.TrimSpace(*params.Icon)
+			}
+			if params.Tags != nil {
+				cleanTags := make([]string, 0, len(*params.Tags))
+				for _, tag := range *params.Tags {
+					if trimmed := strings.TrimSpace(tag); trimmed != "" {
+						cleanTags = append(cleanTags, trimmed)
+					}
+				}
+				st.Projects[i].Tags = cleanTags
+			}
+			if params.WorkingDir != nil {
+				st.Projects[i].WorkingDir = strings.TrimSpace(*params.WorkingDir)
+			}
+			if params.Blocks != nil {
+				blocks := make([]types.NotebookBlock, len(*params.Blocks))
+				copy(blocks, *params.Blocks)
+				st.Projects[i].Blocks = blocks
+			}
+			if params.Archived != nil && !st.Projects[i].IsDefault {
+				st.Projects[i].Archived = *params.Archived
+			}
+			if st.Projects[i].ID == types.DefaultProjectID {
+				st.Projects[i].IsDefault = true
+				st.Projects[i].Archived = false
+			}
+			st.Projects[i].UpdatedAt = "刚刚"
+			break
+		}
+	})
+	if !found {
+		return types.ValetSnapshot{}, fmt.Errorf("project %q not found", pid)
+	}
+	return next, nil
+}
+
+// DeleteProject removes a custom project and reassigns its sessions back to the default project.
+func (s *Service) DeleteProject(projectID string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	pid := strings.TrimSpace(projectID)
+	if pid == "" || pid == types.DefaultProjectID {
+		return types.ValetSnapshot{}, errors.New("cannot delete default project")
+	}
+	var removed bool
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		kept := make([]types.Project, 0, len(st.Projects))
+		for _, p := range st.Projects {
+			if p.ID == pid {
+				removed = true
+				continue
+			}
+			kept = append(kept, p)
+		}
+		if !removed {
+			return
+		}
+		st.Projects = kept
+		for i := range st.ChatThreads {
+			if st.ChatThreads[i].ProjectID == pid {
+				st.ChatThreads[i].ProjectID = types.DefaultProjectID
+			}
+		}
+		if st.ActiveProjectID == pid {
+			st.ActiveProjectID = types.DefaultProjectID
+			st.ActiveProjectTab = "sessions"
+		}
+	})
+	if !removed {
+		return types.ValetSnapshot{}, fmt.Errorf("project %q not found", pid)
+	}
+	return next, nil
+}
+
+// CreateProjectChatThread creates a session inside a target Project (e.g. triggered via @valet in a Notebook).
+func (s *Service) CreateProjectChatThread(params types.CreateProjectChatParams) (types.CreateProjectChatResult, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.CreateProjectChatResult{}, err
+	}
+	var created types.ChatThread
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		pid := strings.TrimSpace(params.ProjectID)
+		projectExists := false
+		for _, p := range st.Projects {
+			if p.ID == pid {
+				projectExists = true
+				break
+			}
+		}
+		if !projectExists {
+			pid = types.DefaultProjectID
+		}
+		model := strings.TrimSpace(params.Model)
+		if model == "" {
+			model = st.Preferences.Models.Primary
+		}
+		title := strings.TrimSpace(params.Title)
+		if title != "" {
+			runes := []rune(title)
+			if len(runes) > 22 {
+				title = string(runes[:22])
+			}
+		}
+		withWelcome := strings.TrimSpace(params.OriginBlockID) == ""
+		created = makeProjectChatThread(pid, title, model, st.Preferences.UserNickname, withWelcome)
+		created.OriginBlockID = strings.TrimSpace(params.OriginBlockID)
+		created.OriginSection = strings.TrimSpace(params.OriginSection)
+		created.NotebookContextInjected = params.NotebookContextInjected
+		st.ChatThreads = append([]types.ChatThread{created}, st.ChatThreads...)
+		if params.SwitchToSession {
+			st.ActiveView = string(types.ViewProjects)
+			st.ActiveProjectID = pid
+			st.ActiveProjectTab = "session"
+			st.ActiveChatID = created.ID
+		}
+	})
+	return types.CreateProjectChatResult{
+		Snapshot: next,
+		Thread:   created,
+	}, nil
+}
+
+// MoveChatThreadToProject moves an existing session into another Project container.
+func (s *Service) MoveChatThreadToProject(chatID, targetProjectID string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	pid := strings.TrimSpace(targetProjectID)
+	if pid == "" {
+		pid = types.DefaultProjectID
+	}
+	var projFound bool
+	var chatFound bool
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for _, p := range st.Projects {
+			if p.ID == pid {
+				projFound = true
+				break
+			}
+		}
+		if !projFound {
+			return
+		}
+		for i := range st.ChatThreads {
+			if st.ChatThreads[i].ID == chatID {
+				st.ChatThreads[i].ProjectID = pid
+				chatFound = true
+				break
+			}
+		}
+	})
+	if !projFound {
+		return types.ValetSnapshot{}, fmt.Errorf("target project %q not found", pid)
+	}
+	if !chatFound {
+		return types.ValetSnapshot{}, fmt.Errorf("chat thread %q not found", chatID)
+	}
+	return next, nil
+}
+
+// SyncSessionSummaryToNotebook writes or updates the session's latest assistant summary in its parent Project's Notebook.
+func (s *Service) SyncSessionSummaryToNotebook(chatID string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	var threadFound bool
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		var thread *types.ChatThread
+		for i := range st.ChatThreads {
+			if st.ChatThreads[i].ID == chatID {
+				thread = &st.ChatThreads[i]
+				threadFound = true
+				break
+			}
+		}
+		if thread == nil {
+			return
+		}
+		pid := thread.ProjectID
+		if pid == "" {
+			pid = types.DefaultProjectID
+		}
+
+		summary := ""
+		for mIdx := len(thread.Messages) - 1; mIdx >= 0; mIdx-- {
+			m := thread.Messages[mIdx]
+			if m.Role == "assistant" {
+				cleaned := stripThinkTags(m.Content)
+				if s := summarizeMarkdownReply(cleaned); s != "" {
+					summary = s
+					break
+				}
+			}
+		}
+		if summary == "" {
+			summary = "会话已同步，点击进入查看完整上下文"
+		}
+
+		for pi := range st.Projects {
+			if st.Projects[pi].ID != pid {
+				continue
+			}
+			updatedExisting := false
+			originIdx := -1
+			for bi := range st.Projects[pi].Blocks {
+				blk := &st.Projects[pi].Blocks[bi]
+				if blk.ID == thread.OriginBlockID && thread.OriginBlockID != "" {
+					originIdx = bi
+				}
+				if blk.Type == "session_ref" && blk.SessionID == chatID {
+					blk.Summary = summary
+					if strings.TrimSpace(blk.Content) == "" {
+						blk.Content = thread.Title
+					}
+					updatedExisting = true
+				}
+			}
+			if !updatedExisting {
+				newBlk := types.NotebookBlock{
+					ID:        fmt.Sprintf("blk-ref-%d", time.Now().UnixNano()),
+					Type:      "session_ref",
+					SessionID: chatID,
+					Content:   thread.Title,
+					Summary:   summary,
+				}
+				if originIdx >= 0 && originIdx < len(st.Projects[pi].Blocks) {
+					idx := originIdx + 1
+					blocks := append([]types.NotebookBlock(nil), st.Projects[pi].Blocks[:idx]...)
+					blocks = append(blocks, newBlk)
+					blocks = append(blocks, st.Projects[pi].Blocks[idx:]...)
+					st.Projects[pi].Blocks = blocks
+				} else {
+					st.Projects[pi].Blocks = append(st.Projects[pi].Blocks, newBlk)
+				}
+			}
+			st.Projects[pi].UpdatedAt = "刚刚"
+			break
+		}
+	})
+	if !threadFound {
+		return types.ValetSnapshot{}, fmt.Errorf("chat thread %q not found", chatID)
+	}
+	return next, nil
+}
+
+func stripThinkTags(raw string) string {
+	out := raw
+	for {
+		lower := strings.ToLower(out)
+		start := strings.Index(lower, "<think")
+		if start == -1 {
+			break
+		}
+		closeTag := strings.Index(lower[start:], "</think")
+		if closeTag == -1 {
+			out = out[:start]
+			break
+		}
+		endBracket := strings.Index(out[start+closeTag:], ">")
+		if endBracket == -1 {
+			out = out[:start]
+			break
+		}
+		out = out[:start] + out[start+closeTag+endBracket+1:]
+	}
+	return strings.TrimSpace(out)
 }
 
 func summarizeMarkdownReply(raw string) string {

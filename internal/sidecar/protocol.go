@@ -86,6 +86,7 @@ type PluginEventResponse struct {
 	ReplyText        string   `json:"replyText"`
 	QueuedInboxIDs   []string `json:"queuedInboxIds"`
 	TimelineEventIDs []string `json:"timelineEventIds"`
+	WorkflowRunID    string   `json:"workflowRunId,omitempty"`
 }
 
 // ExecuteApprovedRequest runs a pre-approved Inbox tool invocation inside the sidecar.
@@ -160,11 +161,12 @@ type RecordTimelineRequest struct {
 	Summary     string                     `json:"summary"`
 	Status      string                     `json:"status"`
 	Reasoning   string                     `json:"reasoning"`
-	ReclaimedGB float64                    `json:"reclaimedGB,omitempty"`
-	Intercepted bool                       `json:"intercepted,omitempty"`
-	CanRestore  bool                       `json:"canRestore,omitempty"`
-	Payload     map[string]any             `json:"payload"`
-	ActionItems []types.TimelineActionItem `json:"actionItems,omitempty"`
+	ReclaimedGB   float64                    `json:"reclaimedGB,omitempty"`
+	Intercepted   bool                       `json:"intercepted,omitempty"`
+	CanRestore    bool                       `json:"canRestore,omitempty"`
+	WorkflowRunID string                     `json:"workflowRunId,omitempty"`
+	Payload       map[string]any             `json:"payload"`
+	ActionItems   []types.TimelineActionItem `json:"actionItems,omitempty"`
 }
 
 // AlwaysOnIngestRequest enqueues a durable event into the sidecar Always-On Inbox for coalesced execution.

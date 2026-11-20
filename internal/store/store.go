@@ -283,6 +283,7 @@ func normalizeLoadedSnapshot(s *types.ValetSnapshot) {
 		s.ChatThreads = seedChatThreads(s.Preferences.Models.Primary, s.Preferences.UserNickname)
 		s.ActiveChatID = s.ChatThreads[0].ID
 	}
+	normalizeProjectsSnapshot(s)
 	if s.Automations == nil {
 		s.Automations = []types.AutomationRule{}
 	}
@@ -441,6 +442,75 @@ func cloneSnapshot(src types.ValetSnapshot) types.ValetSnapshot {
 		return src
 	}
 	return out
+}
+
+func normalizeProjectsSnapshot(s *types.ValetSnapshot) {
+	var defaultProj *types.Project
+	others := make([]types.Project, 0, len(s.Projects))
+	for i := range s.Projects {
+		p := s.Projects[i]
+		if p.ID == "" {
+			continue
+		}
+		if p.Tags == nil {
+			p.Tags = []string{}
+		}
+		if len(p.Blocks) == 0 {
+			p.Blocks = []types.NotebookBlock{{ID: "blk-" + p.ID + "-1", Type: "paragraph", Content: ""}}
+		}
+		if p.ID == types.DefaultProjectID {
+			p.IsDefault = true
+			p.Archived = false
+			if strings.TrimSpace(p.Title) == "" {
+				p.Title = "默认项目"
+			}
+			if strings.TrimSpace(p.Icon) == "" {
+				p.Icon = "box"
+			}
+			copyProj := p
+			defaultProj = &copyProj
+			continue
+		}
+		p.IsDefault = false
+		others = append(others, p)
+	}
+	if defaultProj == nil {
+		def := DefaultProject()
+		defaultProj = &def
+	}
+	s.Projects = append([]types.Project{*defaultProj}, others...)
+
+	validProjectIDs := make(map[string]bool, len(s.Projects))
+	for _, p := range s.Projects {
+		validProjectIDs[p.ID] = true
+	}
+
+	for i := range s.ChatThreads {
+		if !validProjectIDs[s.ChatThreads[i].ProjectID] {
+			s.ChatThreads[i].ProjectID = types.DefaultProjectID
+		}
+	}
+
+	if !validProjectIDs[s.ActiveProjectID] {
+		s.ActiveProjectID = types.DefaultProjectID
+	}
+
+	if s.ActiveView == string(types.ViewChat) {
+		s.ActiveView = string(types.ViewProjects)
+		if s.ActiveProjectTab == "" {
+			s.ActiveProjectTab = "session"
+		}
+	}
+
+	switch s.ActiveProjectTab {
+	case "notebook", "sessions", "session":
+	default:
+		if s.ActiveProjectID == types.DefaultProjectID {
+			s.ActiveProjectTab = "sessions"
+		} else {
+			s.ActiveProjectTab = "notebook"
+		}
+	}
 }
 
 func extractStoreStringSlice(raw any) []string {

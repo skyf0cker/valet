@@ -38,6 +38,7 @@ export const CommandPalette: React.FC = () => {
     selectTimelineEvent,
     openPluginDetail,
     openSettingsSection,
+    selectProject,
     selectChatThread,
     createNewChat,
     togglePauseValet,
@@ -188,18 +189,33 @@ export const CommandPalette: React.FC = () => {
       onSelect: () => openSettingsSection(sec.id),
     }));
 
+    const projectItems: PaletteItem[] = state.projects
+      .filter((p) => !p.archived)
+      .map((proj) => ({
+        id: `proj-${proj.id}`,
+        group: "项目 Notebook",
+        title: proj.title,
+        subtitle: `${proj.isDefault ? "默认容器 · " : ""}${proj.blocks.length} 个内容块 · ${proj.updatedAt}`,
+        onSelect: () => selectProject(proj.id, "notebook"),
+      }));
+
+    const projectById = new Map(state.projects.map((p) => [p.id, p]));
     const chats: PaletteItem[] = state.chatThreads
       .filter((ch) => !ch.archived)
-      .map((ch) => ({
-      id: `chat-${ch.id}`,
-      group: "历史对话",
-      title: ch.title,
-      subtitle: `${ch.model} · ${ch.updatedAt}`,
-      onSelect: () => selectChatThread(ch.id),
-    }));
+      .map((ch) => {
+        const projTitle = projectById.get(ch.projectId || "proj-default")?.title ?? "默认项目";
+        return {
+          id: `chat-${ch.id}`,
+          group: "项目会话",
+          title: ch.title,
+          subtitle: `${projTitle} · ${ch.model} · ${ch.updatedAt}`,
+          onSelect: () => selectChatThread(ch.id),
+        };
+      });
 
     return [
       ...actions,
+      ...projectItems,
       ...inboxPalette,
       ...events,
       ...plugins,
@@ -216,6 +232,7 @@ export const CommandPalette: React.FC = () => {
     reversibleCount,
     selectChatThread,
     selectInboxItem,
+    selectProject,
     selectTimelineEvent,
     setActiveView,
     state.chatThreads,
@@ -223,6 +240,7 @@ export const CommandPalette: React.FC = () => {
     state.plugins,
     state.preferences.appearance,
     state.preferences.darkTheme,
+    state.projects,
     state.timelineEvents,
     pushToast,
     togglePauseValet,

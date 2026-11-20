@@ -62,13 +62,20 @@ import type {
   ProbeMcpResponse,
   ProcessSampleRow,
   ResolvePermissionRequest,
+  ResumeWorkflowHookRequest,
   SendChatRequest,
   SendChatResponse,
+  StartWorkflowRequest,
   TestAutoReviewRequest,
   TestProviderRequest,
   ValetSyncState,
+  WorkflowGraphResponse,
+  WorkflowRunDetail,
+  WorkflowRunSummary,
+  WorkflowValidationResponse,
 } from "./protocol.ts";
 import { openUniversalSqliteBundle } from "./sqlite.ts";
+import { ValetWorkflowManager } from "./workflow/manager.ts";
 
 const ValetThreadsDoc = defineDoc<{ map: Record<string, ConversationId> }>({
   kind: "valet.threads",
@@ -331,6 +338,8 @@ export class ValetDurableRuntime {
     { inboxIds: string[]; timelineIds: string[] }
   >();
   private alwaysOn: ValetAlwaysOnStore | null = null;
+  private workflows: ValetWorkflowManager | null = null;
+  private fauxScriptQueue: Promise<unknown> = Promise.resolve();
   private activeRunId: string | null = null;
   private activeRunChatId: string | null = null;
   private activeRunPromise: Promise<void> | null = null;
@@ -513,6 +522,144 @@ export class ValetDurableRuntime {
       await this.alwaysOn.ensureSchema();
     }
 
+    this.workflows = new ValetWorkflowManager(
+      params.state.dataDir,
+      db,
+      {
+        getPlugin: (pluginId) =>
+          this.state.plugins.find((p) => p.id === pluginId),
+        executeTool: async (req) => {
+          return await this.runWorkflowToolSafely({
+            conversationKey: `workflow:${req.__valetPluginId}:${req.__valetRunId ?? "run"}:${req.__valetNodeId}`,
+            toolName: req.tool,
+            toolArgs: req.args,
+          });
+        },
+        runAgentPrompt: async (req) => {
+          const model =
+            req.model?.trim() ||
+            this.state.preferences.models.fast ||
+            this.state.preferences.models.primary;
+          const prompt = req.systemPrompt?.trim()
+            ? `${req.systemPrompt.trim()}\n\n${req.prompt}`
+            : req.prompt;
+          const res = await this.sendChat({
+            chatId: `wf-agent:${req.__valetPluginId}:${req.__valetRunId ?? "run"}`,
+            prompt,
+            model,
+            interactive: false,
+          });
+          return {
+            text: res.replyMessage.content,
+            queuedInboxIds: res.queuedInboxIds,
+            timelineEventIds: res.timelineEventIds,
+            providerUsed: res.providerUsed,
+          };
+        },
+        emitNotify: async (req) => {
+          const plugin = this.state.plugins.find(
+            (p) => p.id === req.__valetPluginId,
+          );
+          const kind = req.kind ?? "timeline";
+          let timelineEventId: string | undefined;
+          let outboxId: string | undefined;
+
+          if (kind === "outbox" || kind === "both") {
+            if (this.alwaysOn) {
+              const msg = await this.alwaysOn.appendOutbox({
+                run_id: req.__valetRunId ?? null,
+                kind: "message",
+                title: req.title?.trim() || plugin?.name || "Workflow 通知",
+                body: req.message,
+                detail: {
+                  level: req.level ?? "info",
+                  pluginId: req.__valetPluginId,
+                  nodeId: req.__valetNodeId,
+                },
+                dedupe_key: `wf:${req.__valetRunId ?? "direct"}:${req.__valetNodeId}`,
+              });
+              outboxId = msg.id;
+              this.bridge.notifyHost("host.outboxNotify", {
+                message: msg,
+                level: req.level ?? "info",
+              });
+              this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "outbox" });
+            }
+          }
+
+          if (kind === "timeline" || kind === "both") {
+            const rec = await this.bridge.callHost<{ timelineEventId: string }>(
+              "host.recordTimelineEvent",
+              {
+                pluginId: req.__valetPluginId,
+                pluginName: plugin?.name ?? req.__valetPluginId,
+                eventCode: "workflow.notify",
+                title: req.title?.trim() || plugin?.name || "Workflow 通知",
+                summary: req.message,
+                status: req.level === "error" ? "failed" : "completed",
+                reasoning: req.message,
+                workflowRunId: req.__valetRunId,
+                payload: {
+                  level: req.level ?? "info",
+                  nodeId: req.__valetNodeId,
+                  workflowRunId: req.__valetRunId ?? "",
+                },
+              },
+            );
+            timelineEventId = rec?.timelineEventId;
+          }
+
+          return {
+            notified: true,
+            kind,
+            ...(timelineEventId ? { timelineEventId } : {}),
+            ...(outboxId ? { outboxId } : {}),
+          };
+        },
+        queueApproval: async (req) => {
+          const plugin = this.state.plugins.find(
+            (p) => p.id === req.__valetPluginId,
+          );
+          const res = await this.bridge.callHost<{ inboxId: string }>(
+            "host.queueApproval",
+            {
+              pluginId: req.__valetPluginId,
+              pluginName: plugin?.name ?? req.__valetPluginId,
+              eventCode: "workflow.approval",
+              category: "process",
+              iconKind: "pulse",
+              title: req.title,
+              summary:
+                req.detail?.trim() ||
+                `工作流节点「${req.__valetNodeName}」等待人工审批后继续`,
+              reasoning: `Vercel Workflow durable hook 等待审批 (runId=${req.runId}, token=${req.hookToken})`,
+              reversible7d: false,
+              approveLabel: req.approveLabel || "批准继续",
+              dismissLabel: req.rejectLabel || "拒绝",
+              toolName: "workflow_resume_hook",
+              toolArgs: {
+                runId: req.runId,
+                hookToken: req.hookToken,
+                nodeId: req.__valetNodeId,
+                nodeName: req.__valetNodeName,
+                pluginId: req.__valetPluginId,
+              },
+              actionItems: [],
+            },
+          );
+          return {
+            queued: true,
+            inboxId: res?.inboxId ?? "",
+            token: req.hookToken,
+          };
+        },
+        onRunUpdated: (info) => {
+          this.bridge.notifyHost("host.workflowUpdate", info);
+        },
+      },
+    );
+    await this.workflows.init();
+
     this.harness = await Harness.open(
       storage,
       {
@@ -553,8 +700,10 @@ export class ValetDurableRuntime {
 
       const sig = JSON.stringify({
         v: plugin.version,
+        m: plugin.executionMode ?? "skill",
         y: plugin.manifestYaml,
         s: plugin.skillMarkdown ?? "",
+        w: plugin.workflowYaml ?? "",
         e: plugin.events.map((ev) => `${ev.id}:${ev.policy}`),
         l: plugin.localDir ?? "",
         c: plugin.config?.values ?? {},
@@ -711,8 +860,13 @@ export class ValetDurableRuntime {
     const quoteExcerpts: string[] = [];
     const nonQuoteAttachments: typeof req.attachments = [];
     for (const att of req.attachments ?? []) {
-      if (att.kind === "inbox_item" || att.kind === "timeline_event") {
-        const kindLabel = att.kind === "inbox_item" ? "收件箱事项" : "时间线事件";
+      if (att.kind === "inbox_item" || att.kind === "timeline_event" || att.kind === "notebook_context") {
+        const kindLabel =
+          att.kind === "inbox_item"
+            ? "收件箱事项"
+            : att.kind === "timeline_event"
+              ? "时间线事件"
+              : "项目 Notebook 上下文";
         const idTag = att.refId ? ` id=${att.refId}` : "";
         const quoteBody = (att.textExcerpt?.trim() || att.meta || "").slice(0, 12_000);
         quoteExcerpts.push(
@@ -1110,6 +1264,7 @@ export class ValetDurableRuntime {
     replyText: string;
     queuedInboxIds: string[];
     timelineEventIds: string[];
+    workflowRunId?: string;
   }> {
     const plugin = this.state.plugins.find((p) => p.id === req.pluginId);
     if (!plugin || !plugin.installed || !plugin.enabled) {
@@ -1146,6 +1301,56 @@ export class ValetDurableRuntime {
         timelineEventIds: recorded?.timelineEventId
           ? [recorded.timelineEventId]
           : [],
+      };
+    }
+
+    if (plugin.executionMode === "workflow") {
+      const wf = this.requireWorkflows();
+      const detail = await wf.startPluginWorkflow({
+        plugin,
+        event: req.eventCode,
+        source: req.simulated ? "simulate" : "event",
+        payload: req.payload ?? {},
+        waitForCompletionMs: 4000,
+      });
+      const tlStatus =
+        detail.summary.status === "failed" ||
+        detail.summary.status === "cancelled"
+          ? "failed"
+          : detail.summary.status === "waiting_approval"
+            ? "pending_confirm"
+            : detail.summary.status === "completed"
+              ? "completed"
+              : "running";
+      const summary =
+        detail.summary.errorMessage ||
+        `工作流运行状态：${detail.summary.status} (${detail.summary.runId})`;
+      const recorded = await this.bridge.callHost<{ timelineEventId: string }>(
+        "host.recordTimelineEvent",
+        {
+          pluginId: plugin.id,
+          pluginName: plugin.name,
+          eventCode: req.eventCode,
+          title: `${req.simulated ? "模拟事件：" : ""}${plugin.name} 工作流 (${req.eventCode})`,
+          summary,
+          status: tlStatus,
+          reasoning: `通过 Workflow 模式本地执行 DAG (${detail.summary.runId})`,
+          workflowRunId: detail.summary.runId,
+          payload: {
+            workflowRunId: detail.summary.runId,
+            status: detail.summary.status,
+          },
+        },
+      );
+      return {
+        handled: true,
+        policy,
+        replyText: summary,
+        queuedInboxIds: [],
+        timelineEventIds: recorded?.timelineEventId
+          ? [recorded.timelineEventId]
+          : [],
+        workflowRunId: detail.summary.runId,
       };
     }
 
@@ -1651,8 +1856,210 @@ export class ValetDurableRuntime {
     };
   }
 
+  private requireWorkflows(): ValetWorkflowManager {
+    if (!this.workflows) {
+      throw new Error("ValetWorkflowManager is not initialized");
+    }
+    return this.workflows;
+  }
+
+  private async runWorkflowToolSafely(opts: {
+    conversationKey: string;
+    toolName: string;
+    toolArgs: Record<string, unknown>;
+  }): Promise<unknown> {
+    const effectiveToolName =
+      opts.toolName === "disk_move_to_trash" ||
+      opts.toolName === "app_trash_remnants"
+        ? "trash_files"
+        : opts.toolName === "process_terminate"
+          ? "kill_process"
+          : opts.toolName;
+
+    const snap = this.registry.snapshot();
+    const matched = snap.tools().find((entry) => entry.tool.name === effectiveToolName);
+    if (!matched) {
+      throw new Error(`Tool not registered: ${effectiveToolName}`);
+    }
+
+    const execTask = async () => {
+      const conv = await this.ensureConversation(opts.conversationKey);
+      let calledTool = false;
+      let finalOut = "";
+      let toolIsError = false;
+
+      this.models.setLocalStewardScript([
+        async (ctx) => {
+          const last = ctx.messages[ctx.messages.length - 1];
+          if (!calledTool && last?.role === "user") {
+            calledTool = true;
+            return fauxAssistantMessage(
+              [
+                fauxThinking(`Workflow 调用内置工具 ${effectiveToolName}`),
+                fauxToolCall(effectiveToolName, opts.toolArgs as never),
+              ],
+              { stopReason: "toolUse" },
+            );
+          }
+          if (last?.role === "toolResult") {
+            toolIsError = Boolean(last.isError);
+            finalOut = last.content
+              .map((b) => (b.type === "text" ? b.text : ""))
+              .join("\n");
+          }
+          return fauxAssistantMessage(finalOut || "done");
+        },
+        async (ctx) => {
+          const last = ctx.messages[ctx.messages.length - 1];
+          if (last?.role === "toolResult") {
+            toolIsError = Boolean(last.isError);
+            finalOut = last.content
+              .map((b) => (b.type === "text" ? b.text : ""))
+              .join("\n");
+          }
+          return fauxAssistantMessage(finalOut || "done");
+        },
+      ]);
+
+      try {
+        await conv.configure(
+          {
+            model: { provider: "valet-local", modelId: "valet-steward-local" },
+            maxTurns: 3,
+          },
+          BACKGROUND_CONTEXT,
+        );
+        const sub = await conv.submit(
+          {
+            type: "input",
+            content: `Workflow tool step: ${effectiveToolName}`,
+            requestId: `${opts.conversationKey}:${Date.now()}`,
+          },
+          BACKGROUND_CONTEXT,
+        );
+        await sub.wait(BACKGROUND_CONTEXT);
+      } finally {
+        this.models.setLocalStewardScript([]);
+      }
+
+      if (toolIsError) {
+        throw new Error(finalOut || `Tool ${effectiveToolName} failed`);
+      }
+
+      let parsedJson: unknown;
+      const trimmed = finalOut.trim();
+      if (
+        (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+        (trimmed.startsWith("[") && trimmed.endsWith("]"))
+      ) {
+        try {
+          parsedJson = JSON.parse(trimmed);
+        } catch {
+          parsedJson = undefined;
+        }
+      }
+
+      return {
+        tool: effectiveToolName,
+        output: finalOut,
+        ...(parsedJson !== undefined ? { json: parsedJson } : {}),
+      };
+    };
+
+    const next = this.fauxScriptQueue.then(execTask, execTask);
+    this.fauxScriptQueue = next.catch(() => undefined);
+    return await next;
+  }
+
+  workflowValidate(yaml: string): WorkflowValidationResponse {
+    if (!this.workflows) {
+      // Pure schema validation works even before harness init
+      const temp = new ValetWorkflowManager(
+        this.state.dataDir,
+        null,
+        {
+          getPlugin: (id) => this.state.plugins.find((p) => p.id === id),
+          executeTool: async () => undefined,
+          runAgentPrompt: async () => undefined,
+          emitNotify: async () => undefined,
+          queueApproval: async () => ({ queued: false, inboxId: "", token: "" }),
+          onRunUpdated: () => undefined,
+        },
+      );
+      return temp.validateYaml(yaml);
+    }
+    return this.workflows.validateYaml(yaml);
+  }
+
+  workflowGetGraph(pluginId: string): WorkflowGraphResponse {
+    const plugin = this.state.plugins.find((p) => p.id === pluginId);
+    if (!plugin) {
+      throw new Error(`插件不存在: ${pluginId}`);
+    }
+    if (!this.workflows) {
+      const temp = new ValetWorkflowManager(
+        this.state.dataDir,
+        null,
+        {
+          getPlugin: (id) => this.state.plugins.find((p) => p.id === id),
+          executeTool: async () => undefined,
+          runAgentPrompt: async () => undefined,
+          emitNotify: async () => undefined,
+          queueApproval: async () => ({ queued: false, inboxId: "", token: "" }),
+          onRunUpdated: () => undefined,
+        },
+      );
+      return temp.getPluginGraph(plugin);
+    }
+    return this.workflows.getPluginGraph(plugin);
+  }
+
+  async workflowStart(req: StartWorkflowRequest): Promise<WorkflowRunDetail> {
+    const plugin = this.state.plugins.find((p) => p.id === req.pluginId);
+    if (!plugin) {
+      throw new Error(`插件不存在: ${req.pluginId}`);
+    }
+    const wf = this.requireWorkflows();
+    return await wf.startPluginWorkflow({
+      plugin,
+      event: req.event,
+      source: req.source,
+      summary: req.summary,
+      payload: req.payload,
+      waitForCompletionMs: req.waitForCompletionMs ?? 1500,
+    });
+  }
+
+  async workflowListRuns(
+    pluginId: string,
+    limit?: number,
+  ): Promise<WorkflowRunSummary[]> {
+    return await this.requireWorkflows().listPluginRuns(pluginId, limit);
+  }
+
+  async workflowGetRun(runId: string): Promise<WorkflowRunDetail> {
+    return await this.requireWorkflows().getRunDetail(runId);
+  }
+
+  async workflowCancelRun(runId: string): Promise<{ cancelled: boolean }> {
+    return await this.requireWorkflows().cancelRun(runId);
+  }
+
+  async workflowResumeHook(
+    req: ResumeWorkflowHookRequest,
+  ): Promise<{ resumed: boolean; runId?: string }> {
+    return await this.requireWorkflows().resumeHook(req.token, {
+      approved: Boolean(req.approved),
+      comment: req.comment,
+      decidedBy: req.decidedBy || "user",
+      decidedAt: new Date().toISOString(),
+    });
+  }
+
   async close(): Promise<void> {
     this.clearWakeupTimer();
+    await this.workflows?.close();
+    this.workflows = null;
     await this.mcp.closeAll();
     if (this.harness) {
       await this.harness.close(BACKGROUND_CONTEXT);

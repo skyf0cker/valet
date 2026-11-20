@@ -1,8 +1,17 @@
 import React, { useEffect, useRef } from "react";
 import { useValet } from "../../store/ValetContext";
+import { DEFAULT_PROJECT_ID } from "../../types/valet";
 import { isQuoteAttachment } from "../../utils/chatQuotes";
 import { SidebarToggleButton } from "../Sidebar";
-import { BowtieSvg, ClockIcon, InboxIcon, PlusIcon } from "../ui/Icons";
+import {
+  ArrowLeftIcon,
+  BookOpenIcon,
+  BowtieSvg,
+  ClockIcon,
+  FileTextIcon,
+  InboxIcon,
+  PlusIcon,
+} from "../ui/Icons";
 import { SelectMenu } from "../ui/SelectMenu";
 import { ChatComposer } from "./ChatComposer";
 import {
@@ -21,6 +30,9 @@ export const ChatView: React.FC = () => {
     sidebarCollapsed,
     createNewChat,
     selectChatThread,
+    selectProject,
+    returnToProjectNotebook,
+    syncSessionSummaryToNotebook,
     sendChatMessage,
     resolveChatPermission,
     abortChatMessage,
@@ -43,6 +55,18 @@ export const ChatView: React.FC = () => {
   const sending = thread ? (runningChatIds[thread.id] ?? 0) > 0 : false;
   const activeStream = thread ? (chatStreams[thread.id] ?? null) : null;
 
+  const parentProject = thread
+    ? state.projects.find((p) => p.id === (thread.projectId || DEFAULT_PROJECT_ID)) ??
+      state.projects.find((p) => p.id === DEFAULT_PROJECT_ID) ??
+      state.projects[0]
+    : undefined;
+
+  const projectThreads = parentProject
+    ? activeThreads.filter(
+        (t) => (t.projectId || DEFAULT_PROJECT_ID) === parentProject.id
+      )
+    : activeThreads;
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [
@@ -54,6 +78,20 @@ export const ChatView: React.FC = () => {
 
   if (!thread) return null;
 
+  const switcherThreads = projectThreads.some((t) => t.id === thread.id)
+    ? projectThreads
+    : [thread, ...projectThreads];
+
+  const hasNotebookBacklink =
+    Boolean(parentProject) &&
+    (Boolean(thread.originBlockId) ||
+      Boolean(thread.notebookContextInjected) ||
+      Boolean(
+        parentProject?.blocks.some(
+          (b) => b.sessionId === thread.id || b.content.includes(`[[session:${thread.id}]]`)
+        )
+      ));
+
   return (
     <div className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-[var(--bg-canvas)]">
       {/* Top Bar */}
@@ -64,14 +102,33 @@ export const ChatView: React.FC = () => {
       >
         <SidebarToggleButton />
 
-        {/* Thread Switcher Dropdown (matches 23 小屏 · 对话) */}
+        {parentProject && (
+          <div className="app-no-drag flex shrink-0 items-center gap-1.5 text-[12px] text-[var(--ink-muted)]">
+            <button
+              type="button"
+              onClick={() => selectProject(parentProject.id, "sessions")}
+              className="cursor-pointer rounded-[5px] px-1 py-0.5 hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+            >
+              项目
+            </button>
+            <span className="text-[var(--ink-subtle)]">/</span>
+            <button
+              type="button"
+              onClick={() => returnToProjectNotebook(undefined, parentProject.id)}
+              className="max-w-[140px] cursor-pointer truncate rounded-[5px] px-1 py-0.5 font-medium hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+              title={`返回 ${parentProject.title} Notebook`}
+            >
+              {parentProject.title}
+            </button>
+            <span className="text-[var(--ink-subtle)]">/</span>
+          </div>
+        )}
+
+        {/* Scoped Thread Switcher Dropdown */}
         <div className="app-no-drag min-w-0">
           <SelectMenu
             value={thread.id}
-            options={(thread.archived && !activeThreads.some((t) => t.id === thread.id)
-              ? [thread, ...activeThreads]
-              : activeThreads
-            ).map((t) => ({
+            options={switcherThreads.map((t) => ({
               value: t.id,
               label: t.archived ? `${t.title}（已归档）` : t.title,
               hint: t.updatedAt,
@@ -83,6 +140,19 @@ export const ChatView: React.FC = () => {
         </div>
 
         <div className="flex-1" />
+
+        {parentProject && (
+          <button
+            type="button"
+            onClick={() =>
+              returnToProjectNotebook(thread.originBlockId || undefined, parentProject.id)
+            }
+            className="app-no-drag inline-flex h-[28px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2.5 text-[11.5px] font-medium text-[var(--ink-strong)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)]"
+          >
+            <ArrowLeftIcon size={12} />
+            <span>返回 Notebook</span>
+          </button>
+        )}
 
         {thread.timelineActionCount > 0 && (
           <button
@@ -102,7 +172,7 @@ export const ChatView: React.FC = () => {
 
         <button
           type="button"
-          onClick={createNewChat}
+          onClick={() => createNewChat(parentProject?.id)}
           title="新建对话 (⌘N)"
           className={`app-no-drag flex shrink-0 cursor-pointer items-center justify-center rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-primary)] hover:bg-[var(--bg-subtle)] lg:rounded-[8px] ${
             sidebarCollapsed ? "h-[26px] w-[26px]" : "h-[30px] w-[30px]"
@@ -111,6 +181,44 @@ export const ChatView: React.FC = () => {
           <PlusIcon size={sidebarCollapsed ? 12 : 14} />
         </button>
       </header>
+
+      {/* Notebook Backlink Context Bar */}
+      {hasNotebookBacklink && parentProject && (
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-[var(--border-light)] bg-[var(--bg-subtle)]/70 px-6 py-1.5 text-[11.5px]">
+          <div className="flex min-w-0 items-center gap-2 text-[var(--ink-secondary)]">
+            <FileTextIcon size={12.5} className="shrink-0 text-[var(--ink-muted)]" />
+            <span className="truncate">
+              引用自「{parentProject.title}」Notebook
+              {thread.originSection ? ` · ${thread.originSection}` : ""}
+            </span>
+            {thread.notebookContextInjected && (
+              <span className="shrink-0 rounded-[5px] border border-[var(--border-light)] bg-[var(--bg-surface)] px-1.5 py-[1px] font-mono text-[10px] text-[var(--ink-muted)]">
+                已注入页面上下文
+              </span>
+            )}
+          </div>
+
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                returnToProjectNotebook(thread.originBlockId || undefined, parentProject.id)
+              }
+              className="cursor-pointer font-medium text-[var(--ink-strong)] hover:underline"
+            >
+              定位到引用处 ↗
+            </button>
+            <span className="text-[var(--ink-subtle)]">·</span>
+            <button
+              type="button"
+              onClick={() => syncSessionSummaryToNotebook(thread.id)}
+              className="cursor-pointer text-[var(--ink-muted)] hover:text-[var(--ink-strong)] hover:underline"
+            >
+              同步摘要到 Notebook
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Message stream */}
       <div
@@ -172,6 +280,38 @@ export const ChatView: React.FC = () => {
                                 <span className="shrink-0 font-mono text-[9.5px] font-medium text-[var(--ink-muted)]">
                                   {att.badge ??
                                     (att.kind === "inbox_item" ? "收件箱" : "时间线")}
+                                </span>
+                                <span className="truncate text-[11.5px] font-medium text-[var(--ink-strong)]">
+                                  {att.name}
+                                </span>
+                              </div>
+                              {att.meta && (
+                                <span className="truncate font-mono text-[9.5px] text-[var(--ink-subtle)]">
+                                  {att.meta}
+                                </span>
+                              )}
+                            </div>
+                          </button>
+                        ) : att.kind === "notebook_context" ? (
+                          <button
+                            key={att.id}
+                            type="button"
+                            onClick={() =>
+                              returnToProjectNotebook(
+                                thread.originBlockId || undefined,
+                                att.refId || parentProject?.id
+                              )
+                            }
+                            title="点击跳转回项目 Notebook"
+                            className="flex max-w-[320px] cursor-pointer items-center gap-2 overflow-hidden rounded-[8px] border border-[var(--border-card)] bg-[var(--bg-subtle)] px-2.5 py-1.5 text-left shadow-[inset_3px_0_0_var(--ink-primary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]/65"
+                          >
+                            <div className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-primary)]">
+                              <BookOpenIcon size={11.5} />
+                            </div>
+                            <div className="flex min-w-0 flex-1 flex-col">
+                              <div className="flex items-center gap-1.5">
+                                <span className="shrink-0 font-mono text-[9.5px] font-medium text-[var(--ink-muted)]">
+                                  {att.badge ?? "Notebook"}
                                 </span>
                                 <span className="truncate text-[11.5px] font-medium text-[var(--ink-strong)]">
                                   {att.name}

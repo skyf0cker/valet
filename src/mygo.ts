@@ -187,6 +187,7 @@ export interface ChatStreamStep {
 
 export interface ChatThread {
   id: string;
+  projectId?: string;
   title: string;
   model: string;
   timelineActionCount: number;
@@ -194,6 +195,9 @@ export interface ChatThread {
   updatedAt: string;
   archived?: boolean;
   archivedAt?: string;
+  originBlockId?: string;
+  originSection?: string;
+  notebookContextInjected?: boolean;
   messages: ChatMessage[];
 }
 
@@ -212,6 +216,29 @@ export interface CreateAlwaysOnTimerParams {
   at_iso?: string;
   every_seconds?: number;
   start_at_iso?: string;
+}
+
+export interface CreateProjectChatParams {
+  projectId: string;
+  title?: string;
+  model?: string;
+  originBlockId?: string;
+  originSection?: string;
+  notebookContextInjected?: boolean;
+  switchToSession?: boolean;
+}
+
+export interface CreateProjectChatResult {
+  snapshot: ValetSnapshot;
+  thread: ChatThread;
+}
+
+export interface CreateProjectParams {
+  title: string;
+  description?: string;
+  icon?: string;
+  tags?: string[];
+  workingDir?: string;
 }
 
 export interface HeartbeatRunLog {
@@ -265,7 +292,9 @@ export interface InstallCustomPluginParams {
   name: string;
   tagline: string;
   yaml: string;
+  executionMode?: string;
   skillMarkdown?: string;
+  workflowYaml?: string;
 }
 
 export interface LogLine {
@@ -321,6 +350,16 @@ export interface MonitoringThresholds {
   ignoredProcesses: string[];
   logSensitivity: string;
   eventThrottle10m: boolean;
+}
+
+export interface NotebookBlock {
+  id: string;
+  type: string;
+  content: string;
+  checked?: boolean;
+  language?: string;
+  sessionId?: string;
+  summary?: string;
 }
 
 export interface PendingPermissionRequest {
@@ -436,7 +475,9 @@ export interface PluginState {
   configSchema?: PluginConfigField[];
   config: PluginConfig;
   manifestYaml: string;
+  executionMode?: string;
   skillMarkdown?: string;
+  workflowYaml?: string;
   localDir?: string;
   bundledFiles?: string[];
 }
@@ -459,12 +500,33 @@ export interface ProcessTablePayload {
   autoRuleAdded?: boolean;
 }
 
+export interface Project {
+  id: string;
+  title: string;
+  description?: string;
+  icon?: string;
+  tags: string[];
+  workingDir?: string;
+  isDefault?: boolean;
+  archived?: boolean;
+  updatedAt: string;
+  createdAt: string;
+  blocks: NotebookBlock[];
+}
+
 export interface ProviderVerifyResult {
   ok: boolean;
   latencyMs: number;
   modelCount: number;
   models?: string[];
   message: string;
+}
+
+export interface ResumeWorkflowHookParams {
+  token: string;
+  approved: boolean;
+  comment?: string;
+  decidedBy?: string;
 }
 
 export interface SafetyConfirmationChecklist {
@@ -521,6 +583,16 @@ export interface SendChatResult {
 export interface SimulateEventResult {
   event: TimelineEvent;
   inboxItem?: InboxApprovalItem;
+  workflowRunId?: string;
+}
+
+export interface StartWorkflowParams {
+  pluginId: string;
+  event?: string;
+  source?: string;
+  summary?: string;
+  payload?: Record<string, unknown>;
+  waitForCompletionMs?: number;
 }
 
 export interface StateChangeNotice {
@@ -591,6 +663,7 @@ export interface TimelineEvent {
   restored?: boolean;
   ignored?: boolean;
   trashBatchId?: string;
+  workflowRunId?: string;
 }
 
 export interface TimelineProgress {
@@ -609,6 +682,17 @@ export interface TraceStep {
   status: string;
 }
 
+export interface UpdateProjectParams {
+  projectId: string;
+  title?: string;
+  description?: string;
+  icon?: string;
+  tags?: string[];
+  workingDir?: string;
+  blocks?: NotebookBlock[];
+  archived?: boolean;
+}
+
 export interface UpsertLocalPluginParams {
   id: string;
   slug?: string;
@@ -616,7 +700,9 @@ export interface UpsertLocalPluginParams {
   tagline?: string;
   description?: string;
   manifestYaml: string;
+  executionMode?: string;
   skillMarkdown?: string;
+  workflowYaml?: string;
   files?: Record<string, string>;
   localDir?: string;
   enabled?: boolean;
@@ -671,6 +757,8 @@ export interface ValetSnapshot {
   isOnDuty: boolean;
   isPaused: boolean;
   activePluginDetailId: string | null;
+  activeProjectId: string;
+  activeProjectTab?: string;
   activeChatId: string;
   selectedTimelineEventId: string | null;
   selectedInboxItemId: string | null;
@@ -682,6 +770,7 @@ export interface ValetSnapshot {
   inboxProcessedHistoryCount: number;
   timelineEvents: TimelineEvent[];
   earlierCountLabel: string;
+  projects: Project[];
   chatThreads: ChatThread[];
   automations: AutomationRule[];
   mcpServers: McpServerItem[];
@@ -691,6 +780,96 @@ export interface ValetSnapshot {
   systemMetrics: SystemMetrics;
   scan: ScanState;
   storageStats?: StorageStats;
+}
+
+export interface WorkflowEdgeRunState {
+  edgeId: string;
+  from: string;
+  to: string;
+  status: string;
+}
+
+export interface WorkflowGraphDefinition {
+  version: number;
+  name?: string;
+  description?: string;
+  nodes: WorkflowGraphNode[];
+  edges: WorkflowGraphEdge[];
+}
+
+export interface WorkflowGraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  when?: string;
+  label?: string;
+}
+
+export interface WorkflowGraphNode {
+  id: string;
+  type: string;
+  name?: string;
+  description?: string;
+  config?: Record<string, unknown>;
+}
+
+export interface WorkflowGraphResponse {
+  pluginId: string;
+  executionMode: string;
+  workflowYaml: string;
+  valid: boolean;
+  errors: string[];
+  definition?: WorkflowGraphDefinition;
+  topologicalOrder: string[];
+  entryNodeIds: string[];
+}
+
+export interface WorkflowNodeRunState {
+  nodeId: string;
+  nodeType: string;
+  nodeName: string;
+  status: string;
+  attempt?: number;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  input?: unknown;
+  output?: unknown;
+  error?: string;
+  hookToken?: string;
+  inboxId?: string;
+}
+
+export interface WorkflowRunDetail {
+  summary: WorkflowRunSummary;
+  definition: WorkflowGraphDefinition;
+  triggerInput?: unknown;
+  nodes: WorkflowNodeRunState[];
+  edges: WorkflowEdgeRunState[];
+}
+
+export interface WorkflowRunSummary {
+  runId: string;
+  pluginId: string;
+  pluginName: string;
+  triggerEvent: string;
+  triggerSource: string;
+  status: string;
+  timelineEventId?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  errorMessage?: string;
+  durationMs?: number;
+}
+
+export interface WorkflowUpdatedPayload {
+  pluginId: string;
+  runId: string;
+  status: string;
+  error?: string;
+  timelineEventId?: string;
+  completedNodeCount?: number;
 }
 
 // ---- Services ----
@@ -742,6 +921,10 @@ export const Valet = {
   cancelAlwaysOnTimer(timerID: string): Promise<AlwaysOnTimer | null> {
     return call("Valet.CancelAlwaysOnTimer", timerID);
   },
+  /** CancelWorkflowRun cancels an in-progress local Vercel Workflow execution run. */
+  cancelWorkflowRun(runID: string): Promise<WorkflowRunDetail> {
+    return call("Valet.CancelWorkflowRun", runID);
+  },
   /**
    * CaptureCurrentScreen verifies Screen Recording access, captures a bounded screenshot on macOS,
    * and syncs the updated permission state.
@@ -769,9 +952,17 @@ export const Valet = {
   createAlwaysOnTimer(params: CreateAlwaysOnTimerParams): Promise<AlwaysOnTimer> {
     return call("Valet.CreateAlwaysOnTimer", params);
   },
-  /** CreateChatThread creates and activates a new conversation thread. */
+  /** CreateChatThread creates and activates a new conversation thread inside the active project (or default project). */
   createChatThread(): Promise<ValetSnapshot> {
     return call("Valet.CreateChatThread");
+  },
+  /** CreateProject creates a new Project container with a starter Notebook and activates it. */
+  createProject(params: CreateProjectParams): Promise<ValetSnapshot> {
+    return call("Valet.CreateProject", params);
+  },
+  /** CreateProjectChatThread creates a session inside a target Project (e.g. triggered via @valet in a Notebook). */
+  createProjectChatThread(params: CreateProjectChatParams): Promise<CreateProjectChatResult> {
+    return call("Valet.CreateProjectChatThread", params);
   },
   /** DeleteAutomationRule removes an automation rule and reloads the Engine scheduler. */
   deleteAutomationRule(id: string): Promise<ValetSnapshot> {
@@ -784,6 +975,10 @@ export const Valet = {
   /** DeleteMemory deletes a single memory item and updates Sidecar. */
   deleteMemory(id: string): Promise<ValetSnapshot> {
     return call("Valet.DeleteMemory", id);
+  },
+  /** DeleteProject removes a custom project and reassigns its sessions back to the default project. */
+  deleteProject(projectID: string): Promise<ValetSnapshot> {
+    return call("Valet.DeleteProject", projectID);
   },
   /** DismissInboxItem rejects an Inbox item without touching files or processes. */
   dismissInboxItem(itemID: string): Promise<ValetSnapshot> {
@@ -801,9 +996,17 @@ export const Valet = {
   getAlwaysOnSnapshot(): Promise<AlwaysOnSnapshot> {
     return call("Valet.GetAlwaysOnSnapshot");
   },
+  /** GetPluginWorkflowGraph validates and returns the parsed DAG graph structure for a plugin. */
+  getPluginWorkflowGraph(pluginID: string): Promise<WorkflowGraphResponse> {
+    return call("Valet.GetPluginWorkflowGraph", pluginID);
+  },
   /** GetSnapshot returns the current persistent application state plus live storage stats. */
   getSnapshot(): Promise<ValetSnapshot> {
     return call("Valet.GetSnapshot");
+  },
+  /** GetWorkflowRunDetail returns hydrated run status, node states, edge states, and node inputs/outputs. */
+  getWorkflowRunDetail(runID: string): Promise<WorkflowRunDetail> {
+    return call("Valet.GetWorkflowRunDetail", runID);
   },
   /** IgnoreTimelineEvent dismisses a pending Timeline confirmation event. */
   ignoreTimelineEvent(eventID: string): Promise<ValetSnapshot> {
@@ -828,6 +1031,10 @@ export const Valet = {
   installPluginDraft(chatID: string, messageID: string, draft: PluginDraftSpec): Promise<ValetSnapshot> {
     return call("Valet.InstallPluginDraft", chatID, messageID, draft);
   },
+  /** ListPluginWorkflowRuns lists recent local Vercel Workflow execution runs for a plugin. */
+  listPluginWorkflowRuns(pluginID: string, limit: number): Promise<WorkflowRunSummary[]> {
+    return call("Valet.ListPluginWorkflowRuns", pluginID, limit);
+  },
   /** MarkAllOutboxRead marks all unread Always-On Outbox notifications as read. */
   markAllOutboxRead(): Promise<number> {
     return call("Valet.MarkAllOutboxRead");
@@ -835,6 +1042,10 @@ export const Valet = {
   /** MarkOutboxMessageRead marks a single Always-On Outbox notification as read. */
   markOutboxMessageRead(msgID: string): Promise<AlwaysOnOutboxMessage | null> {
     return call("Valet.MarkOutboxMessageRead", msgID);
+  },
+  /** MoveChatThreadToProject moves an existing session into another Project container. */
+  moveChatThreadToProject(chatID: string, targetProjectID: string): Promise<ValetSnapshot> {
+    return call("Valet.MoveChatThreadToProject", chatID, targetProjectID);
   },
   /** OpenSystemSettings opens macOS System Settings for the requested permission ID. */
   openSystemSettings(permissionID: string): Promise<boolean> {
@@ -891,6 +1102,10 @@ export const Valet = {
   restoreTimelineEvent(eventID: string): Promise<ValetSnapshot> {
     return call("Valet.RestoreTimelineEvent", eventID);
   },
+  /** ResumeWorkflowHook delivers an approval/rejection decision to a suspended Vercel Workflow createHook() token. */
+  resumeWorkflowHook(params: ResumeWorkflowHookParams): Promise<WorkflowRunDetail> {
+    return call("Valet.ResumeWorkflowHook", params);
+  },
   /** RetryAlwaysOnInboxItem resets a dead or delayed Always-On Inbox event back to queued for immediate execution. */
   retryAlwaysOnInboxItem(itemID: string): Promise<AlwaysOnInboxItem | null> {
     return call("Valet.RetryAlwaysOnInboxItem", itemID);
@@ -926,6 +1141,10 @@ export const Valet = {
   /** SimulatePluginEvent injects an event through Valet's event throttle + Pi Durable agent pipeline. */
   simulatePluginEvent(pluginID: string, eventCode: string): Promise<SimulateEventResult> {
     return call("Valet.SimulatePluginEvent", pluginID, eventCode);
+  },
+  /** SyncSessionSummaryToNotebook writes or updates the session's latest assistant summary in its parent Project's Notebook. */
+  syncSessionSummaryToNotebook(chatID: string): Promise<ValetSnapshot> {
+    return call("Valet.SyncSessionSummaryToNotebook", chatID);
   },
   /** TestAutoReview validates Auto Review decision model connectivity (Jev System One or small model fallback). */
   testAutoReview(cfg: AutoReviewConfig): Promise<TestMessageResult> {
@@ -963,6 +1182,10 @@ export const Valet = {
   triggerPluginEvent(pluginID: string, eventCode: string, payloadJSON: string): Promise<SimulateEventResult> {
     return call("Valet.TriggerPluginEvent", pluginID, eventCode, payloadJSON);
   },
+  /** TriggerPluginWorkflow manually starts a plugin's workflow.yaml via the local Vercel Workflow runtime. */
+  triggerPluginWorkflow(params: StartWorkflowParams): Promise<WorkflowRunDetail> {
+    return call("Valet.TriggerPluginWorkflow", params);
+  },
   /**
    * UninstallPlugin uninstalls any installed plugin (removing local plugins completely, or
    * resetting catalog plugins back to Installed=false) and deletes its materialized disk bundle.
@@ -986,6 +1209,10 @@ export const Valet = {
   updatePluginEventPolicy(pluginID: string, eventID: string, policy: string): Promise<ValetSnapshot> {
     return call("Valet.UpdatePluginEventPolicy", pluginID, eventID, policy);
   },
+  /** UpdatePluginExecutionMode switches a plugin between mutually exclusive "skill" and "workflow" execution modes. */
+  updatePluginExecutionMode(pluginID: string, mode: string): Promise<ValetSnapshot> {
+    return call("Valet.UpdatePluginExecutionMode", pluginID, mode);
+  },
   /** UpdatePluginManifest parses updated YAML for an existing plugin, preserves matching event policies, and hot-reloads. */
   updatePluginManifest(pluginID: string, manifestYAML: string): Promise<ValetSnapshot> {
     return call("Valet.UpdatePluginManifest", pluginID, manifestYAML);
@@ -994,9 +1221,17 @@ export const Valet = {
   updatePluginSkill(pluginID: string, skillMarkdown: string): Promise<ValetSnapshot> {
     return call("Valet.UpdatePluginSkill", pluginID, skillMarkdown);
   },
+  /** UpdatePluginWorkflow validates and updates a plugin's workflow.yaml definition and persists it on disk. */
+  updatePluginWorkflow(pluginID: string, workflowYAML: string): Promise<ValetSnapshot> {
+    return call("Valet.UpdatePluginWorkflow", pluginID, workflowYAML);
+  },
   /** UpdatePreferences applies a full preferences update, syncs native Tray/Login hooks, and reloads Engine & Sidecar. */
   updatePreferences(prefs: ValetPreferences): Promise<ValetSnapshot> {
     return call("Valet.UpdatePreferences", prefs);
+  },
+  /** UpdateProject persists metadata or Notebook block edits on an existing Project. */
+  updateProject(params: UpdateProjectParams): Promise<ValetSnapshot> {
+    return call("Valet.UpdateProject", params);
   },
   /** UpdateProvider updates API keys (stored in OS Keychain when available), base URLs, and connection status for a provider. */
   updateProvider(providerID: string, patch: AgentProviderConfig): Promise<ValetSnapshot> {
@@ -1022,4 +1257,6 @@ export const events = {
   metricsUpdated: event<SystemMetrics>("metrics:updated"),
   /** StateChangedEvent notifies the UI when background agent/plugin work updates stored state. */
   stateChanged: event<StateChangeNotice>("state:changed"),
+  /** WorkflowUpdatedEvent notifies the UI when a local Vercel Workflow run changes status or node state. */
+  workflowUpdated: event<WorkflowUpdatedPayload>("workflow:updated"),
 } as const;

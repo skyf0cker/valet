@@ -13,7 +13,9 @@ import type {
   HostBridge,
   ProbeMcpRequest,
   ResolvePermissionRequest,
+  ResumeWorkflowHookRequest,
   SendChatRequest,
+  StartWorkflowRequest,
   TestAutoReviewRequest,
   TestProviderRequest,
   ValetSyncState,
@@ -202,6 +204,27 @@ class StdioJsonRpcServer implements HostBridge {
         return this.runtime.alwaysOnMarkAllOutboxRead();
       case "alwaysOn.tick":
         return this.runtime.alwaysOnTick(Boolean(params.waitForRun));
+      case "workflow.validate":
+        return this.runtime.workflowValidate(String(params.yaml ?? ""));
+      case "workflow.getGraph":
+        return this.runtime.workflowGetGraph(String(params.pluginId ?? ""));
+      case "workflow.start":
+        return this.runtime.workflowStart(
+          params as unknown as StartWorkflowRequest,
+        );
+      case "workflow.listRuns":
+        return this.runtime.workflowListRuns(
+          String(params.pluginId ?? ""),
+          typeof params.limit === "number" ? params.limit : undefined,
+        );
+      case "workflow.getRun":
+        return this.runtime.workflowGetRun(String(params.runId ?? ""));
+      case "workflow.cancelRun":
+        return this.runtime.workflowCancelRun(String(params.runId ?? ""));
+      case "workflow.resumeHook":
+        return this.runtime.workflowResumeHook(
+          params as unknown as ResumeWorkflowHookRequest,
+        );
       case "agent.shutdown":
         await this.runtime.close();
         setTimeout(() => process.exit(0), 15);

@@ -9,12 +9,14 @@
     "dev:web": "vite",
     "build:web": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit && tsc --noEmit -p sidecar/tsconfig.json",
-    "build:sidecar": "bun -e 'import { chmodSync, copyFileSync, mkdirSync, rmSync } from \"node:fs\"; mkdirSync(\"resources/darwin-arm64/bin\", { recursive: true }); rmSync(\"resources/darwin-arm64/bin/valet-bun\", { force: true }); rmSync(\"resources/darwin-arm64/bin/valet-agent.js\", { force: true }); copyFileSync(process.execPath, \"resources/darwin-arm64/bin/valet-bun\"); chmodSync(\"resources/darwin-arm64/bin/valet-bun\", 0o755);' && bun build sidecar/src/main.ts --target=bun --outfile resources/darwin-arm64/bin/valet-agent.js",
+    "build:workflow": "bun scripts/build-workflow-runtime.ts",
+    "build:sidecar": "bun run build:workflow && bun -e 'import { chmodSync, copyFileSync, mkdirSync, rmSync } from \"node:fs\"; mkdirSync(\"resources/darwin-arm64/bin/workflow-runtime\", { recursive: true }); rmSync(\"resources/darwin-arm64/bin/valet-bun\", { force: true }); rmSync(\"resources/darwin-arm64/bin/valet-agent.js\", { force: true }); copyFileSync(process.execPath, \"resources/darwin-arm64/bin/valet-bun\"); chmodSync(\"resources/darwin-arm64/bin/valet-bun\", 0o755); for (const f of [\"flow.mjs\", \"manifest.json\", \"package.json\"]) { copyFileSync(\"sidecar/src/workflow/generated/\" + f, \"resources/darwin-arm64/bin/workflow-runtime/\" + f); }' && bun build sidecar/src/main.ts --target=bun --outfile resources/darwin-arm64/bin/valet-agent.js",
     "build:cli": "mkdir -p resources/darwin-arm64/bin && CGO_ENABLED=0 go build -o resources/darwin-arm64/bin/valet ./cmd/valet",
     "cli": "CGO_ENABLED=0 go run ./cmd/valet",
     "test:sidecar": "bun test sidecar/src/__tests__"
   },
   "dependencies": {
+    "@dagrejs/dagre": "^3.1.3",
     "@earendil-works/chord": "1.5.2",
     "@earendil-works/pi-ai": "1.5.2",
     "@earendil-works/pi-durable": "1.5.2",
@@ -22,9 +24,12 @@
     "@fontsource-variable/geist": "^5.3.0",
     "@fontsource-variable/geist-mono": "^5.3.0",
     "@fontsource/instrument-serif": "^5.3.0",
+    "@workflow/world-local": "5.2.1",
+    "@xyflow/react": "^13.0.2",
     "mygo-runtime": "^0.9.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
+    "workflow": "5.4.0",
     "yaml": "^2.9.1"
   },
   "devDependencies": {
@@ -33,6 +38,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
+    "@workflow/builders": "5.0.8",
     "mygo-cli": "^0.9.1",
     "tailwindcss": "^4.3.5",
     "typescript": "^7",

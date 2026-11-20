@@ -16,6 +16,7 @@ export type CanonicalAutonomyLevel = "always_ask" | "auto_review" | "full_access
 export type EventPolicyMode = "auto" | "ask" | "record";
 export type ActionSafety = "readonly" | "reversible" | "confirm_always";
 export type InboxCategory = "files" | "process" | "outbound";
+export type PluginExecutionMode = "skill" | "workflow";
 
 export interface SafetyConfirmationChecklist {
   deleteOrOverwrite: boolean;
@@ -164,7 +165,9 @@ export interface PluginState {
   configSchema?: PluginConfigField[];
   config: PluginConfig;
   manifestYaml: string;
+  executionMode?: PluginExecutionMode;
   skillMarkdown?: string;
+  workflowYaml?: string;
   localDir?: string;
   bundledFiles?: string[];
 }
@@ -178,7 +181,7 @@ export interface MemoryEntry {
 
 export interface ChatAttachment {
   id: string;
-  kind: "image" | "file" | "screen" | "timeline_event" | "inbox_item";
+  kind: "image" | "file" | "screen" | "timeline_event" | "inbox_item" | "notebook_context";
   refId?: string;
   name: string;
   meta?: string;
@@ -341,6 +344,7 @@ export interface RecordTimelineParams {
   reclaimedGB?: number;
   intercepted?: boolean;
   canRestore?: boolean;
+  workflowRunId?: string;
   payload: Record<string, string | number | boolean>;
   actionItems?: QueueApprovalParams["actionItems"];
 }
@@ -409,6 +413,138 @@ export interface DispatchPluginEventRequest {
   eventCode: string;
   payload?: Record<string, unknown>;
   simulated?: boolean;
+}
+
+export type WorkflowRunStatus =
+  | "pending"
+  | "running"
+  | "waiting_approval"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type WorkflowNodeStatus =
+  | "pending"
+  | "running"
+  | "waiting_approval"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "cancelled";
+
+export interface WorkflowGraphNodeDto {
+  id: string;
+  type:
+    | "trigger"
+    | "script"
+    | "http"
+    | "tool"
+    | "agent"
+    | "condition"
+    | "transform"
+    | "sleep"
+    | "approval"
+    | "notify";
+  name?: string;
+  description?: string;
+  config?: Record<string, unknown>;
+}
+
+export interface WorkflowGraphEdgeDto {
+  id: string;
+  from: string;
+  to: string;
+  when?: string;
+  label?: string;
+}
+
+export interface WorkflowGraphDefinitionDto {
+  version: number;
+  name?: string;
+  description?: string;
+  nodes: WorkflowGraphNodeDto[];
+  edges: WorkflowGraphEdgeDto[];
+}
+
+export interface WorkflowValidationResponse {
+  valid: boolean;
+  errors: string[];
+  definition?: WorkflowGraphDefinitionDto;
+  topologicalOrder: string[];
+  entryNodeIds: string[];
+}
+
+export interface WorkflowGraphResponse {
+  pluginId: string;
+  executionMode: PluginExecutionMode;
+  workflowYaml: string;
+  valid: boolean;
+  errors: string[];
+  definition?: WorkflowGraphDefinitionDto;
+  topologicalOrder: string[];
+  entryNodeIds: string[];
+}
+
+export interface WorkflowRunSummary {
+  runId: string;
+  pluginId: string;
+  pluginName: string;
+  triggerEvent: string;
+  triggerSource: string;
+  status: WorkflowRunStatus;
+  timelineEventId?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  errorMessage?: string;
+  durationMs?: number;
+}
+
+export interface WorkflowNodeRunState {
+  nodeId: string;
+  nodeType: string;
+  nodeName: string;
+  status: WorkflowNodeStatus;
+  attempt?: number;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  input?: unknown;
+  output?: unknown;
+  error?: string;
+  hookToken?: string;
+  inboxId?: string;
+}
+
+export interface WorkflowEdgeRunState {
+  edgeId: string;
+  from: string;
+  to: string;
+  status: "pending" | "taken" | "skipped";
+}
+
+export interface WorkflowRunDetail {
+  summary: WorkflowRunSummary;
+  definition: WorkflowGraphDefinitionDto;
+  triggerInput?: unknown;
+  nodes: WorkflowNodeRunState[];
+  edges: WorkflowEdgeRunState[];
+}
+
+export interface StartWorkflowRequest {
+  pluginId: string;
+  event?: string;
+  source?: string;
+  summary?: string;
+  payload?: Record<string, unknown>;
+  waitForCompletionMs?: number;
+}
+
+export interface ResumeWorkflowHookRequest {
+  token: string;
+  approved: boolean;
+  comment?: string;
+  decidedBy?: string;
 }
 
 export interface ExecuteApprovedToolRequest {

@@ -6,9 +6,13 @@ type AppView string
 const (
 	ViewInbox    AppView = "inbox"
 	ViewTimeline AppView = "timeline"
+	ViewProjects AppView = "projects"
 	ViewChat     AppView = "chat"
 	ViewPlugins  AppView = "plugins"
 	ViewSettings AppView = "settings"
+
+	// DefaultProjectID identifies the pinned system project that manages unassigned/existing sessions.
+	DefaultProjectID = "proj-default"
 )
 
 // MonitoringThresholds configures disk, CPU/memory, and log thresholds.
@@ -136,7 +140,9 @@ type PluginState struct {
 	ConfigSchema            []PluginConfigField      `json:"configSchema,omitempty"`
 	Config                  PluginConfig             `json:"config"`
 	ManifestYAML            string                   `json:"manifestYaml"`
+	ExecutionMode           string                   `json:"executionMode,omitempty"` // "skill" | "workflow"
 	SkillMarkdown           string                   `json:"skillMarkdown,omitempty"`
+	WorkflowYAML            string                   `json:"workflowYaml,omitempty"`
 	LocalDir                string                   `json:"localDir,omitempty"`
 	BundledFiles            []string                 `json:"bundledFiles,omitempty"`
 }
@@ -244,6 +250,7 @@ type TimelineEvent struct {
 	Restored            bool                 `json:"restored,omitempty"`
 	Ignored             bool                 `json:"ignored,omitempty"`
 	TrashBatchID        string               `json:"trashBatchId,omitempty"`
+	WorkflowRunID       string               `json:"workflowRunId,omitempty"`
 }
 
 // ProcessSampleRow holds a single sampled system process row inside a chat card.
@@ -315,15 +322,83 @@ type ChatMessage struct {
 
 // ChatThread represents one persistent agent conversation.
 type ChatThread struct {
-	ID                  string        `json:"id"`
-	Title               string        `json:"title"`
-	Model               string        `json:"model"`
-	TimelineActionCount int           `json:"timelineActionCount"`
-	LinkedEventIDs      []string      `json:"linkedEventIds"`
-	UpdatedAt           string        `json:"updatedAt"`
-	Archived            bool          `json:"archived,omitempty"`
-	ArchivedAt          string        `json:"archivedAt,omitempty"`
-	Messages            []ChatMessage `json:"messages"`
+	ID                      string        `json:"id"`
+	ProjectID               string        `json:"projectId,omitempty"`
+	Title                   string        `json:"title"`
+	Model                   string        `json:"model"`
+	TimelineActionCount     int           `json:"timelineActionCount"`
+	LinkedEventIDs          []string      `json:"linkedEventIds"`
+	UpdatedAt               string        `json:"updatedAt"`
+	Archived                bool          `json:"archived,omitempty"`
+	ArchivedAt              string        `json:"archivedAt,omitempty"`
+	OriginBlockID           string        `json:"originBlockId,omitempty"`
+	OriginSection           string        `json:"originSection,omitempty"`
+	NotebookContextInjected bool          `json:"notebookContextInjected,omitempty"`
+	Messages                []ChatMessage `json:"messages"`
+}
+
+// NotebookBlock stores one Notion-style Markdown or embedded session reference block in a project Notebook.
+type NotebookBlock struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"` // "paragraph" | "h1" | "h2" | "h3" | "bullet" | "numbered" | "todo" | "callout" | "quote" | "code" | "divider" | "session_ref"
+	Content   string `json:"content"`
+	Checked   bool   `json:"checked,omitempty"`
+	Language  string `json:"language,omitempty"`
+	SessionID string `json:"sessionId,omitempty"`
+	Summary   string `json:"summary,omitempty"`
+}
+
+// Project represents an upper-level container managing sessions alongside a Markdown Notebook.
+type Project struct {
+	ID          string          `json:"id"`
+	Title       string          `json:"title"`
+	Description string          `json:"description,omitempty"`
+	Icon        string          `json:"icon,omitempty"`
+	Tags        []string        `json:"tags"`
+	WorkingDir  string          `json:"workingDir,omitempty"`
+	IsDefault   bool            `json:"isDefault,omitempty"`
+	Archived    bool            `json:"archived,omitempty"`
+	UpdatedAt   string          `json:"updatedAt"`
+	CreatedAt   string          `json:"createdAt"`
+	Blocks      []NotebookBlock `json:"blocks"`
+}
+
+// CreateProjectParams defines parameters for creating a new Project container.
+type CreateProjectParams struct {
+	Title       string   `json:"title"`
+	Description string   `json:"description,omitempty"`
+	Icon        string   `json:"icon,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+	WorkingDir  string   `json:"workingDir,omitempty"`
+}
+
+// UpdateProjectParams updates one or more fields of an existing Project.
+type UpdateProjectParams struct {
+	ProjectID   string           `json:"projectId"`
+	Title       *string          `json:"title,omitempty"`
+	Description *string          `json:"description,omitempty"`
+	Icon        *string          `json:"icon,omitempty"`
+	Tags        *[]string        `json:"tags,omitempty"`
+	WorkingDir  *string          `json:"workingDir,omitempty"`
+	Blocks      *[]NotebookBlock `json:"blocks,omitempty"`
+	Archived    *bool            `json:"archived,omitempty"`
+}
+
+// CreateProjectChatParams creates a new session inside a target Project (optionally spawned from @valet in Notebook).
+type CreateProjectChatParams struct {
+	ProjectID               string `json:"projectId"`
+	Title                   string `json:"title,omitempty"`
+	Model                   string `json:"model,omitempty"`
+	OriginBlockID           string `json:"originBlockId,omitempty"`
+	OriginSection           string `json:"originSection,omitempty"`
+	NotebookContextInjected bool   `json:"notebookContextInjected,omitempty"`
+	SwitchToSession         bool   `json:"switchToSession,omitempty"`
+}
+
+// CreateProjectChatResult returns both the updated snapshot and the newly created ChatThread.
+type CreateProjectChatResult struct {
+	Snapshot ValetSnapshot `json:"snapshot"`
+	Thread   ChatThread    `json:"thread"`
 }
 
 // AgentProviderConfig stores LLM provider connection metadata.
@@ -527,6 +602,8 @@ type ValetSnapshot struct {
 	IsOnDuty                   bool                  `json:"isOnDuty"`
 	IsPaused                   bool                  `json:"isPaused"`
 	ActivePluginDetailID       *string               `json:"activePluginDetailId"`
+	ActiveProjectID            string                `json:"activeProjectId"`
+	ActiveProjectTab           string                `json:"activeProjectTab,omitempty"` // "notebook" | "sessions" | "session"
 	ActiveChatID               string                `json:"activeChatId"`
 	SelectedTimelineEventID    *string               `json:"selectedTimelineEventId"`
 	SelectedInboxItemID        *string               `json:"selectedInboxItemId"`
@@ -538,6 +615,7 @@ type ValetSnapshot struct {
 	InboxProcessedHistoryCount int                   `json:"inboxProcessedHistoryCount"`
 	TimelineEvents             []TimelineEvent       `json:"timelineEvents"`
 	EarlierCountLabel          string                `json:"earlierCountLabel"`
+	Projects                   []Project             `json:"projects"`
 	ChatThreads                []ChatThread          `json:"chatThreads"`
 	Automations                []AutomationRule      `json:"automations"`
 	McpServers                 []McpServerItem       `json:"mcpServers"`
@@ -589,8 +667,9 @@ type SendChatResult struct {
 
 // SimulateEventResult returns the Timeline and optional Inbox card created for a simulated event.
 type SimulateEventResult struct {
-	Event     TimelineEvent      `json:"event"`
-	InboxItem *InboxApprovalItem `json:"inboxItem,omitempty"`
+	Event         TimelineEvent      `json:"event"`
+	InboxItem     *InboxApprovalItem `json:"inboxItem,omitempty"`
+	WorkflowRunID string             `json:"workflowRunId,omitempty"`
 }
 
 // InstallCustomPluginParams defines a user-submitted custom plugin manifest.
@@ -598,7 +677,9 @@ type InstallCustomPluginParams struct {
 	Name          string `json:"name"`
 	Tagline       string `json:"tagline"`
 	YAML          string `json:"yaml"`
+	ExecutionMode string `json:"executionMode,omitempty"`
 	SkillMarkdown string `json:"skillMarkdown,omitempty"`
+	WorkflowYAML  string `json:"workflowYaml,omitempty"`
 }
 
 // ChatStreamStep tracks one live tool call during a turn.
@@ -650,7 +731,9 @@ type UpsertLocalPluginParams struct {
 	Tagline       string            `json:"tagline,omitempty"`
 	Description   string            `json:"description,omitempty"`
 	ManifestYAML  string            `json:"manifestYaml"`
+	ExecutionMode string            `json:"executionMode,omitempty"`
 	SkillMarkdown string            `json:"skillMarkdown,omitempty"`
+	WorkflowYAML  string            `json:"workflowYaml,omitempty"`
 	Files         map[string]string `json:"files,omitempty"`
 	LocalDir      string            `json:"localDir,omitempty"`
 	Enabled       *bool             `json:"enabled,omitempty"`
@@ -778,4 +861,130 @@ type CreateAlwaysOnTimerParams struct {
 	AtISO        string   `json:"at_iso,omitempty"`
 	EverySeconds *float64 `json:"every_seconds,omitempty"`
 	StartAtISO   string   `json:"start_at_iso,omitempty"`
+}
+
+// WorkflowGraphNode represents one declarative node in a plugin's workflow DAG.
+type WorkflowGraphNode struct {
+	ID          string         `json:"id"`
+	Type        string         `json:"type"`
+	Name        string         `json:"name,omitempty"`
+	Description string         `json:"description,omitempty"`
+	Config      map[string]any `json:"config,omitempty"`
+}
+
+// WorkflowGraphEdge represents one directed dependency/branch edge in a plugin's workflow DAG.
+type WorkflowGraphEdge struct {
+	ID    string `json:"id"`
+	From  string `json:"from"`
+	To    string `json:"to"`
+	When  string `json:"when,omitempty"`
+	Label string `json:"label,omitempty"`
+}
+
+// WorkflowGraphDefinition captures the validated workflow DAG definition.
+type WorkflowGraphDefinition struct {
+	Version     int                 `json:"version"`
+	Name        string              `json:"name,omitempty"`
+	Description string              `json:"description,omitempty"`
+	Nodes       []WorkflowGraphNode `json:"nodes"`
+	Edges       []WorkflowGraphEdge `json:"edges"`
+}
+
+// WorkflowValidationResult reports workflow.yaml syntax and DAG validation status.
+type WorkflowValidationResult struct {
+	Valid            bool                     `json:"valid"`
+	Errors           []string                 `json:"errors"`
+	Definition       *WorkflowGraphDefinition `json:"definition,omitempty"`
+	TopologicalOrder []string                 `json:"topologicalOrder"`
+	EntryNodeIds     []string                 `json:"entryNodeIds"`
+}
+
+// WorkflowGraphResponse returns a plugin's parsed workflow DAG and active execution mode.
+type WorkflowGraphResponse struct {
+	PluginID         string                   `json:"pluginId"`
+	ExecutionMode    string                   `json:"executionMode"`
+	WorkflowYAML     string                   `json:"workflowYaml"`
+	Valid            bool                     `json:"valid"`
+	Errors           []string                 `json:"errors"`
+	Definition       *WorkflowGraphDefinition `json:"definition,omitempty"`
+	TopologicalOrder []string                 `json:"topologicalOrder"`
+	EntryNodeIds     []string                 `json:"entryNodeIds"`
+}
+
+// WorkflowRunSummary summarizes one durable local execution of a plugin workflow.
+type WorkflowRunSummary struct {
+	RunID           string `json:"runId"`
+	PluginID        string `json:"pluginId"`
+	PluginName      string `json:"pluginName"`
+	TriggerEvent    string `json:"triggerEvent"`
+	TriggerSource   string `json:"triggerSource"`
+	Status          string `json:"status"`
+	TimelineEventID string `json:"timelineEventId,omitempty"`
+	CreatedAt       string `json:"createdAt"`
+	UpdatedAt       string `json:"updatedAt"`
+	CompletedAt     string `json:"completedAt,omitempty"`
+	ErrorMessage    string `json:"errorMessage,omitempty"`
+	DurationMs      int64  `json:"durationMs,omitempty"`
+}
+
+// WorkflowNodeRunState holds live/completed status, timings, and hydrated I/O for a single workflow node.
+type WorkflowNodeRunState struct {
+	NodeID      string `json:"nodeId"`
+	NodeType    string `json:"nodeType"`
+	NodeName    string `json:"nodeName"`
+	Status      string `json:"status"`
+	Attempt     int    `json:"attempt,omitempty"`
+	StartedAt   string `json:"startedAt,omitempty"`
+	CompletedAt string `json:"completedAt,omitempty"`
+	DurationMs  int64  `json:"durationMs,omitempty"`
+	Input       any    `json:"input,omitempty"`
+	Output      any    `json:"output,omitempty"`
+	Error       string `json:"error,omitempty"`
+	HookToken   string `json:"hookToken,omitempty"`
+	InboxID     string `json:"inboxId,omitempty"`
+}
+
+// WorkflowEdgeRunState holds evaluated edge routing status within a workflow run.
+type WorkflowEdgeRunState struct {
+	EdgeID string `json:"edgeId"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Status string `json:"status"`
+}
+
+// WorkflowRunDetail aggregates full canvas state, node I/O, and edge outcomes for a workflow run.
+type WorkflowRunDetail struct {
+	Summary      WorkflowRunSummary      `json:"summary"`
+	Definition   WorkflowGraphDefinition `json:"definition"`
+	TriggerInput any                     `json:"triggerInput,omitempty"`
+	Nodes        []WorkflowNodeRunState  `json:"nodes"`
+	Edges        []WorkflowEdgeRunState  `json:"edges"`
+}
+
+// WorkflowUpdatedPayload notifies the UI when a background workflow run advances state.
+type WorkflowUpdatedPayload struct {
+	PluginID           string `json:"pluginId"`
+	RunID              string `json:"runId"`
+	Status             string `json:"status"`
+	Error              string `json:"error,omitempty"`
+	TimelineEventID    string `json:"timelineEventId,omitempty"`
+	CompletedNodeCount int    `json:"completedNodeCount,omitempty"`
+}
+
+// StartWorkflowParams configures a manual or host-driven workflow invocation.
+type StartWorkflowParams struct {
+	PluginID            string         `json:"pluginId"`
+	Event               string         `json:"event,omitempty"`
+	Source              string         `json:"source,omitempty"`
+	Summary             string         `json:"summary,omitempty"`
+	Payload             map[string]any `json:"payload,omitempty"`
+	WaitForCompletionMs int            `json:"waitForCompletionMs,omitempty"`
+}
+
+// ResumeWorkflowHookParams resumes a suspended workflow approval gate via its hook token.
+type ResumeWorkflowHookParams struct {
+	Token     string `json:"token"`
+	Approved  bool   `json:"approved"`
+	Comment   string `json:"comment,omitempty"`
+	DecidedBy string `json:"decidedBy,omitempty"`
 }

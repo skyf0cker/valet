@@ -1,6 +1,11 @@
 import React, { useEffect, useState } from "react";
 import { useValet } from "../../store/ValetContext";
-import type { EventPolicyMode, PluginConfigField, PluginState } from "../../types/valet";
+import type {
+  EventPolicyMode,
+  PluginConfigField,
+  PluginExecutionMode,
+  PluginState,
+} from "../../types/valet";
 import { SidebarToggleButton } from "../Sidebar";
 import { PluginBadgeIcon } from "../ui/Icons";
 import { MarkdownRenderer } from "../ui/MarkdownRenderer";
@@ -8,6 +13,7 @@ import { SegmentedControl } from "../ui/SegmentedControl";
 import { Slider } from "../ui/Slider";
 import { Switch } from "../ui/Switch";
 import { TagInputList } from "../ui/TagInputList";
+import { PluginWorkflowPanel } from "./workflow/PluginWorkflowPanel";
 
 const POLICY_OPTIONS: Array<{ value: EventPolicyMode; label: string; widthClass: string }> = [
   { value: "auto", label: "自动处理", widthClass: "w-[70px]" },
@@ -25,6 +31,7 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
     updatePluginConfig,
     updatePluginManifest,
     updatePluginSkill,
+    updatePluginExecutionMode,
     reloadPlugin,
     simulatePluginEvent,
     setActiveView,
@@ -300,54 +307,80 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
             })}
           </section>
 
-          {/* Skill Handling Logic (SKILL.md) */}
-          <section className="flex flex-col gap-2.5 border-t border-[var(--border-subtle)] pt-5">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex items-baseline gap-2.5">
+          {/* Mutually Exclusive Execution Logic: Skill (SKILL.md) OR Workflow (workflow.yaml) */}
+          <section className="flex flex-col gap-3 border-t border-[var(--border-subtle)] pt-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-baseline gap-2.5">
                 <h2 className="font-[family-name:var(--font-serif-zh)] text-[18px] font-semibold leading-[22px] text-[var(--ink-strong)]">
-                  Skill 处理逻辑（SKILL.md）
+                  {plugin.executionMode === "workflow"
+                    ? "Workflow 编排与执行（workflow.yaml）"
+                    : "Skill 处理逻辑（SKILL.md）"}
                 </h2>
                 <span className="text-[12px] text-[var(--ink-muted)]">
-                  定义事件触发或 @该插件 时，Agent 如何借助核心通用工具排查与处理
+                  {plugin.executionMode === "workflow"
+                    ? "与 SKILL.md 互斥二选一：事件触发后由本地 Vercel Workflow SDK 按 DAG 执行并可查看运行轨迹与节点输入输出"
+                    : "与 Workflow 互斥二选一：定义事件触发或 @该插件 时，Agent 如何借助核心通用工具排查与处理"}
                 </span>
               </div>
-              <div className="flex items-center gap-2">
-                {editingSkill ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setDraftSkill(plugin.skillMarkdown ?? "");
-                        setEditingSkill(false);
-                      }}
-                      className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-2.5 text-[11px] font-medium text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        updatePluginSkill(plugin.id, draftSkill);
-                        setEditingSkill(false);
-                      }}
-                      className="inline-flex h-7 cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] px-3 text-[11px] font-semibold text-[var(--ink-on-primary)]"
-                    >
-                      保存并热重载
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => setEditingSkill(true)}
-                    className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-2.5 text-[11px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
-                  >
-                    编辑 Skill
-                  </button>
+
+              <div className="flex flex-wrap items-center gap-2.5">
+                <SegmentedControl<PluginExecutionMode>
+                  size="sm"
+                  value={plugin.executionMode === "workflow" ? "workflow" : "skill"}
+                  onChange={(mode) => {
+                    if (mode !== (plugin.executionMode === "workflow" ? "workflow" : "skill")) {
+                      setEditingSkill(false);
+                      void updatePluginExecutionMode(plugin.id, mode);
+                    }
+                  }}
+                  options={[
+                    { value: "skill", label: "Skill 模式", widthClass: "w-[74px]" },
+                    { value: "workflow", label: "Workflow 模式", widthClass: "w-[92px]" },
+                  ]}
+                />
+
+                {plugin.executionMode !== "workflow" && (
+                  <div className="flex items-center gap-2">
+                    {editingSkill ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDraftSkill(plugin.skillMarkdown ?? "");
+                            setEditingSkill(false);
+                          }}
+                          className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-2.5 text-[11px] font-medium text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
+                        >
+                          取消
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            updatePluginSkill(plugin.id, draftSkill);
+                            setEditingSkill(false);
+                          }}
+                          className="inline-flex h-7 cursor-pointer items-center rounded-[7px] bg-[var(--ink-primary)] px-3 text-[11px] font-semibold text-[var(--ink-on-primary)]"
+                        >
+                          保存并热重载
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setEditingSkill(true)}
+                        className="inline-flex h-7 cursor-pointer items-center rounded-[7px] border border-[var(--border-control)] px-2.5 text-[11px] font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
+                      >
+                        编辑 Skill
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
             </div>
 
-            {editingSkill ? (
+            {plugin.executionMode === "workflow" ? (
+              <PluginWorkflowPanel plugin={plugin} />
+            ) : editingSkill ? (
               <textarea
                 value={draftSkill}
                 onChange={(e) => setDraftSkill(e.target.value)}
@@ -364,7 +397,7 @@ export const PluginDetailView: React.FC<{ plugin: PluginState }> = ({ plugin }) 
               </div>
             ) : (
               <div className="rounded-[10px] border border-dashed border-[var(--border-dash)] px-4 py-3 text-[12px] text-[var(--ink-subtle)]">
-                尚未配置 Skill 说明，点击右上角「编辑 Skill」补充处理逻辑以形成闭环。
+                尚未配置 Skill 说明，点击右上角「编辑 Skill」补充处理逻辑，或切换为「Workflow 模式」使用 DAG 编排。
               </div>
             )}
           </section>

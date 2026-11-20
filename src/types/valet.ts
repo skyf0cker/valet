@@ -1,4 +1,48 @@
-export type AppView = "inbox" | "timeline" | "chat" | "plugins" | "settings";
+export type AppView = "inbox" | "timeline" | "projects" | "chat" | "plugins" | "settings";
+
+export type ProjectTab = "notebook" | "sessions" | "session";
+
+export type ProjectIconKind = "box" | "book" | "terminal" | "sparkles" | "folder";
+
+export type NotebookBlockType =
+  | "paragraph"
+  | "h1"
+  | "h2"
+  | "h3"
+  | "bullet"
+  | "numbered"
+  | "todo"
+  | "callout"
+  | "quote"
+  | "code"
+  | "divider"
+  | "session_ref";
+
+export const DEFAULT_PROJECT_ID = "proj-default";
+
+export interface NotebookBlock {
+  id: string;
+  type: NotebookBlockType;
+  content: string;
+  checked?: boolean;
+  language?: string;
+  sessionId?: string;
+  summary?: string;
+}
+
+export interface Project {
+  id: string;
+  title: string;
+  description?: string;
+  icon?: ProjectIconKind | string;
+  tags: string[];
+  workingDir?: string;
+  isDefault?: boolean;
+  archived?: boolean;
+  updatedAt: string;
+  createdAt: string;
+  blocks: NotebookBlock[];
+}
 
 export type BusyMessagePolicy = "queue" | "steer";
 
@@ -123,6 +167,8 @@ export interface PermissionItem {
 
 export type PluginSource = "core" | "community" | "local";
 
+export type PluginExecutionMode = "skill" | "workflow";
+
 export type EventPolicyMode = "auto" | "ask" | "record";
 
 export type ActionSafety = "readonly" | "reversible" | "confirm_always";
@@ -200,7 +246,9 @@ export interface PluginState {
   configSchema?: PluginConfigField[];
   config: PluginConfig;
   manifestYaml: string;
+  executionMode?: PluginExecutionMode;
   skillMarkdown?: string;
+  workflowYaml?: string;
   localDir?: string;
   bundledFiles?: string[];
 }
@@ -267,6 +315,7 @@ export interface TimelineEvent {
   canRestore?: boolean;
   restored?: boolean;
   ignored?: boolean;
+  workflowRunId?: string;
 }
 
 export interface ProcessSampleRow {
@@ -292,7 +341,7 @@ export interface PluginDraftSpec {
 
 export interface ChatAttachment {
   id: string;
-  kind: "image" | "file" | "screen" | "timeline_event" | "inbox_item";
+  kind: "image" | "file" | "screen" | "timeline_event" | "inbox_item" | "notebook_context";
   refId?: string;
   name: string;
   meta?: string;
@@ -345,6 +394,7 @@ export interface ChatMessage {
 
 export interface ChatThread {
   id: string;
+  projectId?: string;
   title: string;
   model: string;
   timelineActionCount: number;
@@ -352,6 +402,9 @@ export interface ChatThread {
   updatedAt: string;
   archived?: boolean;
   archivedAt?: string;
+  originBlockId?: string;
+  originSection?: string;
+  notebookContextInjected?: boolean;
   messages: ChatMessage[];
 }
 
@@ -569,6 +622,8 @@ export interface ValetSnapshot {
   isOnDuty: boolean;
   isPaused: boolean;
   activePluginDetailId: string | null;
+  activeProjectId: string;
+  activeProjectTab?: ProjectTab;
   activeChatId: string;
   selectedTimelineEventId: string | null;
   selectedInboxItemId: string | null;
@@ -580,6 +635,7 @@ export interface ValetSnapshot {
   inboxProcessedHistoryCount: number;
   timelineEvents: TimelineEvent[];
   earlierCountLabel: string;
+  projects: Project[];
   chatThreads: ChatThread[];
   automations: AutomationRule[];
   mcpServers: McpServerItem[];
@@ -598,4 +654,147 @@ export interface QueuedChatMessage {
   mentionPlugin: PluginState | null;
   attachments: ChatAttachment[];
   createdAt: string;
+}
+
+export type WorkflowNodeType =
+  | "trigger"
+  | "script"
+  | "http"
+  | "tool"
+  | "agent"
+  | "condition"
+  | "transform"
+  | "sleep"
+  | "approval"
+  | "notify";
+
+export type WorkflowRunStatus =
+  | "pending"
+  | "running"
+  | "waiting_approval"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type WorkflowNodeStatus =
+  | "pending"
+  | "running"
+  | "waiting_approval"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "cancelled";
+
+export interface WorkflowGraphNode {
+  id: string;
+  type: WorkflowNodeType;
+  name?: string;
+  description?: string;
+  config?: Record<string, unknown>;
+}
+
+export interface WorkflowGraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  when?: string;
+  label?: string;
+}
+
+export interface WorkflowGraphDefinition {
+  version: number;
+  name?: string;
+  description?: string;
+  nodes: WorkflowGraphNode[];
+  edges: WorkflowGraphEdge[];
+}
+
+export interface WorkflowValidationResult {
+  valid: boolean;
+  errors: string[];
+  definition?: WorkflowGraphDefinition;
+  topologicalOrder: string[];
+  entryNodeIds: string[];
+}
+
+export interface WorkflowGraphResponse {
+  pluginId: string;
+  executionMode: PluginExecutionMode;
+  workflowYaml: string;
+  valid: boolean;
+  errors: string[];
+  definition?: WorkflowGraphDefinition;
+  topologicalOrder: string[];
+  entryNodeIds: string[];
+}
+
+export interface WorkflowRunSummary {
+  runId: string;
+  pluginId: string;
+  pluginName: string;
+  triggerEvent: string;
+  triggerSource: string;
+  status: WorkflowRunStatus;
+  timelineEventId?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  errorMessage?: string;
+  durationMs?: number;
+}
+
+export interface WorkflowNodeRunState {
+  nodeId: string;
+  nodeType: string;
+  nodeName: string;
+  status: WorkflowNodeStatus;
+  attempt?: number;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  input?: unknown;
+  output?: unknown;
+  error?: string;
+  hookToken?: string;
+  inboxId?: string;
+}
+
+export interface WorkflowEdgeRunState {
+  edgeId: string;
+  from: string;
+  to: string;
+  status: "pending" | "taken" | "skipped";
+}
+
+export interface WorkflowRunDetail {
+  summary: WorkflowRunSummary;
+  definition: WorkflowGraphDefinition;
+  triggerInput?: unknown;
+  nodes: WorkflowNodeRunState[];
+  edges: WorkflowEdgeRunState[];
+}
+
+export interface WorkflowUpdatedPayload {
+  pluginId: string;
+  runId: string;
+  status: WorkflowRunStatus;
+  error?: string;
+  timelineEventId?: string;
+  completedNodeCount?: number;
+}
+
+export interface StartWorkflowParams {
+  pluginId: string;
+  event?: string;
+  source?: string;
+  summary?: string;
+  payload?: Record<string, unknown>;
+  waitForCompletionMs?: number;
+}
+
+export interface ResumeWorkflowHookParams {
+  token: string;
+  approved: boolean;
+  comment?: string;
+  decidedBy?: string;
 }

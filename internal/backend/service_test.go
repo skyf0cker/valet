@@ -1820,3 +1820,247 @@ func TestTimelineEventNotificationsAndCommandFiltering(t *testing.T) {
 		t.Fatalf("expected 5 TimelineEvents total, got %d", len(st.Snapshot().TimelineEvents))
 	}
 }
+
+func TestUpdatePluginExecutionModeAndWorkflowPersistence(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(dataDir, homeDir)
+	if err != nil {
+		t.Fatalf("store.Open failed: %v", err)
+	}
+	svc := NewService()
+	svc.store = st
+	svc.opts = StartOptions{DataDir: dataDir, HomeDir: homeDir}
+	svc.started = true
+
+	// Install a local plugin in Skill mode
+	afterInstall, err := svc.InstallCustomPlugin(types.InstallCustomPluginParams{
+		Name:          "模式切换测试",
+		Tagline:       "测试 Skill 与 Workflow 互斥切换",
+		YAML:          "id: local-mode-test\nname: 模式切换测试\ntriggers:\n  - id: manual.check\n    sensor: manual\n    policy: ask\n",
+		SkillMarkdown: "# Original Skill",
+	})
+	if err != nil {
+		t.Fatalf("InstallCustomPlugin failed: %v", err)
+	}
+	var installed types.PluginState
+	for _, p := range afterInstall.Plugins {
+		if p.ID == "local-mode-test" {
+			installed = p
+		}
+	}
+	if installed.ExecutionMode != "skill" {
+		t.Fatalf("expected initial ExecutionMode=skill, got %q", installed.ExecutionMode)
+	}
+
+	// Switch to workflow mode -> should seed starter workflow.yaml & update manifest execution_mode
+	afterWf, err := svc.UpdatePluginExecutionMode("local-mode-test", "workflow")
+	if err != nil {
+		t.Fatalf("UpdatePluginExecutionMode(workflow) failed: %v", err)
+	}
+	var wfPlugin types.PluginState
+	for _, p := range afterWf.Plugins {
+		if p.ID == "local-mode-test" {
+			wfPlugin = p
+		}
+	}
+	if wfPlugin.ExecutionMode != "workflow" {
+		t.Fatalf("expected ExecutionMode=workflow, got %q", wfPlugin.ExecutionMode)
+	}
+	if !strings.Contains(wfPlugin.ManifestYAML, "execution_mode: workflow") {
+		t.Fatalf("expected execution_mode: workflow in manifest, got:\n%s", wfPlugin.ManifestYAML)
+	}
+	if !strings.Contains(wfPlugin.WorkflowYAML, "type: trigger") {
+		t.Fatalf("expected starter workflow.yaml, got:\n%s", wfPlugin.WorkflowYAML)
+	}
+	if wfPlugin.SkillMarkdown != "# Original Skill" {
+		t.Fatalf("expected SKILL.md to remain preserved on disk, got %q", wfPlugin.SkillMarkdown)
+	}
+
+	// Switch back to skill mode
+	afterSkill, err := svc.UpdatePluginExecutionMode("local-mode-test", "skill")
+	if err != nil {
+		t.Fatalf("UpdatePluginExecutionMode(skill) failed: %v", err)
+	}
+	for _, p := range afterSkill.Plugins {
+		if p.ID == "local-mode-test" {
+			if p.ExecutionMode != "skill" {
+				t.Fatalf("expected ExecutionMode=skill after switch back, got %q", p.ExecutionMode)
+			}
+			if !strings.Contains(p.ManifestYAML, "execution_mode: skill") {
+				t.Fatalf("expected execution_mode: skill in manifest, got:\n%s", p.ManifestYAML)
+			}
+		}
+	}
+}
+
+func TestProjectsAndNotebookLifecycle(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		DataDir:      dataDir,
+		HomeDir:      homeDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("svc.start failed: %v", err)
+	}
+	defer func() { _ = svc.close() }()
+
+	// 1. CreateProject sets active project and switches to notebook tab
+	snap, err := svc.CreateProject(types.CreateProjectParams{
+		Title:       "磁盘与性能治理",
+		Description: "记录排查过程并通过 @valet 调度检测",
+		Icon:        "terminal",
+		Tags:        []string{"磁盘", "性能"},
+		WorkingDir:  "~/Projects/valet",
+	})
+	if err != nil {
+		t.Fatalf("CreateProject failed: %v", err)
+	}
+	if len(snap.Projects) != 2 || snap.Projects[0].ID != types.DefaultProjectID {
+		t.Fatalf("expected default project at index 0 + custom project, got %+v", snap.Projects)
+	}
+	customProj := snap.Projects[1]
+	if snap.ActiveProjectID != customProj.ID || snap.ActiveProjectTab != "notebook" {
+		t.Fatalf("expected activeProject=%q tab=notebook, got project=%q tab=%q",
+			customProj.ID, snap.ActiveProjectID, snap.ActiveProjectTab)
+	}
+
+	// 2. UpdateProject updates metadata and Markdown blocks
+	newTitle := "Mac 性能与存储治理"
+	newDir := "~/Workspace/valet"
+	newTags := []string{"性能诊断", "清理"}
+	blocks := []types.NotebookBlock{
+		{ID: "blk-h1", Type: "h1", Content: "1. 待排查问题"},
+		{ID: "blk-todo", Type: "todo", Content: "扫描冗余缓存", Checked: false},
+		{ID: "blk-origin", Type: "paragraph", Content: "准备调用 Valet 执行扫描"},
+	}
+	snap, err = svc.UpdateProject(types.UpdateProjectParams{
+		ProjectID:  customProj.ID,
+		Title:      &newTitle,
+		WorkingDir: &newDir,
+		Tags:       &newTags,
+		Blocks:     &blocks,
+	})
+	if err != nil {
+		t.Fatalf("UpdateProject failed: %v", err)
+	}
+	updatedProj := snap.Projects[1]
+	if updatedProj.Title != newTitle || updatedProj.WorkingDir != newDir || len(updatedProj.Blocks) != 3 {
+		t.Fatalf("unexpected updated project: %+v", updatedProj)
+	}
+
+	// 3. CreateProjectChatThread from @valet without leaving Notebook tab
+	createdRes, err := svc.CreateProjectChatThread(types.CreateProjectChatParams{
+		ProjectID:               customProj.ID,
+		Title:                   "扫描本机缓存",
+		OriginBlockID:           "blk-origin",
+		OriginSection:           "1. 待排查问题",
+		NotebookContextInjected: true,
+		SwitchToSession:         false,
+	})
+	if err != nil {
+		t.Fatalf("CreateProjectChatThread failed: %v", err)
+	}
+	if createdRes.Thread.ProjectID != customProj.ID ||
+		createdRes.Thread.OriginBlockID != "blk-origin" ||
+		createdRes.Thread.OriginSection != "1. 待排查问题" ||
+		!createdRes.Thread.NotebookContextInjected {
+		t.Fatalf("unexpected created project thread metadata: %+v", createdRes.Thread)
+	}
+	if createdRes.Snapshot.ActiveProjectTab != "notebook" {
+		t.Fatalf("expected SwitchToSession=false to keep ActiveProjectTab=notebook, got %q",
+			createdRes.Snapshot.ActiveProjectTab)
+	}
+
+	// Insert session_ref block and assistant message with <think> tags, then sync summary back to Notebook
+	refBlocks := []types.NotebookBlock{
+		{ID: "blk-h1", Type: "h1", Content: "1. 待排查问题"},
+		{ID: "blk-origin", Type: "session_ref", SessionID: createdRes.Thread.ID, Content: createdRes.Thread.Title},
+	}
+	if _, err := svc.UpdateProject(types.UpdateProjectParams{
+		ProjectID: customProj.ID,
+		Blocks:    &refBlocks,
+	}); err != nil {
+		t.Fatalf("UpdateProject refBlocks failed: %v", err)
+	}
+	svc.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.ChatThreads {
+			if st.ChatThreads[i].ID == createdRes.Thread.ID {
+				st.ChatThreads[i].Messages = append(st.ChatThreads[i].Messages, types.ChatMessage{
+					ID:        "msg-assist-1",
+					Role:      "assistant",
+					Content:   "<think>internal reasoning</think>\n已定位 4.2 GB 冗余缓存。",
+					CreatedAt: "刚刚",
+				})
+				break
+			}
+		}
+	})
+
+	snap, err = svc.SyncSessionSummaryToNotebook(createdRes.Thread.ID)
+	if err != nil {
+		t.Fatalf("SyncSessionSummaryToNotebook failed: %v", err)
+	}
+	if snap.Projects[1].Blocks[1].Summary != "已定位 4.2 GB 冗余缓存。" {
+		t.Fatalf("expected stripped summary synced to session_ref block, got %q",
+			snap.Projects[1].Blocks[1].Summary)
+	}
+
+	// 4. Create second thread in customProj, move first thread to default, then delete customProj
+	secondRes, err := svc.CreateProjectChatThread(types.CreateProjectChatParams{
+		ProjectID:       customProj.ID,
+		Title:           "留在项目等待迁回默认",
+		SwitchToSession: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateProjectChatThread(second) failed: %v", err)
+	}
+	snap, err = svc.MoveChatThreadToProject(createdRes.Thread.ID, types.DefaultProjectID)
+	if err != nil {
+		t.Fatalf("MoveChatThreadToProject failed: %v", err)
+	}
+	var movedOK bool
+	for _, th := range snap.ChatThreads {
+		if th.ID == createdRes.Thread.ID && th.ProjectID == types.DefaultProjectID {
+			movedOK = true
+		}
+	}
+	if !movedOK {
+		t.Fatalf("expected thread %q moved to %q", createdRes.Thread.ID, types.DefaultProjectID)
+	}
+
+	if _, err := svc.DeleteProject(types.DefaultProjectID); err == nil {
+		t.Fatalf("expected error deleting default project")
+	}
+	snap, err = svc.DeleteProject(customProj.ID)
+	if err != nil {
+		t.Fatalf("DeleteProject failed: %v", err)
+	}
+	if len(snap.Projects) != 1 || snap.ActiveProjectID != types.DefaultProjectID {
+		t.Fatalf("expected fallback to default project after deletion, got %+v active=%q",
+			snap.Projects, snap.ActiveProjectID)
+	}
+	var reassignedOK bool
+	for _, th := range snap.ChatThreads {
+		if th.ID == secondRes.Thread.ID && th.ProjectID == types.DefaultProjectID {
+			reassignedOK = true
+		}
+	}
+	if !reassignedOK {
+		t.Fatalf("expected remaining thread %q reassigned to default project after DeleteProject",
+			secondRes.Thread.ID)
+	}
+}
+
