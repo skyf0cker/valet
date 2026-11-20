@@ -266,6 +266,51 @@ export async function openBunSqliteDatabase(
   }
 }
 
+export interface UniversalSqliteBundle {
+  storage: SqliteStorage;
+  db: SqliteDatabase | null;
+}
+
+/**
+ * Opens durable SQLite storage alongside the underlying `SqliteDatabase` handle
+ * so Always-On tables (`valet_*`) can share the same serialized WAL connection.
+ */
+export async function openUniversalSqliteBundle(
+  filePath: string,
+  options: {
+    prefix?: string;
+    mode?: "read-write" | "read-only";
+    busyTimeoutMs?: number;
+  } = {},
+): Promise<UniversalSqliteBundle> {
+  const prefix = options.prefix ?? "pi_";
+  validateSqliteSchemaPrefix(prefix);
+
+  if (typeof Bun !== "undefined") {
+    const db = await openBunSqliteDatabase(filePath, {
+      mode: options.mode,
+      busyTimeoutMs: options.busyTimeoutMs,
+    });
+    const storage = await SqliteStorage.open(db, { prefix });
+    return { storage, db };
+  }
+
+  // Dynamically resolve Node SQLite fallback without static bundler capture of node:sqlite.
+  const nodeStorageModule = `${"@earendil-works/pi-durable"}/storage/sqlite/node`;
+  const mod = (await import(nodeStorageModule)) as {
+    openNodeSqliteStorage: (
+      path: string,
+      opts?: { prefix?: string; mode?: "read-write" | "read-only"; busyTimeoutMs?: number },
+    ) => Promise<SqliteStorage>;
+  };
+  const storage = await mod.openNodeSqliteStorage(filePath, {
+    prefix,
+    mode: options.mode,
+    busyTimeoutMs: options.busyTimeoutMs,
+  });
+  return { storage, db: null };
+}
+
 /**
  * Opens durable SQLite storage compatible with both Bun (`bun:sqlite`) and Node (`node:sqlite`).
  */
@@ -277,28 +322,6 @@ export async function openUniversalSqliteStorage(
     busyTimeoutMs?: number;
   } = {},
 ): Promise<SqliteStorage> {
-  const prefix = options.prefix ?? "pi_";
-  validateSqliteSchemaPrefix(prefix);
-
-  if (typeof Bun !== "undefined") {
-    const db = await openBunSqliteDatabase(filePath, {
-      mode: options.mode,
-      busyTimeoutMs: options.busyTimeoutMs,
-    });
-    return SqliteStorage.open(db, { prefix });
-  }
-
-  // Dynamically resolve Node SQLite fallback without static bundler capture of node:sqlite.
-  const nodeStorageModule = `${"@earendil-works/pi-durable"}/storage/sqlite/node`;
-  const mod = (await import(nodeStorageModule)) as {
-    openNodeSqliteStorage: (
-      path: string,
-      opts?: { prefix?: string; mode?: "read-write" | "read-only"; busyTimeoutMs?: number },
-    ) => Promise<SqliteStorage>;
-  };
-  return mod.openNodeSqliteStorage(filePath, {
-    prefix,
-    mode: options.mode,
-    busyTimeoutMs: options.busyTimeoutMs,
-  });
+  const { storage } = await openUniversalSqliteBundle(filePath, options);
+  return storage;
 }

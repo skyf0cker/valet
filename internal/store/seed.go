@@ -166,6 +166,7 @@ func DefaultPluginRuntime() types.PluginRuntimeSettings {
 		AllowUnsignedLocal: true,
 		MaxEventsPerHour:   "60 / 小时",
 		QuietHours:         "23:30 – 08:00",
+		DebounceMs:         1500,
 	}
 }
 

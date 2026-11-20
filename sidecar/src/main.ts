@@ -1,6 +1,12 @@
 import { connect, type Socket } from "node:net";
 import { createInterface } from "node:readline";
 import type {
+  AlwaysOnInboxStatus,
+  AlwaysOnTimerStatus,
+  CreateTimerInput,
+  IngestInboxInput,
+} from "./always-on.ts";
+import type {
   AnswerInboxQuestionRequest,
   DispatchPluginEventRequest,
   ExecuteApprovedToolRequest,
@@ -167,6 +173,35 @@ class StdioJsonRpcServer implements HostBridge {
         );
       case "mcp.probe":
         return this.runtime.probeMcpServer(params as unknown as ProbeMcpRequest);
+      case "alwaysOn.ingest":
+        return this.runtime.alwaysOnIngest(params as unknown as IngestInboxInput);
+      case "alwaysOn.snapshot":
+        return this.runtime.alwaysOnSnapshot({
+          inboxLimit:
+            typeof params.inboxLimit === "number" ? params.inboxLimit : undefined,
+          runsLimit:
+            typeof params.runsLimit === "number" ? params.runsLimit : undefined,
+          timersLimit:
+            typeof params.timersLimit === "number" ? params.timersLimit : undefined,
+          outboxLimit:
+            typeof params.outboxLimit === "number" ? params.outboxLimit : undefined,
+          inboxStatus: params.inboxStatus as AlwaysOnInboxStatus | undefined,
+          timerStatus: params.timerStatus as AlwaysOnTimerStatus | undefined,
+        });
+      case "alwaysOn.retryInbox":
+        return this.runtime.alwaysOnRetryInbox(String(params.itemId ?? ""));
+      case "alwaysOn.createTimer":
+        return this.runtime.alwaysOnCreateTimer(
+          params as unknown as CreateTimerInput,
+        );
+      case "alwaysOn.cancelTimer":
+        return this.runtime.alwaysOnCancelTimer(String(params.timerId ?? ""));
+      case "alwaysOn.markOutboxRead":
+        return this.runtime.alwaysOnMarkOutboxRead(String(params.msgId ?? ""));
+      case "alwaysOn.markAllOutboxRead":
+        return this.runtime.alwaysOnMarkAllOutboxRead();
+      case "alwaysOn.tick":
+        return this.runtime.alwaysOnTick(Boolean(params.waitForRun));
       case "agent.shutdown":
         await this.runtime.close();
         setTimeout(() => process.exit(0), 15);

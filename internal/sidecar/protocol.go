@@ -167,6 +167,31 @@ type RecordTimelineRequest struct {
 	ActionItems []types.TimelineActionItem `json:"actionItems,omitempty"`
 }
 
+// AlwaysOnIngestRequest enqueues a durable event into the sidecar Always-On Inbox for coalesced execution.
+type AlwaysOnIngestRequest struct {
+	Source    string `json:"source"`
+	PluginID  string `json:"plugin_id,omitempty"`
+	EventType string `json:"event_type"`
+	Title     string `json:"title"`
+	Payload   string `json:"payload"`
+	EventID   string `json:"event_id,omitempty"`
+	Trusted   *bool  `json:"trusted,omitempty"`
+	ThreadKey string `json:"thread_key,omitempty"`
+}
+
+// AlwaysOnIngestResponse reports whether an event was enqueued or deduplicated.
+type AlwaysOnIngestResponse struct {
+	Item         types.AlwaysOnInboxItem `json:"item"`
+	Deduplicated bool                    `json:"deduplicated"`
+	Immediate    bool                    `json:"immediate"`
+}
+
+// AlwaysOnOutboxNotifyPayload is sent by Sidecar when notify() or dead-letter writes an Outbox message.
+type AlwaysOnOutboxNotifyPayload struct {
+	Message types.AlwaysOnOutboxMessage `json:"message"`
+	Level   string                      `json:"level"` // "info" | "warn" | "urgent"
+}
+
 type rpcEnvelope struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`

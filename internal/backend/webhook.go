@@ -160,14 +160,30 @@ func (s *Service) handleWebhookEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		_, _ = s.dispatchPluginEventInternal(ctx, pluginID, eventCode, payload, false)
+		eventID := strings.TrimSpace(r.Header.Get("X-Event-Id"))
+		if eventID == "" {
+			eventID = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		}
+		if eventID == "" {
+			if rawID, ok := payload["event_id"].(string); ok {
+				eventID = strings.TrimSpace(rawID)
+			}
+		}
+		_, err := s.enqueuePluginEventAlwaysOn(ctx, pluginID, eventCode, payload, "webhook", eventID, false)
+		if err != nil {
+			// Fallback to legacy synchronous dispatch if Always-On ingest is unavailable.
+			fbCtx, fbCancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer fbCancel()
+			_, _ = s.dispatchPluginEventInternal(fbCtx, pluginID, eventCode, payload, false)
+		}
 	}()
 
 	writeWebhookJSON(w, http.StatusAccepted, map[string]any{
 		"ok":        true,
 		"accepted":  true,
+		"queued":    true,
 		"pluginId":  pluginID,
 		"eventCode": eventCode,
 	})

@@ -1570,3 +1570,124 @@ func TestConfigureServicePreservesChatStreamCallbackOnEarlyEnsureStarted(t *test
 		t.Fatalf("expected chatStream callback to receive payload after early ensureStarted, got %+v", received)
 	}
 }
+
+func TestAlwaysOnInboxTimerOutboxEndToEnd(t *testing.T) {
+	tmp := t.TempDir()
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("resolve repoRoot failed: %v", err)
+	}
+
+	svc := NewService()
+	if err := StartService(svc, StartOptions{
+		DataDir:      filepath.Join(tmp, "data"),
+		HomeDir:      filepath.Join(tmp, "home"),
+		RepoRoot:     repoRoot,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("StartService failed: %v", err)
+	}
+	defer CloseService(svc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// 1. Create and cancel a durable Always-On timer
+	delay := 120.0
+	timer, err := svc.CreateAlwaysOnTimer(ctx, types.CreateAlwaysOnTimerParams{
+		Kind:         "follow_up",
+		Label:        "巡检构建队列",
+		Payload:      "核实 CI 构建状态",
+		DelaySeconds: &delay,
+	})
+	if err != nil {
+		t.Fatalf("CreateAlwaysOnTimer failed: %v", err)
+	}
+	if timer.Status != "armed" || timer.Kind != "follow_up" {
+		t.Fatalf("unexpected timer state: %+v", timer)
+	}
+
+	snap1, err := svc.GetAlwaysOnSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("GetAlwaysOnSnapshot failed: %v", err)
+	}
+	if snap1.Stats.TimersArmed != 1 {
+		t.Fatalf("expected 1 armed timer, got %d", snap1.Stats.TimersArmed)
+	}
+
+	cancelled, err := svc.CancelAlwaysOnTimer(ctx, timer.ID)
+	if err != nil || cancelled == nil || cancelled.Status != "cancelled" {
+		t.Fatalf("CancelAlwaysOnTimer failed: %v, %+v", err, cancelled)
+	}
+
+	// 2. Install a webhook plugin and verify async webhook POST ingests into Always-On Inbox with deduplication & tainting
+	valetSnap, err := svc.InstallCustomPlugin(types.InstallCustomPluginParams{
+		Name:    "AlwaysOn Webhook",
+		Tagline: "测试合批与去重",
+		YAML: `id: local.valet.alwayson-hook
+name: AlwaysOn Webhook
+version: 0.1.0
+triggers:
+  - id: deploy.alert
+    sensor: webhook
+    policy: auto
+`,
+		SkillMarkdown: "收到部署告警后按需汇总。",
+	})
+	if err != nil {
+		t.Fatalf("InstallCustomPlugin failed: %v", err)
+	}
+	var pluginID string
+	for _, p := range valetSnap.Plugins {
+		if p.Name == "AlwaysOn Webhook" {
+			pluginID = p.ID
+			break
+		}
+	}
+	if pluginID == "" {
+		t.Fatalf("installed webhook plugin not found")
+	}
+
+	hookURL := valetSnap.Preferences.PluginRuntime.WebhookEndpoint + "/" + pluginID + "/deploy.alert"
+	postEvent := func(eventID, body string) {
+		req, _ := http.NewRequest(http.MethodPost, hookURL, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Event-Id", eventID)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST webhook failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected 202 Accepted, got %d", resp.StatusCode)
+		}
+	}
+
+	// Send 2 distinct events + 1 duplicate X-Event-Id inside the 1500ms debounce window
+	postEvent("wh-dedupe-1", `{"service":"api","status":"down"}`)
+	postEvent("wh-dedupe-1", `{"service":"api","status":"down"}`)
+	postEvent("wh-dedupe-2", `{"service":"worker","status":"down"}`)
+
+	// Wait briefly for async goroutines to finish calling alwaysOn.ingest
+	deadline := time.Now().Add(5 * time.Second)
+	var snapAfter types.AlwaysOnSnapshot
+	for time.Now().Before(deadline) {
+		snapAfter, err = svc.GetAlwaysOnSnapshot(ctx)
+		if err == nil && snapAfter.Stats.InboxTotal >= 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if snapAfter.Stats.InboxTotal != 2 {
+		t.Fatalf("expected exactly 2 deduplicated inbox items, got %d (%+v)", snapAfter.Stats.InboxTotal, snapAfter.Inbox)
+	}
+	for _, item := range snapAfter.Inbox {
+		if item.Trusted {
+			t.Fatalf("expected webhook inbox item to be untrusted (tainted), got %+v", item)
+		}
+		if item.Source != "webhook" {
+			t.Fatalf("expected source=webhook, got %q", item.Source)
+		}
+	}
+}

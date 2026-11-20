@@ -30,6 +30,93 @@ export interface AgentProviderConfig {
   connected: boolean;
 }
 
+export interface AlwaysOnInboxItem {
+  id: string;
+  event_id: string | null;
+  source: string;
+  plugin_id: string | null;
+  event_type: string;
+  title: string;
+  payload: string;
+  trusted: boolean;
+  thread_key: string | null;
+  status: string;
+  attempts: number;
+  next_attempt_at: string | null;
+  run_id: string | null;
+  agent_reply: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AlwaysOnOutboxList {
+  messages: AlwaysOnOutboxMessage[];
+  unread_count: number;
+}
+
+export interface AlwaysOnOutboxMessage {
+  id: string;
+  run_id: string | null;
+  kind: string;
+  title: string;
+  body: string;
+  call_id: string | null;
+  detail: Record<string, unknown>;
+  read_at: string | null;
+  created_at: string;
+}
+
+export interface AlwaysOnRun {
+  id: string;
+  status: string;
+  end_kind: string | null;
+  event_ids: string[];
+  has_chat: boolean;
+  tainted: boolean;
+  reply_text: string | null;
+  error: string | null;
+  lease_until: string;
+  started_at: string;
+  ended_at: string | null;
+}
+
+export interface AlwaysOnSnapshot {
+  stats: AlwaysOnStats;
+  activeRun: AlwaysOnRun | null;
+  inbox: AlwaysOnInboxItem[];
+  runs: AlwaysOnRun[];
+  timers: AlwaysOnTimer[];
+  outbox: AlwaysOnOutboxList;
+}
+
+export interface AlwaysOnStats {
+  inbox_total: number;
+  inbox_pending: number;
+  inbox_queued: number;
+  inbox_in_run: number;
+  inbox_dead: number;
+  timers_armed: number;
+  outbox_unread: number;
+  debounce_ms: number;
+}
+
+export interface AlwaysOnTimer {
+  id: string;
+  kind: string;
+  label: string;
+  payload: string;
+  due_at: string;
+  every_ms: number | null;
+  anchor_at: string | null;
+  status: string;
+  fire_count: number;
+  last_fired_at: string | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface AutoReviewConfig {
   engine: string;
   jevEndpoint: string;
@@ -115,6 +202,16 @@ export interface CleanupPolicySettings {
   restoreRetentionDays: string;
   protectedDirs: string[];
   autoScanAfterUninstall: boolean;
+}
+
+export interface CreateAlwaysOnTimerParams {
+  kind: string;
+  label: string;
+  payload: string;
+  delay_seconds?: number;
+  at_iso?: string;
+  every_seconds?: number;
+  start_at_iso?: string;
 }
 
 export interface HeartbeatRunLog {
@@ -309,6 +406,7 @@ export interface PluginRuntimeSettings {
   maxEventsPerHour: string;
   quietHours: string;
   webhookEndpoint?: string;
+  debounceMs?: number;
 }
 
 export interface PluginState {
@@ -640,6 +738,10 @@ export const Valet = {
   archiveChatThread(chatID: string, archived: boolean): Promise<ValetSnapshot> {
     return call("Valet.ArchiveChatThread", chatID, archived);
   },
+  /** CancelAlwaysOnTimer cancels an armed Always-On timer by ID. */
+  cancelAlwaysOnTimer(timerID: string): Promise<AlwaysOnTimer | null> {
+    return call("Valet.CancelAlwaysOnTimer", timerID);
+  },
   /**
    * CaptureCurrentScreen verifies Screen Recording access, captures a bounded screenshot on macOS,
    * and syncs the updated permission state.
@@ -662,6 +764,10 @@ export const Valet = {
   /** CompleteOnboarding finishes the onboarding wizard and opens Inbox. */
   completeOnboarding(): Promise<ValetSnapshot> {
     return call("Valet.CompleteOnboarding");
+  },
+  /** CreateAlwaysOnTimer creates a durable one-shot follow_up or drift-free periodic schedule timer. */
+  createAlwaysOnTimer(params: CreateAlwaysOnTimerParams): Promise<AlwaysOnTimer> {
+    return call("Valet.CreateAlwaysOnTimer", params);
   },
   /** CreateChatThread creates and activates a new conversation thread. */
   createChatThread(): Promise<ValetSnapshot> {
@@ -691,6 +797,10 @@ export const Valet = {
   fixPluginAuth(pluginID: string): Promise<ValetSnapshot> {
     return call("Valet.FixPluginAuth", pluginID);
   },
+  /** GetAlwaysOnSnapshot returns the sidecar's durable Inbox queue, Runs, Timers, and Outbox snapshot. */
+  getAlwaysOnSnapshot(): Promise<AlwaysOnSnapshot> {
+    return call("Valet.GetAlwaysOnSnapshot");
+  },
   /** GetSnapshot returns the current persistent application state plus live storage stats. */
   getSnapshot(): Promise<ValetSnapshot> {
     return call("Valet.GetSnapshot");
@@ -717,6 +827,14 @@ export const Valet = {
   /** InstallPluginDraft turns a chat plugin draft YAML into an enabled plugin and hot-reloads the agent registry. */
   installPluginDraft(chatID: string, messageID: string, draft: PluginDraftSpec): Promise<ValetSnapshot> {
     return call("Valet.InstallPluginDraft", chatID, messageID, draft);
+  },
+  /** MarkAllOutboxRead marks all unread Always-On Outbox notifications as read. */
+  markAllOutboxRead(): Promise<number> {
+    return call("Valet.MarkAllOutboxRead");
+  },
+  /** MarkOutboxMessageRead marks a single Always-On Outbox notification as read. */
+  markOutboxMessageRead(msgID: string): Promise<AlwaysOnOutboxMessage | null> {
+    return call("Valet.MarkOutboxMessageRead", msgID);
   },
   /** OpenSystemSettings opens macOS System Settings for the requested permission ID. */
   openSystemSettings(permissionID: string): Promise<boolean> {
@@ -772,6 +890,10 @@ export const Valet = {
   /** RestoreTimelineEvent restores files cleaned up by a Timeline event. */
   restoreTimelineEvent(eventID: string): Promise<ValetSnapshot> {
     return call("Valet.RestoreTimelineEvent", eventID);
+  },
+  /** RetryAlwaysOnInboxItem resets a dead or delayed Always-On Inbox event back to queued for immediate execution. */
+  retryAlwaysOnInboxItem(itemID: string): Promise<AlwaysOnInboxItem | null> {
+    return call("Valet.RetryAlwaysOnInboxItem", itemID);
   },
   /** RunAutomationNow executes an automation rule immediately through the Pi Durable agent. */
   runAutomationNow(id: string): Promise<ValetSnapshot> {

@@ -63,6 +63,7 @@ export interface PluginRuntimeSettings {
   maxEventsPerHour: string;
   quietHours: string;
   webhookEndpoint?: string;
+  debounceMs?: number;
 }
 
 export interface ValetPreferences {

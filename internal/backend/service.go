@@ -585,7 +585,15 @@ func (s *Service) handlePluginEngineTrigger(d plugins.TriggerDispatch) {
 		defer cancel()
 		switch d.Kind {
 		case "plugin":
-			_, _ = s.dispatchPluginEventInternal(ctx, d.PluginID, d.EventCode, d.Payload, false)
+			eventID := ""
+			if d.Payload != nil {
+				if raw, ok := d.Payload["event_id"].(string); ok {
+					eventID = strings.TrimSpace(raw)
+				}
+			}
+			if _, err := s.enqueuePluginEventAlwaysOn(ctx, d.PluginID, d.EventCode, d.Payload, "plugin", eventID, true); err != nil {
+				_, _ = s.dispatchPluginEventInternal(ctx, d.PluginID, d.EventCode, d.Payload, false)
+			}
 		case "automation":
 			if d.AutomationID != "" {
 				_, _ = s.RunAutomationNow(ctx, d.AutomationID)
@@ -647,21 +655,251 @@ func (s *Service) emitStateChange(scope string) {
 }
 
 func (s *Service) handleSidecarNotify(method string, params json.RawMessage) {
-	if method != "host.chatStream" {
-		return
+	switch method {
+	case "host.chatStream":
+		s.mu.Lock()
+		onChatStream := s.opts.OnChatStream
+		s.mu.Unlock()
+		if onChatStream == nil {
+			return
+		}
+		var payload types.ChatStreamPayload
+		if err := json.Unmarshal(params, &payload); err != nil {
+			fmt.Fprintf(os.Stderr, "[valet] chatStream unmarshal error: %v\n", err)
+			return
+		}
+		onChatStream(payload)
+	case "host.alwaysOnUpdate":
+		s.emitStateChange("always_on")
+	case "host.outboxNotify":
+		var payload sidecar.AlwaysOnOutboxNotifyPayload
+		if err := json.Unmarshal(params, &payload); err != nil {
+			fmt.Fprintf(os.Stderr, "[valet] outboxNotify unmarshal error: %v\n", err)
+			return
+		}
+		s.handleAlwaysOnOutboxNotify(payload)
 	}
+}
+
+func (s *Service) handleAlwaysOnOutboxNotify(payload sidecar.AlwaysOnOutboxNotifyPayload) {
+	msg := payload.Message
 	s.mu.Lock()
-	onChatStream := s.opts.OnChatStream
+	onNotify := s.opts.OnNotify
 	s.mu.Unlock()
-	if onChatStream == nil {
-		return
+	if onNotify != nil {
+		kind := payload.Level
+		if kind == "" {
+			kind = "info"
+		}
+		if msg.Kind == "dead_letter" {
+			kind = "warn"
+		}
+		onNotify(kind, msg.Title, "Valet 管家通知", msg.Body)
 	}
-	var payload types.ChatStreamPayload
-	if err := json.Unmarshal(params, &payload); err != nil {
-		fmt.Fprintf(os.Stderr, "[valet] chatStream unmarshal error: %v\n", err)
-		return
+
+	status := "completed"
+	eventCode := "outbox.message"
+	if msg.Kind == "dead_letter" {
+		status = "failed"
+		eventCode = "inbox.dead_letter"
 	}
-	onChatStream(payload)
+	s.recordTimelineFromAgent(sidecar.RecordTimelineRequest{
+		PluginID:   "valet-core",
+		PluginName: "Valet 管家",
+		EventCode:  eventCode,
+		Title:      msg.Title,
+		Summary:    summarizeMarkdownReply(msg.Body),
+		Status:     status,
+		Reasoning:  msg.Body,
+		Payload: map[string]any{
+			"outbox_id": msg.ID,
+			"kind":      msg.Kind,
+			"run_id":    msg.RunID,
+			"detail":    msg.Detail,
+		},
+	})
+	s.emitStateChange("always_on")
+}
+
+// enqueuePluginEventAlwaysOn routes live background plugin/webhook events into the durable Always-On Inbox
+// for deduplication, taint tracking, and debounce coalescing.
+func (s *Service) enqueuePluginEventAlwaysOn(
+	ctx context.Context,
+	pluginID string,
+	eventCode string,
+	payload map[string]any,
+	source string,
+	eventID string,
+	trusted bool,
+) (sidecar.AlwaysOnIngestResponse, error) {
+	if err := s.ensureStarted(); err != nil {
+		return sidecar.AlwaysOnIngestResponse{}, err
+	}
+	snap := s.store.Snapshot()
+	var plugin *types.PluginState
+	for i := range snap.Plugins {
+		if snap.Plugins[i].ID == pluginID {
+			cp := snap.Plugins[i]
+			plugin = &cp
+			break
+		}
+	}
+	if plugin == nil {
+		return sidecar.AlwaysOnIngestResponse{}, fmt.Errorf("plugin not found: %s", pluginID)
+	}
+	if !plugin.Installed || !plugin.Enabled {
+		return sidecar.AlwaysOnIngestResponse{}, fmt.Errorf("plugin %s is disabled", pluginID)
+	}
+
+	policy := "ask"
+	for _, ev := range plugin.Events {
+		if ev.ID == eventCode {
+			policy = ev.Policy
+			break
+		}
+	}
+	if policy == "record" {
+		s.recordPluginTriggerStat(pluginID, eventCode, fmt.Sprintf("刚刚记录 · %s", eventCode))
+		s.recordTimelineFromAgent(sidecar.RecordTimelineRequest{
+			PluginID:   plugin.ID,
+			PluginName: plugin.Name,
+			EventCode:  eventCode,
+			Title:      fmt.Sprintf("%s 捕获 %s", plugin.Name, eventCode),
+			Summary:    "策略为「仅记录」，已归档到时间线供你随时回溯。",
+			Status:     "completed",
+			Reasoning:  fmt.Sprintf("事件 %s 策略配置为 record，仅写入时间线。", eventCode),
+			Payload:    payload,
+		})
+		return sidecar.AlwaysOnIngestResponse{}, nil
+	}
+
+	if s.client == nil {
+		return sidecar.AlwaysOnIngestResponse{}, errors.New("sidecar client not initialized")
+	}
+
+	s.recordPluginTriggerStat(pluginID, eventCode, fmt.Sprintf("已入队 · %s", eventCode))
+
+	reqPayload := make(map[string]any, len(payload)+3)
+	for k, v := range payload {
+		reqPayload[k] = v
+	}
+	reqPayload["bundle"] = plugin.BundleID
+	reqPayload["policy"] = policy
+	payloadBytes, _ := json.Marshal(reqPayload)
+
+	title := fmt.Sprintf("%s · %s", plugin.Name, eventCode)
+	if customTitle, ok := reqPayload["title"].(string); ok && strings.TrimSpace(customTitle) != "" {
+		title = strings.TrimSpace(customTitle)
+	}
+
+	s.syncSidecarBlocking(ctx, s.store.Snapshot())
+	var resp sidecar.AlwaysOnIngestResponse
+	t := trusted
+	if err := s.client.Call(ctx, "alwaysOn.ingest", sidecar.AlwaysOnIngestRequest{
+		Source:    source,
+		PluginID:  plugin.ID,
+		EventType: eventCode,
+		Title:     title,
+		Payload:   string(payloadBytes),
+		EventID:   eventID,
+		Trusted:   &t,
+		ThreadKey: "event:" + plugin.ID,
+	}, &resp); err != nil {
+		return sidecar.AlwaysOnIngestResponse{}, err
+	}
+	return resp, nil
+}
+
+// GetAlwaysOnSnapshot returns the sidecar's durable Inbox queue, Runs, Timers, and Outbox snapshot.
+func (s *Service) GetAlwaysOnSnapshot(ctx context.Context) (types.AlwaysOnSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.AlwaysOnSnapshot{}, err
+	}
+	if s.client == nil {
+		return types.AlwaysOnSnapshot{}, errors.New("sidecar not running")
+	}
+	var out types.AlwaysOnSnapshot
+	if err := s.client.Call(ctx, "alwaysOn.snapshot", map[string]any{}, &out); err != nil {
+		return types.AlwaysOnSnapshot{}, err
+	}
+	return out, nil
+}
+
+// RetryAlwaysOnInboxItem resets a dead or delayed Always-On Inbox event back to queued for immediate execution.
+func (s *Service) RetryAlwaysOnInboxItem(ctx context.Context, itemID string) (*types.AlwaysOnInboxItem, error) {
+	if err := s.ensureStarted(); err != nil {
+		return nil, err
+	}
+	if s.client == nil {
+		return nil, errors.New("sidecar not running")
+	}
+	var out *types.AlwaysOnInboxItem
+	if err := s.client.Call(ctx, "alwaysOn.retryInbox", map[string]any{"itemId": itemID}, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CreateAlwaysOnTimer creates a durable one-shot follow_up or drift-free periodic schedule timer.
+func (s *Service) CreateAlwaysOnTimer(ctx context.Context, params types.CreateAlwaysOnTimerParams) (types.AlwaysOnTimer, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.AlwaysOnTimer{}, err
+	}
+	if s.client == nil {
+		return types.AlwaysOnTimer{}, errors.New("sidecar not running")
+	}
+	var out types.AlwaysOnTimer
+	if err := s.client.Call(ctx, "alwaysOn.createTimer", params, &out); err != nil {
+		return types.AlwaysOnTimer{}, err
+	}
+	return out, nil
+}
+
+// CancelAlwaysOnTimer cancels an armed Always-On timer by ID.
+func (s *Service) CancelAlwaysOnTimer(ctx context.Context, timerID string) (*types.AlwaysOnTimer, error) {
+	if err := s.ensureStarted(); err != nil {
+		return nil, err
+	}
+	if s.client == nil {
+		return nil, errors.New("sidecar not running")
+	}
+	var out *types.AlwaysOnTimer
+	if err := s.client.Call(ctx, "alwaysOn.cancelTimer", map[string]any{"timerId": timerID}, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// MarkOutboxMessageRead marks a single Always-On Outbox notification as read.
+func (s *Service) MarkOutboxMessageRead(ctx context.Context, msgID string) (*types.AlwaysOnOutboxMessage, error) {
+	if err := s.ensureStarted(); err != nil {
+		return nil, err
+	}
+	if s.client == nil {
+		return nil, errors.New("sidecar not running")
+	}
+	var out *types.AlwaysOnOutboxMessage
+	if err := s.client.Call(ctx, "alwaysOn.markOutboxRead", map[string]any{"msgId": msgID}, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// MarkAllOutboxRead marks all unread Always-On Outbox notifications as read.
+func (s *Service) MarkAllOutboxRead(ctx context.Context) (int, error) {
+	if err := s.ensureStarted(); err != nil {
+		return 0, err
+	}
+	if s.client == nil {
+		return 0, errors.New("sidecar not running")
+	}
+	var out struct {
+		Cleared int `json:"cleared"`
+	}
+	if err := s.client.Call(ctx, "alwaysOn.markAllOutboxRead", map[string]any{}, &out); err != nil {
+		return 0, err
+	}
+	return out.Cleared, nil
 }
 
 func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, raw json.RawMessage) (any, error) {

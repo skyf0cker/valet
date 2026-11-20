@@ -25,6 +25,18 @@ import {
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
+  type AlwaysOnInboxStatus,
+  type AlwaysOnOutboxMessage,
+  type AlwaysOnRunRecord,
+  type AlwaysOnStats,
+  type AlwaysOnTimerRecord,
+  type AlwaysOnTimerStatus,
+  type ClaimedBatch,
+  type CreateTimerInput,
+  type IngestInboxInput,
+  ValetAlwaysOnStore,
+} from "./always-on.ts";
+import {
   InteractivePermissionCoordinator,
   ToolPolicyRegistry,
   createSafetyExtension,
@@ -56,7 +68,7 @@ import type {
   TestProviderRequest,
   ValetSyncState,
 } from "./protocol.ts";
-import { openUniversalSqliteStorage } from "./sqlite.ts";
+import { openUniversalSqliteBundle } from "./sqlite.ts";
 
 const ValetThreadsDoc = defineDoc<{ map: Record<string, ConversationId> }>({
   kind: "valet.threads",
@@ -87,6 +99,10 @@ const TOOL_STATUS_LABELS: Record<string, string> = {
   plugin_trigger: "正在注入插件测试事件…",
   plugin_remove: "正在卸载/移除插件…",
   item_resolve: "正在处理引用的事项…",
+  wake_me_at: "正在创建自唤醒定时器…",
+  cancel_wake: "正在取消定时器…",
+  list_timers: "正在查询定时器列表…",
+  notify: "正在发送 Outbox 通知…",
 };
 
 export function stripThinkTags(raw: string): {
@@ -190,6 +206,20 @@ function humanizeToolStepLabel(
       return args?.id
         ? `处理事项 · ${String(args.id)}`
         : "处理引用的事项";
+    case "wake_me_at":
+      return args?.label
+        ? `创建定时唤醒 · ${String(args.label)}`
+        : "创建自唤醒定时器";
+    case "cancel_wake":
+      return args?.timerId
+        ? `取消定时器 · ${String(args.timerId)}`
+        : "取消定时器";
+    case "list_timers":
+      return "查询定时器列表";
+    case "notify":
+      return args?.title
+        ? `发送通知 · ${String(args.title)}`
+        : "发送 Outbox 通知";
     default:
       return name.replace(/^(plugin_|mcp_)/, "").replace(/_/g, " ");
   }
@@ -300,11 +330,27 @@ export class ValetDurableRuntime {
     ConversationId,
     { inboxIds: string[]; timelineIds: string[] }
   >();
+  private alwaysOn: ValetAlwaysOnStore | null = null;
+  private activeRunId: string | null = null;
+  private activeRunChatId: string | null = null;
+  private activeRunPromise: Promise<void> | null = null;
+  private wakeupTimer: ReturnType<typeof setTimeout> | null = null;
+  private tickInFlight: Promise<void> | null = null;
+  private tickRequested = false;
+  private readonly nowFn: () => number;
 
-  constructor(private readonly bridge: HostBridge) {
+  constructor(
+    private readonly bridge: HostBridge,
+    options?: { nowFn?: () => number },
+  ) {
+    this.nowFn = options?.nowFn ?? (() => Date.now());
     this.models.setAvailableToolProvider(
       () => new Set(this.registry.snapshot().tools().map((t) => t.tool.name)),
     );
+  }
+
+  getAlwaysOnStore(): ValetAlwaysOnStore | null {
+    return this.alwaysOn;
   }
 
   getState(): ValetSyncState {
@@ -361,6 +407,74 @@ export class ValetDurableRuntime {
       policyRegistry: this.policyRegistry,
       tracker,
       permissionCoordinator: this.permissionCoordinator,
+      alwaysOn: {
+        getResidentState: async () =>
+          this.alwaysOn ? this.alwaysOn.buildResidentStateSummary() : null,
+        wakeMeAt: async (p) => {
+          if (!this.alwaysOn) {
+            throw new Error("Always-On 定时器存储未初始化");
+          }
+          const isSchedule =
+            typeof p.everySeconds === "number" && Number.isFinite(p.everySeconds);
+          const timer = await this.alwaysOn.createTimer({
+            kind: isSchedule ? "schedule" : "follow_up",
+            label: p.label?.trim() || p.note.trim().slice(0, 40) || "定时唤醒",
+            payload: p.note,
+            delay_seconds: p.delaySeconds,
+            at_iso: p.atIso,
+            every_seconds: p.everySeconds,
+            start_at_iso: p.startAtIso,
+            created_by: "agent",
+          });
+          await this.recomputeWakeup();
+          this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "timers" });
+          return timer;
+        },
+        cancelWake: async (timerId) => {
+          if (!this.alwaysOn) return null;
+          const timer = await this.alwaysOn.cancelTimer(timerId);
+          if (timer) {
+            await this.recomputeWakeup();
+            this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "timers" });
+          }
+          return timer;
+        },
+        listTimers: async (status) => {
+          if (!this.alwaysOn) return [];
+          return this.alwaysOn.listTimers(status);
+        },
+        notify: async (p) => {
+          if (!this.alwaysOn) {
+            throw new Error("Always-On Outbox 存储未初始化");
+          }
+          const dedupeKey =
+            p.dedupeKey?.trim() ||
+            (p.callId
+              ? `notify:${this.activeRunId ?? "direct"}:${p.callId}`
+              : null);
+          const firstLine = p.body
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .find(Boolean);
+          const title =
+            p.title?.trim() ||
+            (firstLine ? firstLine.slice(0, 60) : "Valet 通知");
+          const msg = await this.alwaysOn.appendOutbox({
+            run_id: this.activeRunId,
+            kind: "message",
+            title,
+            body: p.body,
+            detail: { level: p.level ?? "info" },
+            dedupe_key: dedupeKey,
+          });
+          this.bridge.notifyHost("host.outboxNotify", {
+            message: msg,
+            level: p.level ?? "info",
+          });
+          this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "outbox" });
+          return msg;
+        },
+      },
     });
 
     const builtinSkillsExt = createBuiltinSkillsExtension({
@@ -385,11 +499,19 @@ export class ValetDurableRuntime {
       (ext) => this.registry.uninstall(ext),
     );
 
-    const storage = await openUniversalSqliteStorage(
+    const { storage, db } = await openUniversalSqliteBundle(
       params.dbPath || join(params.state.dataDir, "pi-agent.sqlite"),
       { prefix: "pi_" },
     );
     this.storageClose = () => storage.close(BACKGROUND_CONTEXT);
+
+    if (db) {
+      this.alwaysOn = new ValetAlwaysOnStore(db, this.nowFn);
+      this.alwaysOn.setDebounceMs(
+        params.state.preferences.pluginRuntime?.debounceMs,
+      );
+      await this.alwaysOn.ensureSchema();
+    }
 
     this.harness = await Harness.open(
       storage,
@@ -419,6 +541,7 @@ export class ValetDurableRuntime {
     );
 
     this.harness.resume();
+    await this.recomputeWakeup();
     return { resumed: true };
   }
 
@@ -464,7 +587,11 @@ export class ValetDurableRuntime {
   }
 
   async syncState(nextState: ValetSyncState): Promise<{ ok: true }> {
+    const wasPaused = this.state.isPaused;
     this.state = nextState;
+    this.alwaysOn?.setDebounceMs(
+      nextState.preferences.pluginRuntime?.debounceMs,
+    );
     this.autoReviewer.clearCache();
     this.models.syncProviders(
       nextState.providers,
@@ -477,6 +604,11 @@ export class ValetDurableRuntime {
       (ext) => this.registry.install(ext),
       (ext) => this.registry.uninstall(ext),
     );
+    if (wasPaused && !nextState.isPaused) {
+      void this.alwaysOnTick();
+    } else {
+      await this.recomputeWakeup();
+    }
     return { ok: true };
   }
 
@@ -1208,10 +1340,302 @@ export class ValetDurableRuntime {
     };
   }
 
+  private requireAlwaysOn(): ValetAlwaysOnStore {
+    if (!this.alwaysOn) {
+      throw new Error("Always-On store is not initialized");
+    }
+    return this.alwaysOn;
+  }
+
+  private buildPluginSkillsMap(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const p of this.state.plugins) {
+      if (p.installed && p.enabled && p.skillMarkdown?.trim()) {
+        out[p.id] = p.skillMarkdown.trim();
+      }
+    }
+    return out;
+  }
+
+  private clearWakeupTimer(): void {
+    if (this.wakeupTimer !== null) {
+      clearTimeout(this.wakeupTimer);
+      this.wakeupTimer = null;
+    }
+  }
+
+  async recomputeWakeup(): Promise<number | null> {
+    this.clearWakeupTimer();
+    if (!this.alwaysOn || !this.harness || this.state.isPaused) {
+      return null;
+    }
+    const nextAt = await this.alwaysOn.computeNextAlarmAt();
+    if (nextAt === null) {
+      return null;
+    }
+    const delayMs = Math.max(0, Math.min(2_147_483_647, nextAt - this.nowFn()));
+    this.wakeupTimer = setTimeout(() => {
+      this.wakeupTimer = null;
+      void this.alwaysOnTick().catch((err) => {
+        console.error("[always-on] wakeup tick failed:", err);
+      });
+    }, delayMs);
+    if (typeof this.wakeupTimer === "object" && "unref" in this.wakeupTimer) {
+      this.wakeupTimer.unref();
+    }
+    return nextAt;
+  }
+
+  async alwaysOnTick(waitForRun = false): Promise<{
+    firedTimers: number;
+    claimedRunId: string | null;
+    nextAlarmAt: number | null;
+  }> {
+    let lastFired = 0;
+    let lastClaimedRunId: string | null = null;
+
+    this.tickRequested = true;
+    if (!this.tickInFlight) {
+      this.tickInFlight = (async () => {
+        while (this.tickRequested) {
+          this.tickRequested = false;
+          const res = await this.runAlwaysOnTick();
+          lastFired += res.firedTimers;
+          if (res.claimedRunId) {
+            lastClaimedRunId = res.claimedRunId;
+          }
+        }
+      })().finally(() => {
+        this.tickInFlight = null;
+      });
+    }
+    await this.tickInFlight;
+
+    if (waitForRun && this.activeRunPromise) {
+      await this.activeRunPromise;
+    }
+    const nextAlarmAt = await this.recomputeWakeup();
+    return {
+      firedTimers: lastFired,
+      claimedRunId: lastClaimedRunId,
+      nextAlarmAt,
+    };
+  }
+
+  private async runAlwaysOnTick(): Promise<{
+    firedTimers: number;
+    claimedRunId: string | null;
+  }> {
+    if (!this.alwaysOn || !this.harness) {
+      return { firedTimers: 0, claimedRunId: null };
+    }
+
+    // 1. Fire due timers atomically into Event Inbox
+    const firedTimers = await this.alwaysOn.fireDueTimers();
+    if (firedTimers > 0) {
+      this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "timers" });
+    }
+
+    // 2. Check active run lease / crash recovery
+    const activeRun = await this.alwaysOn.getActiveRun();
+    if (activeRun) {
+      const orphanedFromPreviousProcess =
+        this.activeRunId !== activeRun.id && this.activeRunPromise === null;
+      const leaseExpired = this.nowFn() >= activeRun.lease_until;
+      if (orphanedFromPreviousProcess || leaseExpired) {
+        if (this.activeRunChatId) {
+          await this.abortChat(this.activeRunChatId).catch(() => {});
+        }
+        const reason = orphanedFromPreviousProcess
+          ? "run_interrupted_on_restart"
+          : "run_lease_expired";
+        const failed = await this.alwaysOn.failRun(activeRun.id, reason);
+        for (const dl of failed?.deadLetters ?? []) {
+          this.bridge.notifyHost("host.outboxNotify", {
+            message: dl,
+            level: "warn",
+          });
+        }
+        this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "runs" });
+      }
+    }
+
+    // 3. Claim next ready coalesced batch if worker is idle and not paused
+    let claimedRunId: string | null = null;
+    if (!this.state.isPaused && !(await this.alwaysOn.getActiveRun())) {
+      const claimed = await this.alwaysOn.claimNextBatch({
+        pluginSkills: this.buildPluginSkillsMap(),
+      });
+      if (claimed) {
+        claimedRunId = claimed.run.id;
+        this.activeRunId = claimed.run.id;
+        this.activeRunChatId = claimed.chatId;
+        this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "runs" });
+        this.activeRunPromise = this.executeClaimedBatch(claimed).finally(() => {
+          this.activeRunPromise = null;
+        });
+      }
+    }
+
+    await this.recomputeWakeup();
+    return { firedTimers, claimedRunId };
+  }
+
+  private async executeClaimedBatch(claimed: ClaimedBatch): Promise<void> {
+    const store = this.alwaysOn;
+    if (!store) return;
+
+    const conv = await this.ensureConversation(claimed.chatId);
+    this.permissionCoordinator.setConversationTainted(
+      conv.id,
+      claimed.run.tainted === 1,
+    );
+
+    const model =
+      this.state.preferences.models.fast ||
+      this.state.preferences.models.primary;
+
+    try {
+      const res = await this.sendChat({
+        chatId: claimed.chatId,
+        prompt: claimed.promptText,
+        model,
+        interactive: false,
+        requestId: `run:${claimed.run.id}`,
+      });
+      await store.completeRun(claimed.run.id, res.replyMessage.content, {
+        deferredCount: res.queuedInboxIds.length,
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const failed = await store.failRun(claimed.run.id, errMsg);
+      for (const dl of failed?.deadLetters ?? []) {
+        this.bridge.notifyHost("host.outboxNotify", {
+          message: dl,
+          level: "warn",
+        });
+      }
+    } finally {
+      this.permissionCoordinator.setConversationTainted(conv.id, false);
+      this.activeRunId = null;
+      this.activeRunChatId = null;
+      this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "runs" });
+      if (this.harness) {
+        void this.alwaysOnTick().catch((err) => {
+          console.error("[always-on] post-run tick failed:", err);
+        });
+      }
+    }
+  }
+
+  async alwaysOnIngest(input: IngestInboxInput): Promise<{
+    item: Awaited<ReturnType<ValetAlwaysOnStore["ingestInboxEvent"]>>["item"];
+    deduplicated: boolean;
+    immediate: boolean;
+  }> {
+    const store = this.requireAlwaysOn();
+    const res = await store.ingestInboxEvent(input);
+    if (!res.deduplicated) {
+      this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "inbox" });
+      if (res.immediate && !this.state.isPaused && !(await store.getActiveRun())) {
+        void this.alwaysOnTick().catch((err) => {
+          console.error("[always-on] immediate tick failed:", err);
+        });
+      } else {
+        await this.recomputeWakeup();
+      }
+    }
+    return res;
+  }
+
+  async alwaysOnSnapshot(opts?: {
+    inboxLimit?: number;
+    runsLimit?: number;
+    timersLimit?: number;
+    outboxLimit?: number;
+    inboxStatus?: AlwaysOnInboxStatus;
+    timerStatus?: AlwaysOnTimerStatus;
+  }): Promise<{
+    stats: AlwaysOnStats;
+    activeRun: AlwaysOnRunRecord | null;
+    inbox: Awaited<ReturnType<ValetAlwaysOnStore["listInbox"]>>;
+    runs: AlwaysOnRunRecord[];
+    timers: AlwaysOnTimerRecord[];
+    outbox: { messages: AlwaysOnOutboxMessage[]; unread_count: number };
+  }> {
+    const store = this.requireAlwaysOn();
+    const [stats, activeRunRow, inbox, runs, timers, outbox] = await Promise.all([
+      store.getStats(),
+      store.getActiveRun(),
+      store.listInbox(opts?.inboxLimit ?? 50, opts?.inboxStatus),
+      store.listRuns(opts?.runsLimit ?? 30),
+      store.listTimers(opts?.timerStatus, opts?.timersLimit ?? 50),
+      store.listOutbox(opts?.outboxLimit ?? 50),
+    ]);
+    const activeRun = activeRunRow
+      ? runs.find((r) => r.id === activeRunRow.id) ?? null
+      : null;
+    return { stats, activeRun, inbox, runs, timers, outbox };
+  }
+
+  async alwaysOnRetryInbox(itemId: string) {
+    const store = this.requireAlwaysOn();
+    const item = await store.retryInboxItem(itemId);
+    if (item) {
+      this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "inbox" });
+      if (!this.state.isPaused && !(await store.getActiveRun())) {
+        void this.alwaysOnTick().catch(() => {});
+      } else {
+        await this.recomputeWakeup();
+      }
+    }
+    return item;
+  }
+
+  async alwaysOnCreateTimer(input: CreateTimerInput): Promise<AlwaysOnTimerRecord> {
+    const store = this.requireAlwaysOn();
+    const timer = await store.createTimer({
+      ...input,
+      created_by: input.created_by ?? "user",
+    });
+    await this.recomputeWakeup();
+    this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "timers" });
+    return timer;
+  }
+
+  async alwaysOnCancelTimer(timerId: string): Promise<AlwaysOnTimerRecord | null> {
+    const store = this.requireAlwaysOn();
+    const timer = await store.cancelTimer(timerId);
+    if (timer) {
+      await this.recomputeWakeup();
+      this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "timers" });
+    }
+    return timer;
+  }
+
+  async alwaysOnMarkOutboxRead(msgId: string): Promise<AlwaysOnOutboxMessage | null> {
+    const store = this.requireAlwaysOn();
+    const msg = await store.markOutboxRead(msgId);
+    if (msg) {
+      this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "outbox" });
+    }
+    return msg;
+  }
+
+  async alwaysOnMarkAllOutboxRead(): Promise<{ cleared: number }> {
+    const store = this.requireAlwaysOn();
+    const cleared = await store.markAllOutboxRead();
+    if (cleared > 0) {
+      this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "outbox" });
+    }
+    return { cleared };
+  }
+
   async inspect(): Promise<Record<string, unknown>> {
     const harness = this.requireHarness();
     const state = await harness.inspect(BACKGROUND_CONTEXT);
     const usage = await harness.usage(BACKGROUND_CONTEXT);
+    const alwaysOnStats = this.alwaysOn ? await this.alwaysOn.getStats() : null;
     return {
       installedExtensions: this.registry
         .snapshot()
@@ -1222,16 +1646,19 @@ export class ValetDurableRuntime {
         .tools()
         .map((t) => t.tool.name),
       tasksCount: state.tasks.length,
+      alwaysOn: alwaysOnStats,
       usage,
     };
   }
 
   async close(): Promise<void> {
+    this.clearWakeupTimer();
     await this.mcp.closeAll();
     if (this.harness) {
       await this.harness.close(BACKGROUND_CONTEXT);
       this.harness = null;
     }
+    this.alwaysOn = null;
     if (this.storageClose) {
       await this.storageClose();
       this.storageClose = null;

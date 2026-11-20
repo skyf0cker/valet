@@ -6,10 +6,37 @@ import {
 } from "@earendil-works/pi-durable";
 import { arr, bool, num, obj, opt, str } from "@earendil-works/pi-schema";
 import type {
+  AlwaysOnOutboxMessage,
+  AlwaysOnTimerRecord,
+  AlwaysOnTimerStatus,
+  ResidentStateInfo,
+} from "../always-on.ts";
+import type {
   InteractivePermissionCoordinator,
   ToolPolicyRegistry,
   TurnSideEffectTracker,
 } from "../approval.ts";
+
+export interface AlwaysOnToolBridge {
+  getResidentState(): Promise<ResidentStateInfo | null>;
+  wakeMeAt(params: {
+    delaySeconds?: number;
+    atIso?: string;
+    everySeconds?: number;
+    startAtIso?: string;
+    label?: string;
+    note: string;
+  }): Promise<AlwaysOnTimerRecord>;
+  cancelWake(timerId: string): Promise<AlwaysOnTimerRecord | null>;
+  listTimers(status?: AlwaysOnTimerStatus): Promise<AlwaysOnTimerRecord[]>;
+  notify(params: {
+    title?: string;
+    body: string;
+    level?: "info" | "warn" | "urgent";
+    dedupeKey?: string;
+    callId?: string;
+  }): Promise<AlwaysOnOutboxMessage>;
+}
 import type {
   HostBridge,
   PluginDraftSpec,
@@ -38,8 +65,16 @@ export function createStewardCoreExtension(options: {
   policyRegistry: ToolPolicyRegistry;
   tracker?: TurnSideEffectTracker;
   permissionCoordinator?: InteractivePermissionCoordinator;
+  alwaysOn?: AlwaysOnToolBridge;
 }): Extension {
-  const { bridge, getState, policyRegistry, tracker, permissionCoordinator } = options;
+  const {
+    bridge,
+    getState,
+    policyRegistry,
+    tracker,
+    permissionCoordinator,
+    alwaysOn,
+  } = options;
 
   policyRegistry.registerAll([
     {
@@ -203,6 +238,58 @@ export function createStewardCoreExtension(options: {
       iconKind: "disk",
       reversible7d: true,
       approveLabel: "批准执行",
+      dismissLabel: "取消",
+    },
+    {
+      toolName: "wake_me_at",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "timer.create",
+      eventCode: "timer.armed",
+      safety: "readonly",
+      category: "process",
+      iconKind: "pulse",
+      reversible7d: false,
+      approveLabel: "确定",
+      dismissLabel: "取消",
+    },
+    {
+      toolName: "cancel_wake",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "timer.cancel",
+      eventCode: "timer.cancelled",
+      safety: "readonly",
+      category: "process",
+      iconKind: "pulse",
+      reversible7d: false,
+      approveLabel: "确定",
+      dismissLabel: "取消",
+    },
+    {
+      toolName: "list_timers",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "timer.list",
+      eventCode: "timer.listed",
+      safety: "readonly",
+      category: "process",
+      iconKind: "pulse",
+      reversible7d: false,
+      approveLabel: "确定",
+      dismissLabel: "取消",
+    },
+    {
+      toolName: "notify",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "outbox.notify",
+      eventCode: "outbox.sent",
+      safety: "readonly",
+      category: "outbound",
+      iconKind: "mail",
+      reversible7d: false,
+      approveLabel: "确定",
       dismissLabel: "取消",
     },
   ]);
@@ -830,6 +917,152 @@ export function createStewardCoreExtension(options: {
     },
   });
 
+  const wakeMeAtTool = defineTool({
+    name: "wake_me_at",
+    description:
+      "Schedule a durable self-wake timer (one-shot follow_up via delaySeconds/atIso, or drift-free periodic schedule via everySeconds >= 60). When due, the timer fires atomically into Valet's Event Inbox.",
+    parameters: obj({
+      delaySeconds: opt(
+        num({
+          description:
+            "One-shot delay in seconds (10 to 2592000). Mutually exclusive with atIso/everySeconds.",
+        }),
+      ),
+      atIso: opt(
+        str({
+          description:
+            "One-shot future ISO-8601 timestamp (e.g. 2026-11-20T18:00:00+08:00).",
+        }),
+      ),
+      everySeconds: opt(
+        num({
+          description:
+            "Periodic interval in seconds (>= 60) for a drift-free repeating schedule timer.",
+        }),
+      ),
+      startAtIso: opt(
+        str({
+          description:
+            "Optional ISO-8601 anchor time for periodic schedule timers.",
+        }),
+      ),
+      label: opt(str({ description: "Short human-readable timer label." })),
+      note: str({
+        description:
+          "Context / instructions delivered back to you when the timer fires.",
+      }),
+    }),
+    execute: async (args) => {
+      if (!alwaysOn) {
+        return {
+          output: [{ type: "text" as const, text: "Always-On 定时器引擎未初始化。" }],
+          isError: true,
+        };
+      }
+      const timer = await alwaysOn.wakeMeAt({
+        delaySeconds: args.delaySeconds,
+        atIso: args.atIso,
+        everySeconds: args.everySeconds,
+        startAtIso: args.startAtIso,
+        label: args.label,
+        note: args.note,
+      });
+      return textResult(
+        `已创建定时器 ${timer.id}（${timer.kind === "schedule" ? `周期每 ${Math.round((timer.every_ms ?? 60_000) / 1000)}s` : "一次性"}）：${timer.label}，下次触发时间 ${timer.due_at}`,
+        { timer: timer as never },
+      );
+    },
+  });
+
+  const cancelWakeTool = defineTool({
+    name: "cancel_wake",
+    description: "Cancel an armed self-wake timer by its timerId.",
+    parameters: obj({
+      timerId: str({ description: "Target timer ID (e.g. tmr_...)." }),
+    }),
+    execute: async (args) => {
+      if (!alwaysOn) {
+        return {
+          output: [{ type: "text" as const, text: "Always-On 定时器引擎未初始化。" }],
+          isError: true,
+        };
+      }
+      const timer = await alwaysOn.cancelWake(args.timerId);
+      if (!timer) {
+        return textResult(`未找到定时器 ${args.timerId}`);
+      }
+      return textResult(`已取消定时器 ${timer.id}（${timer.label}）`, {
+        timer: timer as never,
+      });
+    },
+  });
+
+  const listTimersTool = defineTool({
+    name: "list_timers",
+    description:
+      "List durable self-wake timers (optional status filter: armed | done | cancelled).",
+    parameters: obj({
+      status: opt(
+        str({ description: "Optional status filter: armed, done, or cancelled." }),
+      ),
+    }),
+    replay: "safe",
+    execute: async (args) => {
+      if (!alwaysOn) {
+        return textResult(JSON.stringify({ timers: [] }));
+      }
+      const status =
+        args.status === "armed" ||
+        args.status === "done" ||
+        args.status === "cancelled"
+          ? args.status
+          : undefined;
+      const timers = await alwaysOn.listTimers(status);
+      return textResult(JSON.stringify({ timers }, null, 2), {
+        timers: timers as never,
+      });
+    },
+  });
+
+  const notifyTool = defineTool({
+    name: "notify",
+    description:
+      "Send an explicit proactive notification to Valet Outbox (quiet-by-default). Use during background event/timer/heartbeat runs ONLY when there is an actionable finding, anomaly, or milestone the user needs to know about.",
+    parameters: obj({
+      title: opt(str({ description: "Concise notification title." })),
+      body: str({ description: "Clear notification body in Chinese." }),
+      level: opt(
+        str({ description: "Notification urgency: info | warn | urgent." }),
+      ),
+      dedupeKey: opt(
+        str({
+          description:
+            "Optional idempotency key to avoid duplicate notifications.",
+        }),
+      ),
+    }),
+    execute: async (args, api) => {
+      if (!alwaysOn) {
+        return {
+          output: [{ type: "text" as const, text: "Always-On Outbox 未初始化。" }],
+          isError: true,
+        };
+      }
+      const level =
+        args.level === "warn" || args.level === "urgent" ? args.level : "info";
+      const msg = await alwaysOn.notify({
+        title: args.title,
+        body: args.body,
+        level,
+        dedupeKey: args.dedupeKey,
+        callId: api.callId,
+      });
+      return textResult(`已写入 Outbox 通知 ${msg.id}：${msg.title}`, {
+        outboxMessage: msg as never,
+      });
+    },
+  });
+
   return defineExtension({
     name: "valet:core",
     sections: [
@@ -925,6 +1158,28 @@ export function createStewardCoreExtension(options: {
           "- 外部 MCP 扩展（valet:mcp:*）：通过 stdio / HTTP 接入的外部工具服务器。",
         ].join("\n");
       }),
+      section("valet_resident_state", async () => {
+        if (!alwaysOn) return undefined;
+        const resident = await alwaysOn.getResidentState();
+        if (!resident) return undefined;
+        const lines: string[] = [
+          "## Always-On 常驻运行状态（Resident State）",
+          `- 事件队列：待处理 ${resident.inboxQueued} 条，死信 ${resident.inboxDead} 条（合批防抖窗口 ${resident.debounceMs}ms）；Outbox 未读通知 ${resident.outboxUnread} 条。`,
+          "- 后台静默原则（Quiet-by-Default）：处理 `<inbox_batch>`、`<plugin_event>`、`<webhook_event>`、`<timer_event>`、`<heartbeat_event>` 时默认保持静默，仅当确实需要用户关注、决策或交付结果时调用 `notify`（或提交审批卡）。",
+          "- 自我唤醒定时：如需延后复查状态或建立周期巡检，请调用 `wake_me_at` / `cancel_wake` / `list_timers`，不要无意义空转。",
+        ];
+        if (resident.armedTimers.length > 0) {
+          lines.push("### 已武装定时器（timers）");
+          for (const tm of resident.armedTimers) {
+            const interval =
+              tm.everyMs !== null ? `, 每 ${Math.round(tm.everyMs / 1000)}s` : "";
+            lines.push(
+              `- ${tm.id} [${tm.kind}${interval}] ${tm.label} @ ${tm.dueAt}`,
+            );
+          }
+        }
+        return lines.join("\n");
+      }),
     ],
     tools: [
       systemOverviewTool,
@@ -939,6 +1194,10 @@ export function createStewardCoreExtension(options: {
       pluginDraftCreateTool,
       inboxProposeApprovalTool,
       itemResolveTool,
+      wakeMeAtTool,
+      cancelWakeTool,
+      listTimersTool,
+      notifyTool,
     ],
   });
 }

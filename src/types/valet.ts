@@ -81,6 +81,7 @@ export interface PluginRuntimeSettings {
   maxEventsPerHour: string;
   quietHours: string;
   webhookEndpoint?: string;
+  debounceMs?: number;
 }
 
 export type OnboardingStepId = 1 | 2 | 3 | 4 | 5;

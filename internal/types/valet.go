@@ -40,6 +40,7 @@ type PluginRuntimeSettings struct {
 	MaxEventsPerHour   string `json:"maxEventsPerHour"`
 	QuietHours         string `json:"quietHours"`
 	WebhookEndpoint    string `json:"webhookEndpoint,omitempty"`
+	DebounceMs         int    `json:"debounceMs,omitempty"`
 }
 
 // PermissionGuideStep describes one step in the permission grant wizard.
@@ -672,4 +673,109 @@ func NormalizeDarkTheme(raw string) string {
 	default:
 		return "obsidian"
 	}
+}
+
+// AlwaysOnInboxItem represents a durable queued/batched event in the sidecar Always-On Inbox.
+type AlwaysOnInboxItem struct {
+	ID            string  `json:"id"`
+	EventID       *string `json:"event_id"`
+	Source        string  `json:"source"`
+	PluginID      *string `json:"plugin_id"`
+	EventType     string  `json:"event_type"`
+	Title         string  `json:"title"`
+	Payload       string  `json:"payload"`
+	Trusted       bool    `json:"trusted"`
+	ThreadKey     *string `json:"thread_key"`
+	Status        string  `json:"status"` // "queued" | "in_run" | "done" | "dead"
+	Attempts      int     `json:"attempts"`
+	NextAttemptAt *string `json:"next_attempt_at"`
+	RunID         *string `json:"run_id"`
+	AgentReply    *string `json:"agent_reply"`
+	Error         *string `json:"error"`
+	CreatedAt     string  `json:"created_at"`
+	UpdatedAt     string  `json:"updated_at"`
+}
+
+// AlwaysOnRun represents one coalesced batch execution run in the Always-On engine.
+type AlwaysOnRun struct {
+	ID         string   `json:"id"`
+	Status     string   `json:"status"`   // "running" | "done" | "failed"
+	EndKind    *string  `json:"end_kind"` // "sent" | "silent" | "deferred" | "error"
+	EventIDs   []string `json:"event_ids"`
+	HasChat    bool     `json:"has_chat"`
+	Tainted    bool     `json:"tainted"`
+	ReplyText  *string  `json:"reply_text"`
+	Error      *string  `json:"error"`
+	LeaseUntil string   `json:"lease_until"`
+	StartedAt  string   `json:"started_at"`
+	EndedAt    *string  `json:"ended_at"`
+}
+
+// AlwaysOnTimer represents a durable follow_up or drift-free schedule timer.
+type AlwaysOnTimer struct {
+	ID          string  `json:"id"`
+	Kind        string  `json:"kind"` // "follow_up" | "schedule"
+	Label       string  `json:"label"`
+	Payload     string  `json:"payload"`
+	DueAt       string  `json:"due_at"`
+	EveryMs     *int64  `json:"every_ms"`
+	AnchorAt    *string `json:"anchor_at"`
+	Status      string  `json:"status"` // "armed" | "done" | "cancelled"
+	FireCount   int     `json:"fire_count"`
+	LastFiredAt *string `json:"last_fired_at"`
+	CreatedBy   string  `json:"created_by"` // "agent" | "user"
+	CreatedAt   string  `json:"created_at"`
+	UpdatedAt   string  `json:"updated_at"`
+}
+
+// AlwaysOnOutboxMessage represents a quiet-by-default proactive notification or dead-letter alert.
+type AlwaysOnOutboxMessage struct {
+	ID        string         `json:"id"`
+	RunID     *string        `json:"run_id"`
+	Kind      string         `json:"kind"` // "message" | "approval_request" | "dead_letter"
+	Title     string         `json:"title"`
+	Body      string         `json:"body"`
+	CallID    *string        `json:"call_id"`
+	Detail    map[string]any `json:"detail"`
+	ReadAt    *string        `json:"read_at"`
+	CreatedAt string         `json:"created_at"`
+}
+
+// AlwaysOnStats summarizes current Always-On queue, timer, and outbox counts.
+type AlwaysOnStats struct {
+	InboxTotal   int `json:"inbox_total"`
+	InboxPending int `json:"inbox_pending"`
+	InboxQueued  int `json:"inbox_queued"`
+	InboxInRun   int `json:"inbox_in_run"`
+	InboxDead    int `json:"inbox_dead"`
+	TimersArmed  int `json:"timers_armed"`
+	OutboxUnread int `json:"outbox_unread"`
+	DebounceMs   int `json:"debounce_ms"`
+}
+
+// AlwaysOnOutboxList holds outbox messages and unread count.
+type AlwaysOnOutboxList struct {
+	Messages    []AlwaysOnOutboxMessage `json:"messages"`
+	UnreadCount int                     `json:"unread_count"`
+}
+
+// AlwaysOnSnapshot aggregates the Always-On engine's durable state for UI/CLI inspection.
+type AlwaysOnSnapshot struct {
+	Stats     AlwaysOnStats       `json:"stats"`
+	ActiveRun *AlwaysOnRun        `json:"activeRun"`
+	Inbox     []AlwaysOnInboxItem `json:"inbox"`
+	Runs      []AlwaysOnRun       `json:"runs"`
+	Timers    []AlwaysOnTimer     `json:"timers"`
+	Outbox    AlwaysOnOutboxList  `json:"outbox"`
+}
+
+// CreateAlwaysOnTimerParams defines parameters for creating a durable follow_up or schedule timer.
+type CreateAlwaysOnTimerParams struct {
+	Kind         string   `json:"kind"` // "follow_up" | "schedule"
+	Label        string   `json:"label"`
+	Payload      string   `json:"payload"`
+	DelaySeconds *float64 `json:"delay_seconds,omitempty"`
+	AtISO        string   `json:"at_iso,omitempty"`
+	EverySeconds *float64 `json:"every_seconds,omitempty"`
+	StartAtISO   string   `json:"start_at_iso,omitempty"`
 }

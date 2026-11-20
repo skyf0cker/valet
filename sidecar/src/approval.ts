@@ -65,9 +65,22 @@ export class InteractivePermissionCoordinator {
   >();
   private readonly sessionAllowedTools = new Map<string, Set<string>>();
   private readonly chatUserIntents = new Map<string, string[]>();
+  private readonly taintedConversations = new Set<ConversationId>();
 
   setConversationChatId(convId: ConversationId, chatId: string): void {
     this.convToChatId.set(convId, chatId);
+  }
+
+  setConversationTainted(convId: ConversationId, tainted: boolean): void {
+    if (tainted) {
+      this.taintedConversations.add(convId);
+    } else {
+      this.taintedConversations.delete(convId);
+    }
+  }
+
+  isTainted(convId: ConversationId): boolean {
+    return this.taintedConversations.has(convId);
   }
 
   getChatId(convId: ConversationId): string | undefined {
@@ -111,6 +124,7 @@ export class InteractivePermissionCoordinator {
       !chatId.startsWith("event:") &&
       !chatId.startsWith("heartbeat:") &&
       !chatId.startsWith("automation:") &&
+      !chatId.startsWith("always-on:") &&
       !chatId.startsWith("approved:")
     ) {
       this.interactiveChats.add(chatId);
@@ -1469,8 +1483,13 @@ export function createSafetyExtension(options: {
           }
 
           let decisionReason: string;
+          const isTainted =
+            permissionCoordinator?.isTainted(api.conversationId) ?? false;
           if (decision.outcome === "review") {
-            if (autoReviewer) {
+            if (isTainted && meta.safety !== "readonly") {
+              decisionReason =
+                "当前后台事件批次包含外部不可信输入（tainted），出于安全策略，所有写操作需经人工审批后执行。";
+            } else if (autoReviewer) {
               const reviewRes = await autoReviewer.evaluate({
                 toolName: call.name,
                 args,
