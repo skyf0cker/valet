@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"valet/internal/sidecar"
 	"valet/internal/store"
 	"valet/internal/sys"
 	"valet/internal/types"
@@ -1689,5 +1690,133 @@ triggers:
 		if item.Source != "webhook" {
 			t.Fatalf("expected source=webhook, got %q", item.Source)
 		}
+	}
+}
+
+func TestTimelineEventNotificationsAndCommandFiltering(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(dataDir, homeDir)
+	if err != nil {
+		t.Fatalf("store.Open failed: %v", err)
+	}
+
+	type notifyCall struct {
+		kind, title, subtitle, body string
+	}
+	var calls []notifyCall
+	svc := &Service{
+		store:        st,
+		createdInbox: make(map[string]types.InboxApprovalItem),
+		createdEvent: make(map[string]types.TimelineEvent),
+		opts: StartOptions{
+			OnNotify: func(kind, title, subtitle, body string) {
+				calls = append(calls, notifyCall{kind: kind, title: title, subtitle: subtitle, body: body})
+			},
+		},
+	}
+
+	ctx := context.Background()
+
+	// 1. valet-core system.command must be filtered at runtime and never trigger desktop notifications
+	cmdRaw, _ := json.Marshal(sidecar.RecordTimelineRequest{
+		PluginID:   "valet-core",
+		PluginName: "Valet Core",
+		EventCode:  "system.command",
+		Title:      "已执行命令：T=secret curl /api/config",
+		Summary:    "exit=0",
+		Status:     "completed",
+	})
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.recordTimelineEvent", cmdRaw); err != nil {
+		t.Fatalf("handleSidecarHostRequest(system.command) failed: %v", err)
+	}
+	if len(st.Snapshot().TimelineEvents) != 0 {
+		t.Fatalf("expected system.command to be skipped from TimelineEvents, got %+v", st.Snapshot().TimelineEvents)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("expected no desktop notification for system.command, got %+v", calls)
+	}
+
+	// 2. Completed timeline events write to TimelineEvents but do NOT pop desktop notifications
+	fsRaw, _ := json.Marshal(sidecar.RecordTimelineRequest{
+		PluginID:   "valet-core",
+		PluginName: "Valet Core",
+		EventCode:  "fs.modified",
+		Title:      "写入文件：/tmp/demo.txt",
+		Summary:    "写入 12 字节",
+		Status:     "completed",
+	})
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.recordTimelineEvent", fsRaw); err != nil {
+		t.Fatalf("handleSidecarHostRequest(fs.modified completed) failed: %v", err)
+	}
+	if len(st.Snapshot().TimelineEvents) != 1 {
+		t.Fatalf("expected 1 TimelineEvent after fs.modified, got %d", len(st.Snapshot().TimelineEvents))
+	}
+	if len(calls) != 0 {
+		t.Fatalf("expected no desktop notification for completed timeline event, got %+v", calls)
+	}
+
+	// 3. Failed timeline events respect NotifyOnFailure
+	failRaw, _ := json.Marshal(sidecar.RecordTimelineRequest{
+		PluginID:   "valet-core",
+		PluginName: "Valet Core",
+		EventCode:  "fs.modified",
+		Title:      "写入失败",
+		Summary:    "permission denied",
+		Status:     "failed",
+	})
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.recordTimelineEvent", failRaw); err != nil {
+		t.Fatalf("handleSidecarHostRequest(fs.modified failed off) failed: %v", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("expected no fail notification while NotifyOnFailure=false, got %+v", calls)
+	}
+
+	st.Update(func(snap *types.ValetSnapshot) {
+		snap.Preferences.NotifyOnFailure = true
+	})
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.recordTimelineEvent", failRaw); err != nil {
+		t.Fatalf("handleSidecarHostRequest(fs.modified failed on) failed: %v", err)
+	}
+	if len(calls) != 1 || calls[0].kind != "fail" {
+		t.Fatalf("expected 1 fail notification when NotifyOnFailure=true, got %+v", calls)
+	}
+
+	// 4. Proactive Outbox notifications follow NotifyOnComplete while still recording timeline entry
+	calls = nil
+	svc.handleAlwaysOnOutboxNotify(sidecar.AlwaysOnOutboxNotifyPayload{
+		Level: "info",
+		Message: types.AlwaysOnOutboxMessage{
+			ID:    "outbox-1",
+			Kind:  "message",
+			Title: "后台巡检完成",
+			Body:  "发现 1 项需关注变更",
+		},
+	})
+	if len(calls) != 1 || calls[0].kind != "info" || calls[0].title != "后台巡检完成" {
+		t.Fatalf("expected 1 outbox notification when NotifyOnComplete=true, got %+v", calls)
+	}
+
+	st.Update(func(snap *types.ValetSnapshot) {
+		snap.Preferences.NotifyOnComplete = false
+	})
+	svc.handleAlwaysOnOutboxNotify(sidecar.AlwaysOnOutboxNotifyPayload{
+		Level: "info",
+		Message: types.AlwaysOnOutboxMessage{
+			ID:    "outbox-2",
+			Kind:  "message",
+			Title: "静默汇报",
+			Body:  "仅记录时间线",
+		},
+	})
+	if len(calls) != 1 {
+		t.Fatalf("expected no outbox notification when NotifyOnComplete=false, got %+v", calls)
+	}
+	if len(st.Snapshot().TimelineEvents) != 5 {
+		t.Fatalf("expected 5 TimelineEvents total, got %d", len(st.Snapshot().TimelineEvents))
 	}
 }

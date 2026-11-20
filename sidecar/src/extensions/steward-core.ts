@@ -328,13 +328,9 @@ export function createStewardCoreExtension(options: {
         cwd: args.cwd,
         timeoutSec: args.timeoutSec,
       });
-      const rawCmd = args.command.trim().replace(/\s+/g, " ");
-      const shortCmd = rawCmd.length > 40 ? `${rawCmd.slice(0, 39)}…` : rawCmd;
       const body = `[exit=${res.exitCode}, cwd=${res.cwd}, ${res.durationMs}ms]\n${res.output || "(无标准输出)"}`;
       const details = {
         bashResult: res,
-        timelineTitle: `已执行命令：${shortCmd}`,
-        timelineSummary: res.summary,
         canRestore: false,
       };
       if (res.exitCode !== 0 && !res.ok) {

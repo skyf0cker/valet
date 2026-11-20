@@ -1584,13 +1584,11 @@ export function createSafetyExtension(options: {
           }
           const meta = policyRegistry.get(call.name);
           if (!meta || meta.safety === "readonly") return result;
+          // Raw shell command executions (`valet-core` / `system.command`) are low-level
+          // execution steps stripped from Timeline on load and must not emit Timeline cards
+          // or desktop notifications.
           if (call.name === "bash") {
-            const rawCmd = String(
-              ((call.arguments ?? {}) as Record<string, unknown>).command ?? "",
-            );
-            if (isReadOnlyBashCommand(rawCmd)) {
-              return result;
-            }
+            return result;
           }
 
           const details =

@@ -1522,6 +1522,14 @@ triggers:
     expect(execRes.output).toContain("mock-bash-output");
     expect(bridge.bashCalls.length).toBe(4);
     expect(bridge.bashCalls[3]?.command).toBe("brew cleanup");
+    expect(
+      bridge.recorded.filter((r) => r.eventCode === "system.command").length,
+    ).toBe(0);
+    expect(
+      bridge.recorded.some(
+        (r) => typeof r.title === "string" && r.title.includes("已执行命令"),
+      ),
+    ).toBe(false);
 
     // 3. Forbidden commands targeting ~/.ssh or sudo are hard-denied before approval or execution
     expect(

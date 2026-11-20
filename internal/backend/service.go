@@ -687,6 +687,7 @@ func (s *Service) handleSidecarNotify(method string, params json.RawMessage) {
 
 func (s *Service) handleAlwaysOnOutboxNotify(payload sidecar.AlwaysOnOutboxNotifyPayload) {
 	msg := payload.Message
+	prefs := s.store.Snapshot().Preferences
 	s.mu.Lock()
 	onNotify := s.opts.OnNotify
 	s.mu.Unlock()
@@ -695,10 +696,14 @@ func (s *Service) handleAlwaysOnOutboxNotify(payload sidecar.AlwaysOnOutboxNotif
 		if kind == "" {
 			kind = "info"
 		}
+		shouldNotify := prefs.NotifyOnComplete
 		if msg.Kind == "dead_letter" {
 			kind = "warn"
+			shouldNotify = prefs.NotifyOnFailure || prefs.NotifyOnConfirm
 		}
-		onNotify(kind, msg.Title, "Valet 管家通知", msg.Body)
+		if shouldNotify {
+			onNotify(kind, msg.Title, "Valet 管家通知", msg.Body)
+		}
 	}
 
 	status := "completed"
@@ -984,14 +989,13 @@ func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, r
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
+		if req.PluginID == "valet-core" && (req.EventCode == "system.command" || req.EventCode == "user.question") {
+			return map[string]string{"timelineEventId": ""}, nil
+		}
 		out := s.recordTimelineFromAgent(req)
 		s.recordPluginTriggerStat(req.PluginID, req.EventCode, req.Title)
-		if s.opts.OnNotify != nil {
-			if req.Status == "failed" && snap.Preferences.NotifyOnFailure {
-				s.opts.OnNotify("fail", req.Title, req.PluginName, req.Summary)
-			} else if req.Status == "completed" && snap.Preferences.NotifyOnComplete {
-				s.opts.OnNotify("complete", req.Title, req.PluginName, req.Summary)
-			}
+		if s.opts.OnNotify != nil && req.Status == "failed" && snap.Preferences.NotifyOnFailure {
+			s.opts.OnNotify("fail", req.Title, req.PluginName, req.Summary)
 		}
 		return out, nil
 
