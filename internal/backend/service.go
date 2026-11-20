@@ -62,10 +62,11 @@ type Service struct {
 	controlFilePath string
 	cliOnce         sync.Once
 	cliBinPath      string
-	stopMetrics     chan struct{}
-	trashMover      sys.TrashMover
-	createdInbox    map[string]types.InboxApprovalItem
-	createdEvent    map[string]types.TimelineEvent
+	stopMetrics        chan struct{}
+	trashMover         sys.TrashMover
+	elevatedTrashMover sys.ElevatedTrashMover
+	createdInbox       map[string]types.InboxApprovalItem
+	createdEvent       map[string]types.TimelineEvent
 }
 
 // NewService constructs a zero-I/O Service safe to pass to mygo.Bind before App.Run / MYGO_GENERATE.
@@ -149,10 +150,12 @@ func (s *Service) start(opts StartOptions) error {
 	}
 
 	var mover sys.TrashMover
+	var elevatedMover sys.ElevatedTrashMover
 	if !opts.UseVaultOnly && opts.DesktopReady {
 		mover = func(absPath, _ string) (string, error) {
 			return mygo.Shell.TrashItemResult(absPath)
 		}
+		elevatedMover = sys.MacOSElevatedTrashMover
 	}
 
 	bunBin := resolveBunBinaryWithOpts(opts)
@@ -185,6 +188,7 @@ func (s *Service) start(opts StartOptions) error {
 	s.client = client
 	s.engine = eng
 	s.trashMover = mover
+	s.elevatedTrashMover = elevatedMover
 	s.stopMetrics = make(chan struct{})
 	s.started = true
 	s.mu.Unlock()
@@ -1513,26 +1517,32 @@ func (s *Service) execKernelTrashFiles(snap types.ValetSnapshot, raw json.RawMes
 	if snap.Preferences.CleanupPolicy.DeleteMethod == "安全移出到隔离区" {
 		activeMover = nil
 	}
-	batchID, movedCount, reclaimedGB, err := sys.MoveItemsToTrash(
+	trashRes, err := sys.MoveItemsToTrashWithReport(
 		s.opts.HomeDir,
 		s.opts.DataDir,
 		snap.Preferences.CleanupPolicy.ProtectedDirs,
 		cleanPaths,
 		0,
 		activeMover,
+		s.elevatedTrashMover,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if movedCount > 0 {
+	if trashRes.MovedCount > 0 {
 		s.refreshHostMetrics()
+	}
+	summary := fmt.Sprintf("已将 %d 项移入废纸篓（释放约 %.2f GB，7 天内可还原）", trashRes.MovedCount, trashRes.ReclaimedGB)
+	if len(trashRes.Failed) > 0 {
+		summary += "；已跳过无权限项：" + sys.FormatTrashFailureSummary(trashRes.Failed)
 	}
 	return map[string]any{
 		"ok":          true,
-		"batchId":     batchID,
-		"movedCount":  movedCount,
-		"reclaimedGB": reclaimedGB,
-		"summary":     fmt.Sprintf("已将 %d 项移入废纸篓（释放约 %.2f GB，7 天内可还原）", movedCount, reclaimedGB),
+		"batchId":     trashRes.BatchID,
+		"movedCount":  trashRes.MovedCount,
+		"reclaimedGB": trashRes.ReclaimedGB,
+		"failed":      trashRes.Failed,
+		"summary":     summary,
 	}, nil
 }
 
@@ -2578,23 +2588,27 @@ func (s *Service) ApproveInboxItem(ctx context.Context, itemID string) (types.Va
 			}
 			break
 		}
-		bID, movedCount, realReclaimed, err := sys.MoveItemsToTrash(
+		trashRes, err := sys.MoveItemsToTrashWithReport(
 			s.opts.HomeDir,
 			s.opts.DataDir,
 			snap.Preferences.CleanupPolicy.ProtectedDirs,
 			checkedPaths,
 			reclaimed,
 			activeMover,
+			s.elevatedTrashMover,
 		)
 		if err != nil {
 			return snap, err
 		}
-		if s.opts.DesktopReady && movedCount == 0 {
+		if s.opts.DesktopReady && trashRes.MovedCount == 0 {
 			return snap, errors.New("没有文件被实际移出，请检查目标路径是否存在")
 		}
-		batchID = bID
-		if realReclaimed > 0 {
-			reclaimed = realReclaimed
+		batchID = trashRes.BatchID
+		if trashRes.ReclaimedGB > 0 {
+			reclaimed = trashRes.ReclaimedGB
+		}
+		if len(trashRes.Failed) > 0 {
+			approvedToolSummary = fmt.Sprintf("已移入废纸篓 %d 项；%s", trashRes.MovedCount, sys.FormatTrashFailureSummary(trashRes.Failed))
 		}
 	case target.ToolName == "kill_process" || target.ToolName == "process_terminate":
 		pid := intFromAny(target.ToolArgs["pid"])
@@ -2929,24 +2943,29 @@ func (s *Service) ExecuteTimelineEvent(ctx context.Context, eventID string) (typ
 
 	batchID := ""
 	reclaimed := computeCheckedGB(target.ActionItems, target.ReclaimedGB)
+	partialSummary := ""
 	if len(checked) > 0 {
-		bID, movedCount, realReclaimed, err := sys.MoveItemsToTrash(
+		trashRes, err := sys.MoveItemsToTrashWithReport(
 			s.opts.HomeDir,
 			s.opts.DataDir,
 			snap.Preferences.CleanupPolicy.ProtectedDirs,
 			checked,
 			reclaimed,
 			activeMover,
+			s.elevatedTrashMover,
 		)
 		if err != nil {
 			return snap, err
 		}
-		if s.opts.DesktopReady && movedCount == 0 {
+		if s.opts.DesktopReady && trashRes.MovedCount == 0 {
 			return snap, errors.New("没有文件被实际移出，请检查目标路径是否存在")
 		}
-		batchID = bID
-		if realReclaimed > 0 {
-			reclaimed = realReclaimed
+		batchID = trashRes.BatchID
+		if trashRes.ReclaimedGB > 0 {
+			reclaimed = trashRes.ReclaimedGB
+		}
+		if len(trashRes.Failed) > 0 {
+			partialSummary = fmt.Sprintf("已移入废纸篓 %d 项（7 天内可还原）；%s", trashRes.MovedCount, sys.FormatTrashFailureSummary(trashRes.Failed))
 		}
 	}
 
@@ -2958,7 +2977,11 @@ func (s *Service) ExecuteTimelineEvent(ctx context.Context, eventID string) (typ
 				st.TimelineEvents[i].ReclaimedGB = reclaimed
 				st.TimelineEvents[i].CanRestore = len(checked) > 0
 				st.TimelineEvents[i].TrashBatchID = batchID
-				st.TimelineEvents[i].Summary = "已按你的确认移入废纸篓（7 天内可还原）。"
+				if partialSummary != "" {
+					st.TimelineEvents[i].Summary = partialSummary
+				} else {
+					st.TimelineEvents[i].Summary = "已按你的确认移入废纸篓（7 天内可还原）。"
+				}
 			}
 		}
 	})

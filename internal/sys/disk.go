@@ -1,13 +1,16 @@
 package sys
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -248,18 +251,191 @@ type TrashBatch struct {
 // TrashMover abstracts OS Trash movement (`mygo.Shell.TrashItemResult` in app mode or local staging vault).
 type TrashMover func(absPath string, batchID string) (trashPath string, err error)
 
-// MoveItemsToTrash safely validates each path and moves existing files to Trash (or staging vault),
+// ElevatedTrashMover moves a batch of permission-denied paths to Trash in a single macOS administrator prompt.
+type ElevatedTrashMover func(absPaths []string, homeDir string, batchID string) (moved []TrashRecord, failed []TrashFailure)
+
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func appleScriptStringLiteral(s string) string {
+	escaped := strings.ReplaceAll(s, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return `"` + escaped + `"`
+}
+
+// MacOSElevatedTrashMover requests macOS Administrator privileges ONCE via native Touch ID / password dialog
+// (`osascript do shell script ... with administrator privileges`) to move root-owned paths into ~/.Trash.
+func MacOSElevatedTrashMover(absPaths []string, homeDir string, batchID string) ([]TrashRecord, []TrashFailure) {
+	if runtime.GOOS != "darwin" || len(absPaths) == 0 {
+		return nil, nil
+	}
+	if homeDir == "" {
+		homeDir, _ = os.UserHomeDir()
+	}
+	trashDir := filepath.Join(homeDir, ".Trash")
+	_ = os.MkdirAll(trashDir, 0o700)
+
+	type movePair struct {
+		src  string
+		dest string
+	}
+	pairs := make([]movePair, 0, len(absPaths))
+	cmds := make([]string, 0, len(absPaths))
+	stamp := time.Now().Format("150405")
+	for idx, src := range absPaths {
+		base := filepath.Base(src)
+		dest := filepath.Join(trashDir, base)
+		if _, err := os.Lstat(dest); err == nil {
+			ext := filepath.Ext(base)
+			stem := strings.TrimSuffix(base, ext)
+			dest = filepath.Join(trashDir, fmt.Sprintf("%s-%s-%d%s", stem, stamp, idx+1, ext))
+		}
+		pairs = append(pairs, movePair{src: src, dest: dest})
+		// Move into ~/.Trash with root privileges so it remains reversible in Finder Trash.
+		cmds = append(cmds, fmt.Sprintf("mv -f %s %s", shellSingleQuote(src), shellSingleQuote(dest)))
+	}
+
+	shellScript := strings.Join(cmds, " && ")
+	prompt := fmt.Sprintf("Valet 需要管理员权限将 %d 个受保护项目移入废纸篓", len(pairs))
+	appleScript := fmt.Sprintf(
+		"do shell script %s with administrator privileges with prompt %s",
+		appleScriptStringLiteral(shellScript),
+		appleScriptStringLiteral(prompt),
+	)
+
+	cmd := exec.Command("osascript", "-e", appleScript)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	moved := make([]TrashRecord, 0, len(pairs))
+	failed := make([]TrashFailure, 0)
+
+	if err == nil {
+		for _, p := range pairs {
+			moved = append(moved, TrashRecord{
+				OriginalPath: p.src,
+				TrashPath:    p.dest,
+			})
+		}
+		return moved, failed
+	}
+
+	errText := strings.TrimSpace(stderr.String())
+	if errText == "" {
+		errText = err.Error()
+	}
+	lowerErr := strings.ToLower(errText)
+	userCanceled := strings.Contains(lowerErr, "user canceled") || strings.Contains(lowerErr, "-128")
+
+	// Check which items actually moved before an error occurred (if any)
+	for _, p := range pairs {
+		if _, srcErr := os.Lstat(p.src); errors.Is(srcErr, os.ErrNotExist) {
+			if _, dstErr := os.Lstat(p.dest); dstErr == nil {
+				moved = append(moved, TrashRecord{
+					OriginalPath: p.src,
+					TrashPath:    p.dest,
+				})
+				continue
+			}
+		}
+		reason := errText
+		if userCanceled {
+			reason = "已取消管理员授权"
+		}
+		failed = append(failed, TrashFailure{
+			Path:       p.src,
+			Name:       filepath.Base(p.src),
+			Permission: !userCanceled,
+			Reason:     reason,
+		})
+	}
+	return moved, failed
+}
+
+// TrashFailure records an individual path that could not be moved to Trash (e.g. root-owned or DriverKit-protected).
+type TrashFailure struct {
+	Path       string `json:"path"`
+	Name       string `json:"name"`
+	Permission bool   `json:"permission"`
+	Reason     string `json:"reason"`
+}
+
+// TrashBatchResult summarizes a multi-path Trash operation, including any permission-skipped items.
+type TrashBatchResult struct {
+	BatchID     string         `json:"batchId"`
+	MovedCount  int            `json:"movedCount"`
+	ReclaimedGB float64        `json:"reclaimedGB"`
+	Failed      []TrashFailure `json:"failed,omitempty"`
+}
+
+// IsPermissionError detects POSIX or macOS NSFileManager / Finder Trash permission errors.
+func IsPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "permission") ||
+		strings.Contains(lower, "operation not permitted") ||
+		strings.Contains(lower, "access denied") ||
+		strings.Contains(lower, "couldn’t be moved to the trash") ||
+		strings.Contains(lower, "couldn't be moved to the trash")
+}
+
+// FormatTrashFailureSummary produces a concise Chinese explanation for skipped/failed Trash targets.
+func FormatTrashFailureSummary(failed []TrashFailure) string {
+	if len(failed) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(failed))
+	hasPerm := false
+	allCanceled := true
+	for _, f := range failed {
+		label := f.Name
+		if label == "" {
+			label = filepath.Base(f.Path)
+		}
+		names = append(names, "「"+label+"」")
+		if f.Permission {
+			hasPerm = true
+		}
+		if !strings.Contains(f.Reason, "取消管理员授权") {
+			allCanceled = false
+		}
+	}
+	joined := strings.Join(names, "、")
+	if allCanceled {
+		return fmt.Sprintf("你已取消管理员授权，未移除 %s", joined)
+	}
+	if hasPerm {
+		return fmt.Sprintf("%s 受 macOS 系统或驱动扩展（SIP / DriverKit）保护，即使提权也无法直接移入废纸篓，请使用官方卸载程序或在「系统设置 → 驱动扩展」中关闭后再删除", joined)
+	}
+	return fmt.Sprintf("%s 移入废纸篓失败：%s", joined, failed[0].Reason)
+}
+
+// MoveItemsToTrashWithReport safely validates each path and moves existing files to Trash (or staging vault),
 // recording a 7-day reversible TrashBatch in `<dataDir>/trash-ledger.json`.
-func MoveItemsToTrash(
+// When regular Trash fails with permission denied and elevatedMover is provided, all permission-denied items
+// are batched into a single macOS Administrator authorization prompt.
+func MoveItemsToTrashWithReport(
 	homeDir, dataDir string,
 	protectedDirs []string,
 	paths []string,
 	estimatedGB float64,
 	mover TrashMover,
-) (batchID string, movedCount int, reclaimedGB float64, err error) {
-	batchID = fmt.Sprintf("trash-%d", time.Now().UnixNano())
+	elevatedMover ElevatedTrashMover,
+) (TrashBatchResult, error) {
+	batchID := fmt.Sprintf("trash-%d", time.Now().UnixNano())
 	records := make([]TrashRecord, 0, len(paths))
+	failed := make([]TrashFailure, 0)
+	permRetryPaths := make([]string, 0)
+	permRetryBytes := map[string]int64{}
 	var measuredBytes int64
+	movedCount := 0
 	realMoved := 0
 	var missing []string
 
@@ -269,7 +445,14 @@ func MoveItemsToTrash(
 		}
 		norm, vErr := ValidateTargetPath(raw, homeDir, protectedDirs)
 		if vErr != nil {
-			return "", 0, 0, vErr
+			if len(records) > 0 && dataDir != "" {
+				_ = appendTrashBatch(dataDir, TrashBatch{
+					ID:        batchID,
+					CreatedAt: time.Now().Format(time.RFC3339),
+					Items:     records,
+				})
+			}
+			return TrashBatchResult{}, vErr
 		}
 		info, sErr := os.Lstat(norm)
 		if sErr != nil {
@@ -286,27 +469,49 @@ func MoveItemsToTrash(
 				movedCount++
 				continue
 			}
-			return "", 0, 0, sErr
+			if IsPermissionError(sErr) && elevatedMover != nil {
+				permRetryPaths = append(permRetryPaths, norm)
+				continue
+			}
+			failed = append(failed, TrashFailure{
+				Path:       norm,
+				Name:       filepath.Base(norm),
+				Permission: IsPermissionError(sErr),
+				Reason:     sErr.Error(),
+			})
+			continue
 		}
 
+		var itemBytes int64
 		if info.IsDir() {
-			measuredBytes += measureDirBounded(norm, 5000)
+			itemBytes = measureDirBounded(norm, 5000)
 		} else {
-			measuredBytes += info.Size()
+			itemBytes = info.Size()
 		}
 
 		var dest string
+		var moveErr error
 		if mover != nil {
-			dest, err = mover(norm, batchID)
-			if err != nil {
-				return "", 0, 0, err
-			}
+			dest, moveErr = mover(norm, batchID)
 		} else {
-			dest, err = moveToVault(dataDir, batchID, norm)
-			if err != nil {
-				return "", 0, 0, err
-			}
+			dest, moveErr = moveToVault(dataDir, batchID, norm)
 		}
+		if moveErr != nil {
+			if IsPermissionError(moveErr) && elevatedMover != nil {
+				permRetryPaths = append(permRetryPaths, norm)
+				permRetryBytes[norm] = itemBytes
+				continue
+			}
+			failed = append(failed, TrashFailure{
+				Path:       norm,
+				Name:       filepath.Base(norm),
+				Permission: IsPermissionError(moveErr),
+				Reason:     moveErr.Error(),
+			})
+			continue
+		}
+
+		measuredBytes += itemBytes
 		records = append(records, TrashRecord{
 			OriginalPath: norm,
 			TrashPath:    dest,
@@ -315,10 +520,19 @@ func MoveItemsToTrash(
 		realMoved++
 	}
 
-	if mover != nil && realMoved == 0 && len(missing) > 0 {
-		return "", 0, 0, fmt.Errorf("未找到可移入废纸篓的目标文件：%s", strings.Join(missing, "、"))
+	// Batch all permission-denied items into a single macOS Administrator authorization prompt.
+	if len(permRetryPaths) > 0 && elevatedMover != nil {
+		elevatedMoved, elevatedFailed := elevatedMover(permRetryPaths, homeDir, batchID)
+		for _, rec := range elevatedMoved {
+			records = append(records, rec)
+			measuredBytes += permRetryBytes[rec.OriginalPath]
+			movedCount++
+			realMoved++
+		}
+		failed = append(failed, elevatedFailed...)
 	}
 
+	// Always persist ledger for any files that actually moved so 7-day restore is never lost.
 	if len(records) > 0 && dataDir != "" {
 		_ = appendTrashBatch(dataDir, TrashBatch{
 			ID:        batchID,
@@ -327,6 +541,15 @@ func MoveItemsToTrash(
 		})
 	}
 
+	if movedCount == 0 && len(failed) > 0 {
+		return TrashBatchResult{Failed: failed}, errors.New(FormatTrashFailureSummary(failed))
+	}
+
+	if mover != nil && realMoved == 0 && len(missing) > 0 {
+		return TrashBatchResult{}, fmt.Errorf("未找到可移入废纸篓的目标文件：%s", strings.Join(missing, "、"))
+	}
+
+	var reclaimedGB float64
 	if measuredBytes > 0 {
 		reclaimedGB = math.Round((float64(measuredBytes)/1e9)*100) / 100
 		if reclaimedGB < 0.01 && estimatedGB > 0 {
@@ -336,7 +559,28 @@ func MoveItemsToTrash(
 		reclaimedGB = estimatedGB
 	}
 
-	return batchID, movedCount, reclaimedGB, nil
+	return TrashBatchResult{
+		BatchID:     batchID,
+		MovedCount:  movedCount,
+		ReclaimedGB: reclaimedGB,
+		Failed:      failed,
+	}, nil
+}
+
+// MoveItemsToTrash safely validates each path and moves existing files to Trash (or staging vault),
+// recording a 7-day reversible TrashBatch in `<dataDir>/trash-ledger.json`.
+func MoveItemsToTrash(
+	homeDir, dataDir string,
+	protectedDirs []string,
+	paths []string,
+	estimatedGB float64,
+	mover TrashMover,
+) (batchID string, movedCount int, reclaimedGB float64, err error) {
+	res, err := MoveItemsToTrashWithReport(homeDir, dataDir, protectedDirs, paths, estimatedGB, mover, nil)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	return res.BatchID, res.MovedCount, res.ReclaimedGB, nil
 }
 
 // RestoreTrashBatch returns all recorded items in a TrashBatch back to their original paths.
