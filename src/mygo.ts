@@ -320,6 +320,7 @@ export interface McpServerItem {
   command?: string;
   args?: string[];
   url?: string;
+  headers?: Record<string, string>;
   statusError?: string;
 }
 
@@ -1237,7 +1238,7 @@ export const Valet = {
   updateProject(params: UpdateProjectParams): Promise<ValetSnapshot> {
     return call("Valet.UpdateProject", params);
   },
-  /** UpdateProvider updates API keys (stored in OS Keychain when available), base URLs, and connection status for a provider. */
+  /** UpdateProvider updates API keys (stored in isolated 0600 secrets.json), base URLs, and connection status for a provider. */
   updateProvider(providerID: string, patch: AgentProviderConfig): Promise<ValetSnapshot> {
     return call("Valet.UpdateProvider", providerID, patch);
   },

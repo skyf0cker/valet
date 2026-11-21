@@ -181,7 +181,14 @@ export interface MemoryEntry {
 
 export interface ChatAttachment {
   id: string;
-  kind: "image" | "file" | "screen" | "timeline_event" | "inbox_item" | "notebook_context";
+  kind:
+    | "image"
+    | "file"
+    | "screen"
+    | "timeline_event"
+    | "inbox_item"
+    | "notebook_context"
+    | "message_quote";
   refId?: string;
   name: string;
   meta?: string;
@@ -245,6 +252,7 @@ export interface McpServerConfig {
   command?: string;
   args?: string[];
   url?: string;
+  headers?: Record<string, string>;
   statusError?: string;
 }
 

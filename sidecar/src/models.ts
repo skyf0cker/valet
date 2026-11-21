@@ -385,7 +385,7 @@ function buildLocalStewardMessage(
               : { targetPath: "~/Pictures/Screenshots" }),
             skillMarkdown: isDmg
               ? "### 触发条件\n- `~/Downloads/*.dmg` 新增安装包。\n\n### 处理逻辑\n1. 检查 `/Applications` 对应应用是否已安装，或向用户确认。\n2. 使用 `trash_files` 将安装包移入系统废纸篓（7 天可还原）。"
-              : "### 触发条件\n- `~/Desktop` 新增屏幕截图。\n\n### 处理逻辑\n1. 使用 `list_dir` 确认目标路径，再用 `bash` 将截图移动到 `~/Pictures/Screenshots`。",
+              : "### 触发条件\n- `~/Desktop` 新增屏幕截图。\n\n### 处理逻辑\n1. 使用只读 `bash` 确认目标路径，再用 `bash` 将截图移动到 `~/Pictures/Screenshots`。",
           }),
         ],
         { stopReason: "toolUse" },
@@ -395,8 +395,8 @@ function buildLocalStewardMessage(
     if (isCleanIntent) {
       return fauxAssistantMessage(
         [
-          fauxThinking("先通过 list_dir 只读查看 ~/Downloads 中的候选文件，避开受保护目录。"),
-          fauxToolCall("list_dir", { path: "~/Downloads", maxEntries: 30 }),
+          fauxThinking("先通过只读 bash 命令查看 ~/Downloads 中的候选文件，避开受保护目录。"),
+          fauxToolCall("bash", { command: "ls -1p", cwd: "~/Downloads" }),
         ],
         { stopReason: "toolUse" },
       );
@@ -466,21 +466,24 @@ function buildLocalStewardMessage(
     );
   }
 
-  // Turn 2 for /clean: inspect list_dir output -> propose moving real file candidates via trash_files
+  // Turn 2 for /clean: inspect bash `ls -1p` output -> propose moving real file candidates via trash_files
   if (
     isCleanIntent &&
     toolResults.length === 1 &&
-    toolResults[0]?.toolName === "list_dir" &&
+    toolResults[0]?.toolName === "bash" &&
     !toolResults[0].isError
   ) {
-    const dirData = parseTrailingJson(extractToolText(toolResults[0]));
-    const entries = Array.isArray(dirData?.entries)
-      ? (dirData.entries as Array<{ path?: string; isDir?: boolean; sizeBytes?: number }>)
-      : [];
-    const candidatePaths = entries
-      .filter((e) => typeof e.path === "string" && e.path && !e.isDir)
-      .slice(0, 4)
-      .map((e) => e.path as string);
+    const rawOut = extractToolText(toolResults[0]);
+    const nlIdx = rawOut.indexOf("\n");
+    const header = nlIdx >= 0 ? rawOut.slice(0, nlIdx) : rawOut;
+    const body = nlIdx >= 0 ? rawOut.slice(nlIdx + 1) : "";
+    const cwdMatch = /^\[exit=0,\s*cwd=([^,\]]+)/.exec(header);
+    const baseDir = (cwdMatch?.[1] ?? "~/Downloads").trim().replace(/\/+$/, "");
+    const entries = body
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && line !== "(无标准输出)" && !line.endsWith("/"));
+    const candidatePaths = entries.slice(0, 4).map((name) => `${baseDir}/${name}`);
 
     if (candidatePaths.length > 0) {
       return fauxAssistantMessage(

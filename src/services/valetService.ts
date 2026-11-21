@@ -23,7 +23,7 @@ import type {
   WorkflowRunSummary,
 } from "../types/valet";
 import { buildDefaultWorkflowYaml } from "../utils/workflowYaml";
-import { isQuoteAttachment } from "../utils/chatQuotes";
+import { isMessageQuoteAttachment, isQuoteAttachment } from "../utils/chatQuotes";
 
 export interface ProviderVerifyResult {
   ok: boolean;
@@ -260,6 +260,30 @@ export class MockValetService implements ValetService {
           metaLabel: `${params.model} · 事项解析`,
           createdAt: nowTime,
           content: `已读取你引用的事项上下文：\n\n${detailBlocks.join("\n\n")}\n\n针对你的问题「${trimmed}」：从事件判断依据与载荷来看，该事项已经过插件策略过滤与安全路径保护校验。你可以继续追问具体子项的风险与影响，或直接回复 **“批准执行”** / **“忽略保留”** / **“还原”** 由我代为处理。`,
+        },
+      };
+    }
+
+    const msgQuoteAttachments = params.attachments.filter(isMessageQuoteAttachment);
+    if (msgQuoteAttachments.length > 0 && !lower.startsWith("/")) {
+      const snippetPreview = msgQuoteAttachments
+        .map((q) => {
+          const excerpt = (q.textExcerpt || q.name).trim();
+          const quotedLines = excerpt
+            .split("\n")
+            .slice(0, 6)
+            .map((line) => `> ${line}`)
+            .join("\n");
+          return quotedLines;
+        })
+        .join("\n\n");
+      return {
+        replyMessage: {
+          id: makeId("msg"),
+          role: "assistant",
+          metaLabel: `${params.model} · 引用追问（预览）`,
+          createdAt: nowTime,
+          content: `已结合你选中的引用片段：\n\n${snippetPreview}\n\n收到你的追问「${trimmed}」。当前处于浏览器预览模式；在 Valet 客户端接入大模型后，将围绕上述引用片段展开深入解答或执行对应排查操作。`,
         },
       };
     }

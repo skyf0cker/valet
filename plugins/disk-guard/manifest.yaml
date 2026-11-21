@@ -18,6 +18,11 @@ config_schema:
     max: 40
     default: 15
     description: 当磁盘剩余空间低于该百分比时唤醒管家排查
+  - key: watchDownloads
+    label: 监听 Downloads 安装包（无需完全磁盘访问）
+    type: boolean
+    default: false
+    description: 已授予完全磁盘访问时会自动生效；未授予完全磁盘访问时默认关闭，避免冷启动弹出「下载」文件夹权限窗，可按需手动开启
 triggers:
   - id: disk.low_space
     description: 当可用空间低于设定阈值时触发排查

@@ -421,3 +421,102 @@ triggers:
 		t.Fatalf("expected workflow.yaml in files list, got %+v", files)
 	}
 }
+
+func TestEngineGateProtectedFoldersRespectsPermissionsAndOptIn(t *testing.T) {
+	tmpDir := t.TempDir()
+	downloads := filepath.Join(tmpDir, "Downloads")
+	logsDir := filepath.Join(tmpDir, "Library", "Logs", "DiagnosticReports")
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := NewEngine(EngineConfig{
+		HomeDir:              tmpDir,
+		DataDir:              filepath.Join(tmpDir, "data"),
+		WatchDir:             PollingWatchDir(50 * time.Millisecond),
+		GateProtectedFolders: true,
+	})
+	defer eng.Close()
+
+	snap := types.ValetSnapshot{
+		Permissions: []types.PermissionItem{
+			{ID: "full_disk", Granted: false},
+		},
+		Plugins: []types.PluginState{
+			{
+				ID:        "disk-guard",
+				Slug:      "disk-guard",
+				Version:   "1.2.0",
+				Installed: true,
+				Enabled:   true,
+				Config: types.PluginConfig{
+					Values: map[string]any{"watchDownloads": false},
+				},
+				ManifestYAML: `id: disk-guard
+name: 磁盘守卫
+triggers:
+  - id: disk.large_file
+    sensor: fs_watch
+    watch_dirs: [~/Downloads]
+    ops: [create]
+    glob: "*.dmg"
+    policy: ask
+`,
+			},
+			{
+				ID:        "log-detective",
+				Slug:      "log-detective",
+				Version:   "1.0.0",
+				Installed: true,
+				Enabled:   true,
+				ManifestYAML: `id: log-detective
+name: 日志侦探
+triggers:
+  - id: log.crash
+    sensor: fs_watch
+    watch_dirs: [~/Library/Logs/DiagnosticReports]
+    ops: [create]
+    glob: "*.ips"
+    policy: auto
+`,
+			},
+		},
+	}
+
+	eng.Sync(snap)
+	eng.mu.Lock()
+	_, hasDownloads := eng.fsWatches["disk-guard::"+downloads]
+	_, hasLogs := eng.fsWatches["log-detective::"+logsDir]
+	eng.mu.Unlock()
+	if hasDownloads {
+		t.Fatalf("expected ~/Downloads watcher skipped when GateProtectedFolders=true, full_disk=false, and watchDownloads=false")
+	}
+	if !hasLogs {
+		t.Fatalf("expected non-TCC ~/Library/Logs/DiagnosticReports watcher active even when full_disk=false")
+	}
+
+	// Explicit opt-in via watchDownloads=true should start watching ~/Downloads
+	snap.Plugins[0].Config.Values["watchDownloads"] = true
+	eng.Sync(snap)
+	eng.mu.Lock()
+	_, hasDownloadsOptIn := eng.fsWatches["disk-guard::"+downloads]
+	eng.mu.Unlock()
+	if !hasDownloadsOptIn {
+		t.Fatalf("expected ~/Downloads watcher active when watchDownloads=true")
+	}
+
+	// Reset watchDownloads=false and grant full_disk -> watcher should remain active
+	snap.Plugins[0].Config.Values["watchDownloads"] = false
+	snap.Permissions[0].Granted = true
+	eng.Sync(snap)
+	eng.mu.Lock()
+	_, hasDownloadsFDA := eng.fsWatches["disk-guard::"+downloads]
+	eng.mu.Unlock()
+	if !hasDownloadsFDA {
+		t.Fatalf("expected ~/Downloads watcher active when full_disk=true")
+	}
+}
+

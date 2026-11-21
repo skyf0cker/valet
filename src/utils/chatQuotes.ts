@@ -5,9 +5,129 @@ import type {
 } from "../types/valet";
 
 const MAX_QUOTE_EXCERPT_CHARS = 10_000;
+const MAX_MESSAGE_QUOTE_CHARS = 4_000;
 
 export function isQuoteAttachment(att: ChatAttachment): boolean {
   return att.kind === "inbox_item" || att.kind === "timeline_event";
+}
+
+export function isMessageQuoteAttachment(att: ChatAttachment): boolean {
+  return att.kind === "message_quote";
+}
+
+export function isAnyQuoteAttachment(att: ChatAttachment): boolean {
+  return isQuoteAttachment(att) || isMessageQuoteAttachment(att);
+}
+
+function fnv1aHashHex(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+export function normalizeSelectedQuoteText(raw: string): string {
+  if (!raw) return "";
+  const lines = raw
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) =>
+      line.replace(/[ \t]+$/g, "").replace(/[ \t]*\t+[ \t]*/g, " | ")
+    );
+  const joined = lines
+    .join("\n")
+    .replace(/^\n+|\n+$/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!joined) return "";
+  if (joined.length <= MAX_MESSAGE_QUOTE_CHARS) return joined;
+  return `${joined.slice(0, MAX_MESSAGE_QUOTE_CHARS - 7).trimEnd()}\n…(已截断)`;
+}
+
+export function buildMessageQuoteAttachment(params: {
+  text: string;
+  messageId?: string;
+  role: "assistant" | "user";
+  metaLabel?: string;
+}): ChatAttachment | null {
+  const normalized = normalizeSelectedQuoteText(params.text);
+  if (!normalized) return null;
+
+  const refId = params.messageId?.trim() || undefined;
+  const hash = fnv1aHashHex(normalized);
+  const singleLine = normalized.replace(/\s+/g, " ").trim();
+  const singleChars = Array.from(singleLine);
+  const name =
+    singleChars.length > 72
+      ? `${singleChars.slice(0, 71).join("")}…`
+      : singleLine;
+  const charCount = Array.from(normalized).length;
+  const lineCount = normalized.split("\n").length;
+  const meta =
+    lineCount > 1 ? `${lineCount} 行 · ${charCount} 字` : `${charCount} 字`;
+
+  return {
+    id: `quote-msg-${refId || "live"}-${hash}`,
+    kind: "message_quote",
+    ...(refId ? { refId } : {}),
+    badge: params.role === "assistant" ? "引用 Valet" : "引用我的消息",
+    name,
+    meta,
+    textExcerpt: normalized,
+  };
+}
+
+export function computeQuotePopoverPosition(params: {
+  selectionRect: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+    width: number;
+    height: number;
+  };
+  containerRect: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  };
+  popoverHalfWidth?: number;
+  topClearance?: number;
+}): { left: number; top: number; placement: "above" | "below" } | null {
+  const { selectionRect, containerRect } = params;
+  if (selectionRect.width <= 0 && selectionRect.height <= 0) {
+    return null;
+  }
+  if (
+    selectionRect.bottom < containerRect.top ||
+    selectionRect.top > containerRect.bottom
+  ) {
+    return null;
+  }
+
+  const halfW = params.popoverHalfWidth ?? 76;
+  const topClearance = params.topClearance ?? 46;
+  const centerX = selectionRect.left + selectionRect.width / 2;
+  const minLeft = containerRect.left + halfW;
+  const maxLeft = containerRect.right - halfW;
+  const left =
+    minLeft > maxLeft
+      ? (containerRect.left + containerRect.right) / 2
+      : Math.min(maxLeft, Math.max(minLeft, centerX));
+
+  const placement: "above" | "below" =
+    selectionRect.top - containerRect.top >= topClearance ? "above" : "below";
+  const top =
+    placement === "above" ? selectionRect.top - 10 : selectionRect.bottom + 10;
+
+  return {
+    left: Math.round(left),
+    top: Math.round(top),
+    placement,
+  };
 }
 
 function inboxStatusLabel(item: InboxApprovalItem): string {

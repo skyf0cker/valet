@@ -10,7 +10,11 @@ import { isMyGo } from "mygo-runtime";
 import { Valet } from "../../mygo";
 import { useValet } from "../../store/ValetContext";
 import type { AutonomyLevel, ChatAttachment, PluginState } from "../../types/valet";
-import { isQuoteAttachment } from "../../utils/chatQuotes";
+import {
+  isAnyQuoteAttachment,
+  isMessageQuoteAttachment,
+  isQuoteAttachment,
+} from "../../utils/chatQuotes";
 import {
   ArrowRightIcon,
   ArrowUpIcon,
@@ -23,6 +27,7 @@ import {
   PaperclipIcon,
   PencilIcon,
   PlusIcon,
+  QuoteBlockIcon,
   ScreenCaptureIcon,
   ShieldIcon,
   StopIcon,
@@ -30,6 +35,7 @@ import {
   TrashIcon,
 } from "../ui/Icons";
 import { SelectMenu } from "../ui/SelectMenu";
+import { computeComposerTextareaMetrics } from "./composerUtils";
 
 let lastConsumedQuoteTick = 0;
 
@@ -423,6 +429,50 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
     }
   }, [showSlashMenu, pluginMenuOpen, inlineAtMatch]);
 
+  const syncTextareaHeight = useCallback(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "0px";
+    const viewportHeight =
+      typeof window !== "undefined" ? window.innerHeight : 800;
+    const metrics = computeComposerTextareaMetrics({
+      scrollHeight: ta.scrollHeight,
+      viewportHeight,
+      compact: sidebarCollapsed,
+    });
+    ta.style.height = `${metrics.height}px`;
+    ta.style.maxHeight = `${metrics.maxHeight}px`;
+    ta.style.overflowY = metrics.scrollable ? "auto" : "hidden";
+  }, [sidebarCollapsed]);
+
+  useLayoutEffect(() => {
+    syncTextareaHeight();
+  }, [text, chatId, sidebarCollapsed, syncTextareaHeight]);
+
+  useEffect(() => {
+    const onResize = () => syncTextareaHeight();
+    window.addEventListener("resize", onResize);
+
+    const box = composerBoxRef.current;
+    let ro: ResizeObserver | null = null;
+    let lastWidth = box ? Math.round(box.getBoundingClientRect().width) : 0;
+    if (box && typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver((entries) => {
+        const w = Math.round(entries[0]?.contentRect.width ?? box.getBoundingClientRect().width);
+        if (w > 0 && w !== lastWidth) {
+          lastWidth = w;
+          syncTextareaHeight();
+        }
+      });
+      ro.observe(box);
+    }
+
+    return () => {
+      window.removeEventListener("resize", onResize);
+      ro?.disconnect();
+    };
+  }, [syncTextareaHeight]);
+
   useLayoutEffect(() => {
     if (!pluginMenuOpen && !showSlashMenu) return;
     updatePopoverPositions();
@@ -505,13 +555,17 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
   const handleSubmit = async () => {
     const trimmed = text.trim();
     if (!trimmed && attachments.length === 0) return;
+    const hasMessageQuoteOnly =
+      !trimmed && attachments.length > 0 && attachments.every(isMessageQuoteAttachment);
     const hasQuoteOnly =
       !trimmed && attachments.length > 0 && attachments.every(isQuoteAttachment);
     const finalPrompt =
       trimmed ||
-      (hasQuoteOnly
-        ? "请帮我详细分析这个事项的触发原因、潜在风险，并给出处理建议"
-        : "请帮我分析附加的屏幕截图或文件内容");
+      (hasMessageQuoteOnly
+        ? "请针对我引用的这段内容进一步解释或展开说明"
+        : hasQuoteOnly
+          ? "请帮我详细分析这个事项的触发原因、潜在风险，并给出处理建议"
+          : "请帮我分析附加的屏幕截图或文件内容");
     const sentAttachments = [...attachments];
 
     setText("");
@@ -921,7 +975,7 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
                     </span>
                   )}
                   {(() => {
-                    const quoteCount = item.attachments.filter(isQuoteAttachment).length;
+                    const quoteCount = item.attachments.filter(isAnyQuoteAttachment).length;
                     const fileCount = item.attachments.length - quoteCount;
                     return (
                       <>
@@ -995,19 +1049,56 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
           setDragOver(false);
           void handleFilesAdded(e.dataTransfer.files);
         }}
-        className={`flex w-full max-w-[720px] flex-col rounded-[16px] border bg-[var(--bg-surface)] shadow-[var(--shadow-composer)] transition-colors ${
-          sidebarCollapsed ? "gap-1.5 rounded-[13px] p-2" : "gap-2 p-2.5"
+        className={`flex w-full max-w-[720px] flex-col border bg-[var(--bg-surface)] shadow-[var(--shadow-composer)] transition-colors ${
+          sidebarCollapsed
+            ? "gap-2 rounded-[14px] px-2.5 pt-2 pb-1.5"
+            : "gap-2.5 rounded-[18px] px-3 pt-2.5 pb-2"
         } ${
           dragOver
             ? "border-[var(--ink-primary)] bg-[var(--bg-subtle)]"
-            : "border-[var(--border-card)]"
+            : "border-[var(--border-card)] focus-within:border-[var(--border-strong)]"
         }`}
       >
         {/* Attachments row (only shown when real attachments exist) */}
         {attachments.length > 0 && (
           <div className="flex flex-wrap items-center gap-2 px-1 pt-0.5">
             {attachments.map((att) =>
-              isQuoteAttachment(att) ? (
+              isMessageQuoteAttachment(att) ? (
+                <div
+                  key={att.id}
+                  title={att.textExcerpt || att.name}
+                  className="relative flex min-w-[260px] max-w-full flex-1 items-start gap-2 overflow-hidden rounded-[9px] border border-[var(--border-card)] bg-[var(--bg-subtle)] py-1.5 pr-2 pl-2.5 shadow-[inset_3px_0_0_var(--ink-primary)]"
+                >
+                  <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-primary)]">
+                    <QuoteBlockIcon size={11.5} />
+                  </div>
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <div className="flex items-center gap-1.5">
+                      <span className="shrink-0 font-mono text-[9.5px] font-medium text-[var(--ink-muted)]">
+                        {att.badge ?? "引用内容"}
+                      </span>
+                      {att.meta && (
+                        <span className="truncate font-mono text-[9.5px] text-[var(--ink-subtle)]">
+                          {att.meta}
+                        </span>
+                      )}
+                    </div>
+                    <span className="line-clamp-2 whitespace-pre-wrap break-words text-[11.5px] leading-[16.5px] text-[var(--ink-secondary)]">
+                      {att.textExcerpt || att.name}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAttachments((prev) => prev.filter((a) => a.id !== att.id))
+                    }
+                    aria-label={`移除引用 ${att.name}`}
+                    className="ml-0.5 shrink-0 cursor-pointer rounded px-1 py-0.5 text-[10px] text-[var(--ink-muted)] hover:text-[var(--ink-strong)]"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ) : isQuoteAttachment(att) ? (
                 <div
                   key={att.id}
                   title={att.meta ? `${att.name} · ${att.meta}` : att.name}
@@ -1132,7 +1223,14 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
         )}
 
         {/* Textarea */}
-        <div className="px-1.5 py-0.5 lg:py-1">
+        <div
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              textareaRef.current?.focus();
+            }
+          }}
+          className="cursor-text px-1.5 pt-0.5 pb-0.5"
+        >
           <textarea
             ref={textareaRef}
             rows={1}
@@ -1256,12 +1354,14 @@ export const ChatComposer: React.FC<ChatComposerProps> = ({
                 ? busyPolicy === "steer"
                   ? "正在执行… 输入发送即可实时引导，或点击右侧停止"
                   : "正在执行… 继续输入将加入待发送队列，或点击右侧停止"
-                : attachments.some(isQuoteAttachment)
-                  ? "针对引用的事项提问明确（如原因、影响），或直接输入处理指令…"
-                  : "给 Valet 发消息，@ 指定插件，/ 调用动作…"
+                : attachments.some(isMessageQuoteAttachment)
+                  ? "针对引用的内容追问或补充指令…"
+                  : attachments.some(isQuoteAttachment)
+                    ? "针对引用的事项提问明确（如原因、影响），或直接输入处理指令…"
+                    : "给 Valet 发消息，@ 指定插件，/ 调用动作…"
             }
-            className={`max-h-28 w-full resize-none bg-transparent text-[var(--ink-body)] outline-none placeholder:text-[var(--ink-subtle)] ${
-              sidebarCollapsed ? "text-[12.5px] leading-[19px]" : "text-[14px] leading-[22px]"
+            className={`block w-full resize-none bg-transparent text-[var(--ink-body)] outline-none placeholder:text-[var(--ink-subtle)] ${
+              sidebarCollapsed ? "text-[13px] leading-[20px]" : "text-[14px] leading-[22px]"
             }`}
           />
         </div>

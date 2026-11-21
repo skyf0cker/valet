@@ -922,7 +922,7 @@ func TestGenericBundleScriptsKernelRPCsUninstallAndInteractivePermission(t *test
 		t.Fatalf("expected bundled script to redact secrets, got %s", scriptOutStr)
 	}
 
-	// 2. Verify host.kernel.writeFile -> host.kernel.readFile -> host.kernel.listDir
+	// 2. Verify host.kernel.writeFile -> host.kernel.readFile
 	notePath := filepath.Join(homeDir, "notes", "valet-note.txt")
 	if _, err := svc.handleSidecarHostRequest(
 		context.Background(),
@@ -938,17 +938,6 @@ func TestGenericBundleScriptsKernelRPCsUninstallAndInteractivePermission(t *test
 	)
 	if err != nil || !strings.Contains(readRes.(map[string]any)["content"].(string), "line2") {
 		t.Fatalf("host.kernel.readFile unexpected result: %+v err=%v", readRes, err)
-	}
-	listRes, err := svc.handleSidecarHostRequest(
-		context.Background(),
-		"host.kernel.listDir",
-		json.RawMessage(`{"path":"~/Downloads"}`),
-	)
-	if err != nil {
-		t.Fatalf("host.kernel.listDir failed: %v", err)
-	}
-	if entries, ok := listRes.(map[string]any)["entries"].([]map[string]any); !ok || len(entries) == 0 {
-		t.Fatalf("host.kernel.listDir unexpected entries: %+v", listRes)
 	}
 
 	// 3. Verify equal uninstall -> reinstall lifecycle on catalog plugin
@@ -2063,4 +2052,205 @@ func TestProjectsAndNotebookLifecycle(t *testing.T) {
 			secondRes.Thread.ID)
 	}
 }
+
+func TestServiceSecretsIsolationAndOneTimeMigration(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		DataDir:      dataDir,
+		HomeDir:      homeDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	const customKey = "sk-custom-isolated-secret-123456"
+	const jevKey = "jev-isolated-secret-789012"
+
+	if _, err := svc.UpdateProvider("custom", types.AgentProviderConfig{
+		ID:        "custom",
+		Name:      "自定义",
+		APIKey:    customKey,
+		BaseURL:   "https://example.invalid/v1",
+		Verified:  true,
+		Connected: true,
+	}); err != nil {
+		t.Fatalf("UpdateProvider failed: %v", err)
+	}
+
+	snap := svc.store.Snapshot()
+	prefs := snap.Preferences
+	prefs.AutoReview.JevAPIKey = jevKey
+	if _, err := svc.UpdatePreferences(prefs); err != nil {
+		t.Fatalf("UpdatePreferences failed: %v", err)
+	}
+	_ = svc.close()
+
+	secretsPath := filepath.Join(dataDir, "secrets.json")
+	info, err := os.Stat(secretsPath)
+	if err != nil {
+		t.Fatalf("expected secrets.json at %s: %v", secretsPath, err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected secrets.json perms 0600, got %o", info.Mode().Perm())
+	}
+	rawSec, err := os.ReadFile(secretsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawSec), customKey) || !strings.Contains(string(rawSec), jevKey) {
+		t.Fatalf("expected secrets.json to hold both API keys, got:\n%s", string(rawSec))
+	}
+
+	rawState, err := os.ReadFile(filepath.Join(dataDir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawState), customKey) || strings.Contains(string(rawState), jevKey) {
+		t.Fatalf("expected state.json never to contain plaintext API keys")
+	}
+
+	// Reopen Service and ensure keys hydrate back from secrets.json cleanly
+	svc2 := NewService()
+	if err := svc2.start(StartOptions{
+		DataDir:      dataDir,
+		HomeDir:      homeDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("second start failed: %v", err)
+	}
+	snap2, err := svc2.GetSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotCustom string
+	for _, p := range snap2.Providers {
+		if p.ID == "custom" {
+			gotCustom = p.APIKey
+		}
+	}
+	if gotCustom != customKey || snap2.Preferences.AutoReview.JevAPIKey != jevKey {
+		t.Fatalf("expected keys restored from secrets.json, got custom=%q jev=%q", gotCustom, snap2.Preferences.AutoReview.JevAPIKey)
+	}
+
+	if _, err := svc2.ResetAllData(); err != nil {
+		t.Fatalf("ResetAllData failed: %v", err)
+	}
+	resetSec := svc2.secrets.Snapshot()
+	if len(resetSec.Providers) != 0 || resetSec.AutoReviewJevAPIKey != "" || !resetSec.MigratedFromKeychain {
+		t.Fatalf("unexpected secrets state after ResetAllData: %+v", resetSec)
+	}
+	_ = svc2.close()
+
+	// Verify kernel host path guard protects Valet secrets.json paths
+	if _, err := resolveSafeHostPath("~/Library/Application Support/Valet/secrets.json", homeDir); err == nil {
+		t.Fatalf("expected resolveSafeHostPath to reject Valet/secrets.json")
+	}
+	if _, err := resolveSafeHostPath("~/.valet-data/secrets.json", homeDir); err == nil {
+		t.Fatalf("expected resolveSafeHostPath to reject .valet-data/secrets.json")
+	}
+
+	// Verify Service.hydrateSecrets runs one-time Keychain lookup once and never again
+	migDataDir := filepath.Join(tmpRoot, "mig-data")
+	migStore, err := store.OpenWithOptions(migDataDir, homeDir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migStore.Update(func(s *types.ValetSnapshot) {
+		for i := range s.Providers {
+			if s.Providers[i].ID == "custom" {
+				s.Providers[i].APIKeyMasked = "sk-kch••••9999"
+			}
+		}
+		s.Preferences.AutoReview.JevAPIKeyMasked = "jev-kc••••7777"
+	})
+	migSecrets, err := store.OpenSecretsStore(migDataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	mockKeychain := func(key string) ([]byte, error) {
+		calls++
+		switch key {
+		case "provider.apikey.custom":
+			return []byte("sk-kchain-migrated-9999"), nil
+		case "autoreview.jev.apikey":
+			return []byte("jev-kchain-migrated-7777"), nil
+		default:
+			return nil, os.ErrNotExist
+		}
+	}
+	migSvc := &Service{
+		opts: StartOptions{
+			DataDir:      migDataDir,
+			HomeDir:      homeDir,
+			DesktopReady: true,
+			KeychainGet:  mockKeychain,
+		},
+		store:   migStore,
+		secrets: migSecrets,
+	}
+	migSvc.hydrateSecrets()
+	if calls != 2 {
+		t.Fatalf("expected exactly 2 one-time KeychainGet calls, got %d", calls)
+	}
+	migSvc.hydrateSecrets()
+	if calls != 2 {
+		t.Fatalf("expected 0 extra KeychainGet calls on repeated hydrateSecrets, got %d", calls)
+	}
+}
+
+func TestServiceSidecarRespawnsAndReinitializes(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		DataDir:      dataDir,
+		HomeDir:      homeDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	defer func() {
+		_ = svc.close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Confirm initial sidecar runtime is initialized.
+	var firstInspect map[string]any
+	if err := svc.client.Call(ctx, "agent.inspect", map[string]any{}, &firstInspect); err != nil {
+		t.Fatalf("initial agent.inspect failed: %v", err)
+	}
+
+	// Simulate an unexpected sidecar termination via agent.shutdown while Service remains running.
+	if err := svc.client.Call(ctx, "agent.shutdown", map[string]any{}, nil); err != nil {
+		t.Fatalf("agent.shutdown failed: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	// Next Call must automatically respawn sidecar and run agent.init via Client.SetOnStart
+	// instead of returning "ValetDurableRuntime is not initialized yet".
+	var secondInspect map[string]any
+	if err := svc.client.Call(ctx, "agent.inspect", map[string]any{}, &secondInspect); err != nil {
+		t.Fatalf("post-crash agent.inspect failed (expected auto re-init): %v", err)
+	}
+}
+
+
 

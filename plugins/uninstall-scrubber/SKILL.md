@@ -2,7 +2,7 @@
 - `/Applications` 中有 `.app` 被移出或删除（`app.uninstalled`），或用户主动询问某应用卸载后的系统残留。
 
 ### 处理流程
-1. **先确认应用已真卸载**：通过 `list_dir` 检查 `/Applications` 与 `~/Applications`，核对目标应用未在运行（可用只读 `bash` 执行 `pgrep -i "<AppName>"`）。
+1. **先确认应用已真卸载**：通过只读 `bash`（如 `ls /Applications ~/Applications 2>/dev/null`）检查 `/Applications` 与 `~/Applications`，核对目标应用未在运行（可执行 `pgrep -i "<AppName>"`）。
 2. **定位残留目录**：检索以下位置中匹配该 App 名称或 Bundle ID 的目录与 plist：
    - `~/Library/Application Support/`
    - `~/Library/Caches/`

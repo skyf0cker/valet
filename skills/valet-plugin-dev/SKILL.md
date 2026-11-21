@@ -143,7 +143,6 @@ triggers:
 
 - **只读诊断原语（免审批直接放行）**：
   - `read_file`：按行读取文件/日志/配置
-  - `list_dir`：列举目录文件体积与修改时间
   - `system_overview`：读取实时 CPU / 内存 / 磁盘与高占用进程
   - `bash`：执行只读探测命令（如 `ls`, `ps`, `df`, `pmset`, `networksetup`, `lsof`）及插件包内只读脚本（`scripts/poll-*.mjs` / `import-*.mjs` / `read-*.mjs` 等）
   - `ask_user`：需要用户做主观裁决时提问

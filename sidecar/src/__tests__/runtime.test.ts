@@ -48,7 +48,7 @@ triggers:
     interval_sec: 60
     emit_on: json
     policy: auto`,
-      skillMarkdown: "使用 list_dir 与 trash_files 处理磁盘候选文件。",
+      skillMarkdown: "使用只读 bash 与 trash_files 处理磁盘候选文件。",
     },
     {
       id: "process-sentinel",
@@ -159,7 +159,6 @@ class FakeHostBridge implements HostBridge {
   readonly queued: QueueApprovalParams[] = [];
   readonly recorded: Record<string, unknown>[] = [];
   readonly bashCalls: Record<string, unknown>[] = [];
-  readonly listCalls: Record<string, unknown>[] = [];
   readonly readCalls: Record<string, unknown>[] = [];
   readonly writeCalls: Record<string, unknown>[] = [];
   readonly trashCalls: Record<string, unknown>[] = [];
@@ -190,30 +189,27 @@ class FakeHostBridge implements HostBridge {
       }
       case "host.kernel.bash": {
         this.bashCalls.push(params);
+        const cmd = String(params.command ?? "").trim();
+        const cwd = String(params.cwd ?? "/Users/testuser");
+        if (cmd === "ls -1p" && cwd.includes("Downloads")) {
+          return {
+            ok: true,
+            command: cmd,
+            cwd: "/Users/testuser/Downloads",
+            exitCode: 0,
+            durationMs: 8,
+            output: "old.ipsw",
+            summary: "exit=0 · old.ipsw",
+          } as T;
+        }
         return {
           ok: true,
-          command: String(params.command ?? ""),
-          cwd: String(params.cwd ?? "/Users/testuser"),
+          command: cmd,
+          cwd,
           exitCode: 0,
           durationMs: 12,
           output: "mock-bash-output",
           summary: "exit=0 · mock-bash-output",
-        } as T;
-      }
-      case "host.kernel.listDir": {
-        this.listCalls.push(params);
-        return {
-          path: "/Users/testuser/Downloads",
-          totalCount: 1,
-          entries: [
-            {
-              name: "old.ipsw",
-              path: "/Users/testuser/Downloads/old.ipsw",
-              isDir: false,
-              sizeBytes: 4200000000,
-              modTime: "2026-11-16T00:00:00Z",
-            },
-          ],
         } as T;
       }
       case "host.kernel.readFile": {
@@ -682,7 +678,7 @@ describe("ValetDurableRuntime", () => {
     expect(cleanRes.queuedInboxIds).toEqual(["inbox-test-1"]);
     expect(cleanRes.replyMessage.content).toContain("收件箱");
     expect(cleanRes.replyMessage.steps?.length).toBe(2);
-    expect(cleanRes.replyMessage.steps?.[0]?.name).toBe("list_dir");
+    expect(cleanRes.replyMessage.steps?.[0]?.name).toBe("bash");
     expect(cleanRes.replyMessage.steps?.[0]?.status).toBe("done");
     expect(cleanRes.replyMessage.steps?.[1]?.name).toBe("trash_files");
     expect(cleanRes.replyMessage.steps?.[1]?.status).toBe("done");
@@ -873,8 +869,9 @@ rl.on("line", (line) => {
     const afterDisable = await rt.inspect();
     const registered = afterDisable.registeredTools as string[];
     expect(registered).toContain("trash_files");
+    expect(registered).toContain("system_overview");
     expect(registered).toContain("read_file");
-    expect(registered).toContain("list_dir");
+    expect(registered).not.toContain("list_dir");
     expect(registered).toContain("write_file");
     expect(registered).toContain("kill_process");
     expect(registered).toContain("ask_user");
@@ -1600,7 +1597,7 @@ triggers:
       ].join("\n"),
     };
 
-    // (a) Questioning a quoted item injects [引用事项 ...] without mis-triggering /clean list_dir/trash_files
+    // (a) Questioning a quoted item injects [引用事项 ...] without mis-triggering /clean bash/trash_files
     const askRes = await rt.sendChat({
       chatId: "chat-quote-1",
       prompt: "为什么建议清理这个文件？有风险吗？",
@@ -1608,7 +1605,7 @@ triggers:
       attachments: [quoteAttachment],
       interactive: true,
     });
-    expect(bridge.listCalls.length).toBe(0);
+    expect(bridge.bashCalls.length).toBe(0);
     expect(bridge.trashCalls.length).toBe(0);
     expect(bridge.itemResolveCalls.length).toBe(0);
     expect(askRes.replyMessage.content).toContain("清理旧版磁盘安装包（4.2 GB）");
@@ -1760,6 +1757,82 @@ triggers:
     });
     expect(guardRes.ok).toBe(true);
     expect(bridge.queued.length).toBe(1);
+
+    await rt.close();
+  });
+
+  it("injects message_quote selections cleanly into prompts and derives titles without item_resolve boilerplate", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-msg-quote-"));
+    tempDirs.push(dir);
+    const bridge = new FakeHostBridge();
+    const state = makeBaseState(dir);
+
+    const rt = new ValetDurableRuntime(bridge);
+    await rt.init({ dbPath: join(dir, "pi-msg-quote.sqlite"), state });
+
+    let capturedUserPrompt = "";
+    rt.models.setLocalStewardScript([
+      (ctx) => {
+        const msgs = ctx.messages ?? [];
+        for (let i = msgs.length - 1; i >= 0; i -= 1) {
+          const m = msgs[i];
+          if (m?.role === "user") {
+            capturedUserPrompt =
+              typeof m.content === "string"
+                ? m.content
+                : Array.isArray(m.content)
+                  ? m.content
+                      .filter(
+                        (b): b is { type: "text"; text: string } =>
+                          typeof b === "object" && b !== null && "type" in b && b.type === "text",
+                      )
+                      .map((b) => b.text)
+                      .join("")
+                  : "";
+            break;
+          }
+        }
+        return fauxAssistantMessage(
+          "`read_file` 用于安全读取受限大小内的本地文本文件，并屏蔽敏感凭据路径。",
+        );
+      },
+    ]);
+
+    const msgQuoteAttachment = {
+      id: "quote-msg-a1-1234abcd",
+      kind: "message_quote" as const,
+      refId: "a1",
+      badge: "引用 Valet",
+      name: "read_file | 安全读取文本文件（日志/配置/脚本），支持行偏移",
+      meta: "2 行 · 54 字",
+      textExcerpt: [
+        "system_overview | 实时系统概览：磁盘、内存、CPU、Top 进程",
+        "read_file | 安全读取文本文件（日志/配置/脚本），支持行偏移",
+      ].join("\n"),
+    };
+
+    const res = await rt.sendChat({
+      chatId: "chat-msg-quote-1",
+      prompt: "这个怎么用",
+      model: "claude-opus-4",
+      attachments: [msgQuoteAttachment],
+      interactive: true,
+    });
+
+    expect(capturedUserPrompt).toContain("这个怎么用");
+    expect(capturedUserPrompt).toContain("[引用对话内容 · 引用 Valet]");
+    expect(capturedUserPrompt).toContain("read_file | 安全读取文本文件");
+    expect(capturedUserPrompt).toContain("[引用片段说明]");
+    expect(capturedUserPrompt).not.toContain("[附件上下文:");
+    expect(capturedUserPrompt).not.toContain("item_resolve");
+    expect(res.replyMessage.content).toContain("read_file");
+
+    const titleRes = await rt.generateChatTitle({
+      chatId: "chat-msg-quote-1",
+      prompt: "这个怎么用",
+      attachments: [msgQuoteAttachment],
+    });
+    expect(titleRes.title).toContain("read_file");
 
     await rt.close();
   });

@@ -34,6 +34,38 @@ interface SectionMeta {
   keywords: string;
 }
 
+function parseMcpHeadersInput(raw: string): Record<string, string> | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const out: Record<string, string> = {};
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed)) {
+          const tk = k.trim();
+          if (tk && typeof v === "string" && v.trim()) {
+            out[tk] = v.trim();
+          }
+        }
+        return Object.keys(out).length > 0 ? out : undefined;
+      }
+    } catch {
+      // Fall through to line-by-line Key: Value parsing
+    }
+  }
+  for (const line of trimmed.split(/\r?\n/)) {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx <= 0) continue;
+    const key = line.slice(0, colonIdx).trim();
+    const val = line.slice(colonIdx + 1).trim();
+    if (key && val) {
+      out[key] = val;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 const SECTIONS: SectionMeta[] = [
   {
     id: "general",
@@ -46,7 +78,7 @@ const SECTIONS: SectionMeta[] = [
     id: "models",
     title: "模型与服务商",
     group: "Agent",
-    subtitle: "密钥安全存于 macOS 钥匙串，控制主/快/视觉模型、Auto Review 审查模型与每日预算",
+    subtitle: "密钥安全存于本机受保护凭据文件（0600 隔离存储），控制主/快/视觉模型、Auto Review 审查模型与每日预算",
     keywords: "模型 服务商 anthropic openai ollama gemini api key 花费 预算 jev system one auto review 审查 小模型 google decisions gemini-decision-1",
   },
   {
@@ -198,6 +230,7 @@ export const SettingsView: React.FC = () => {
   const [mcpCommand, setMcpCommand] = useState("npx");
   const [mcpArgsText, setMcpArgsText] = useState("-y @modelcontextprotocol/server-filesystem ~/Downloads");
   const [mcpUrl, setMcpUrl] = useState("http://localhost:3100/mcp");
+  const [mcpHeadersText, setMcpHeadersText] = useState("");
 
   // Inline provider credential & Auto Review state
   const [showProviderKey, setShowProviderKey] = useState(false);
@@ -1226,7 +1259,7 @@ export const SettingsView: React.FC = () => {
 
                 {activeProvider.id !== "ollama" && (
                   <label className="flex flex-col gap-1">
-                    <span className="text-[11px] text-[var(--ink-muted)]">API Key（写入 macOS 钥匙串）</span>
+                    <span className="text-[11px] text-[var(--ink-muted)]">API Key（存于本机 0600 独立凭据文件，与配置隔离）</span>
                     <input
                       type={showProviderKey ? "text" : "password"}
                       value={activeProvider.apiKey}
@@ -1522,7 +1555,7 @@ export const SettingsView: React.FC = () => {
 
                   <label className="flex flex-col gap-1">
                     <span className="text-[11px] text-[var(--ink-muted)]">
-                      决策模型 API Key（写入 macOS 钥匙串；Google / OpenRouter 端点留空时自动复用上方对应服务商 Key）
+                      决策模型 API Key（存于本机 0600 独立凭据文件；Google / OpenRouter 端点留空时自动复用上方对应服务商 Key）
                     </span>
                     <input
                       type={showJevKey ? "text" : "password"}
@@ -2827,27 +2860,47 @@ export const SettingsView: React.FC = () => {
               </label>
             </>
           ) : (
-            <label className="flex flex-col gap-1">
-              <span className="text-[12px] font-medium text-[var(--ink-strong)]">
-                Endpoint URL
-              </span>
-              <input
-                type="text"
-                value={mcpUrl}
-                onChange={(e) => setMcpUrl(e.target.value)}
-                placeholder="http://localhost:3100/mcp"
-                autoCorrect="off"
-                autoCapitalize="off"
-                spellCheck={false}
-                className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
-              />
-            </label>
+            <>
+              <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium text-[var(--ink-strong)]">
+                  Endpoint URL
+                </span>
+                <input
+                  type="text"
+                  value={mcpUrl}
+                  onChange={(e) => setMcpUrl(e.target.value)}
+                  placeholder="http://localhost:3100/mcp"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  className="h-[34px] rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-[12px] font-medium text-[var(--ink-strong)]">
+                  HTTP Headers（可选，每行 Key: Value 或 JSON）
+                </span>
+                <textarea
+                  rows={2}
+                  value={mcpHeadersText}
+                  onChange={(e) => setMcpHeadersText(e.target.value)}
+                  placeholder={"Authorization: Bearer mcp_..."}
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  className="resize-y rounded-[8px] border border-[var(--border-control)] bg-[var(--bg-canvas)] px-3 py-2 font-mono text-[12px] text-[var(--ink-strong)] outline-none focus:border-[var(--ink-primary)]"
+                />
+              </label>
+            </>
           )}
         </div>
         <div className="mt-5 flex justify-end gap-2">
           <button
             type="button"
-            onClick={() => setMcpModalOpen(false)}
+            onClick={() => {
+              setMcpHeadersText("");
+              setMcpModalOpen(false);
+            }}
             className="h-[32px] cursor-pointer rounded-[8px] border border-[var(--border-control)] px-3.5 text-[12px]"
           >
             取消
@@ -2859,6 +2912,10 @@ export const SettingsView: React.FC = () => {
                 .trim()
                 .split(/\s+/)
                 .filter(Boolean);
+              const headers =
+                mcpTransportType === "http"
+                  ? parseMcpHeadersInput(mcpHeadersText)
+                  : undefined;
               addMcpServer({
                 abbr: mcpName.trim().slice(0, 2).toLowerCase() || "mc",
                 name: mcpName.trim() || "Custom MCP",
@@ -2866,6 +2923,7 @@ export const SettingsView: React.FC = () => {
                 command: mcpTransportType === "stdio" ? mcpCommand.trim() : undefined,
                 args: mcpTransportType === "stdio" ? args : undefined,
                 url: mcpTransportType === "http" ? mcpUrl.trim() : undefined,
+                headers,
                 transportLabel:
                   mcpTransportType === "stdio"
                     ? `stdio · ${mcpCommand.trim() || "cmd"}`
@@ -2873,6 +2931,7 @@ export const SettingsView: React.FC = () => {
                 toolCount: 0,
                 enabled: true,
               });
+              setMcpHeadersText("");
               setMcpModalOpen(false);
             }}
             className="h-[32px] cursor-pointer rounded-[8px] bg-[var(--ink-primary)] px-3.5 text-[12px] font-semibold text-[var(--ink-on-primary)]"

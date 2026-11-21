@@ -31,7 +31,7 @@ func Open(dataDir, homeDir string) (*Store, error) {
 }
 
 // OpenWithOptions loads `<dataDir>/state.json` and optionally strips plaintext APIKey fields
-// from disk when the host OS Keychain stores credentials.
+// from disk when credentials are stored separately in `<dataDir>/secrets.json`.
 func OpenWithOptions(dataDir, homeDir string, stripAPIKeyFromDisk bool) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, err
@@ -147,6 +147,18 @@ func appendMissingSeededPlugins(s *types.ValetSnapshot) bool {
 			if len(cur.ConfigSchema) == 0 && len(seeded.ConfigSchema) > 0 {
 				cur.ConfigSchema = append([]types.PluginConfigField(nil), seeded.ConfigSchema...)
 				changed = true
+			} else if len(seeded.ConfigSchema) > 0 {
+				haveField := make(map[string]bool, len(cur.ConfigSchema))
+				for _, f := range cur.ConfigSchema {
+					haveField[f.Key] = true
+				}
+				for _, sf := range seeded.ConfigSchema {
+					if !haveField[sf.Key] {
+						cur.ConfigSchema = append(cur.ConfigSchema, sf)
+						haveField[sf.Key] = true
+						changed = true
+					}
+				}
 			}
 			if len(cur.BundledFiles) == 0 && len(seeded.BundledFiles) > 0 {
 				cur.BundledFiles = append([]string(nil), seeded.BundledFiles...)

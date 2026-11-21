@@ -134,6 +134,7 @@ valet automation disable <ruleId>
 valet pause
 valet resume
 valet mcp add --name "Filesystem" --transport stdio --command npx --args "-y @modelcontextprotocol/server-filesystem ~/Downloads"
+valet mcp add --name "Tower" --transport http --url "https://example.com/mcp" --header "Authorization: Bearer <token>"
 valet memory add "优先保留 ~/Projects 和 ~/Work 下的构建缓存"
 
 # 插件脚手架与管理

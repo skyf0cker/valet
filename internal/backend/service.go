@@ -38,6 +38,7 @@ type StartOptions struct {
 	DesktopReady bool
 	UseVaultOnly bool // true in tests to avoid touching user's real Finder Trash
 	WatchDir     plugins.WatchDirFunc
+	KeychainGet  func(key string) ([]byte, error) // optional override (tests) for one-time legacy Keychain migration
 	OnNotify     func(kind, title, subtitle, body string)
 	OnSyncTray   func(show bool, paused bool)
 	OnSyncLogin  func(launchAtLogin bool)
@@ -57,6 +58,7 @@ type Service struct {
 	configuredOpts  StartOptions
 	opts            StartOptions
 	store           *store.Store
+	secrets         *store.SecretsStore
 	client          *sidecar.Client
 	engine          *plugins.Engine
 	webhookSrv      *http.Server
@@ -145,7 +147,12 @@ func (s *Service) start(opts StartOptions) error {
 		}
 	}
 
-	st, err := store.OpenWithOptions(opts.DataDir, opts.HomeDir, opts.DesktopReady)
+	st, err := store.OpenWithOptions(opts.DataDir, opts.HomeDir, true)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	secStore, err := store.OpenSecretsStore(opts.DataDir)
 	if err != nil {
 		s.mu.Unlock()
 		return err
@@ -170,12 +177,13 @@ func (s *Service) start(opts StartOptions) error {
 	}
 
 	eng := plugins.NewEngine(plugins.EngineConfig{
-		HomeDir:    opts.HomeDir,
-		DataDir:    opts.DataDir,
-		BunPath:    bunBin,
-		WatchDir:   opts.WatchDir,
-		TrashMover: mover,
-		OnTrigger:  s.handlePluginEngineTrigger,
+		HomeDir:              opts.HomeDir,
+		DataDir:              opts.DataDir,
+		BunPath:              bunBin,
+		WatchDir:             opts.WatchDir,
+		TrashMover:           mover,
+		OnTrigger:            s.handlePluginEngineTrigger,
+		GateProtectedFolders: opts.DesktopReady,
 	})
 
 	client := sidecar.NewClient(
@@ -187,6 +195,7 @@ func (s *Service) start(opts StartOptions) error {
 
 	s.opts = opts
 	s.store = st
+	s.secrets = secStore
 	s.client = client
 	s.engine = eng
 	s.trashMover = mover
@@ -194,6 +203,16 @@ func (s *Service) start(opts StartOptions) error {
 	s.stopMetrics = make(chan struct{})
 	s.started = true
 	s.mu.Unlock()
+
+	client.SetOnStart(func(initParentCtx context.Context, callInit func(context.Context, string, any, any) error) error {
+		initCtx, cancel := context.WithTimeout(initParentCtx, 15*time.Second)
+		defer cancel()
+		initParams := sidecar.InitParams{
+			DBPath: filepath.Join(opts.DataDir, "pi-agent.sqlite"),
+			State:  s.buildSyncState(st.Snapshot()),
+		}
+		return callInit(initCtx, "agent.init", initParams, nil)
+	})
 
 	webhookEndpoint, webhookSrv, wErr := s.startWebhookServer(opts.DesktopReady)
 	if wErr != nil {
@@ -278,10 +297,9 @@ func (s *Service) start(opts StartOptions) error {
 		}
 	})
 
-	// Hydrate secrets from OS Keychain and probe live privacy permissions when in desktop app
-	if opts.DesktopReady {
-		s.hydrateSecretsFromKeychain()
-	}
+	// Hydrate secrets from isolated 0600 secrets.json (with one-time legacy Keychain migration)
+	// and probe live privacy permissions when in desktop app.
+	s.hydrateSecrets()
 	s.refreshPermissionsOnStartup()
 	s.refreshHostMetrics()
 
@@ -293,14 +311,10 @@ func (s *Service) start(opts StartOptions) error {
 		opts.OnSyncLogin(snap.Preferences.LaunchAtLogin)
 	}
 
-	// Launch and initialize Pi Durable sidecar
+	// Launch and initialize Pi Durable sidecar (auto-runs agent.init via OnStart)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	initParams := sidecar.InitParams{
-		DBPath: filepath.Join(opts.DataDir, "pi-agent.sqlite"),
-		State:  s.buildSyncState(snap),
-	}
-	if err := client.Call(ctx, "agent.init", initParams, nil); err != nil {
+	if err := client.Start(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "[valet] initial sidecar init error: %v\n", err)
 	}
 
@@ -545,44 +559,23 @@ func (s *Service) syncRuntime(snap types.ValetSnapshot) {
 	s.syncSidecar(snap)
 }
 
-func (s *Service) hydrateSecretsFromKeychain() {
-	snap := s.store.Snapshot()
-	updated := false
-	for _, p := range snap.Providers {
-		if raw, err := mygo.Secrets.Get("provider.apikey." + p.ID); err == nil {
-			val := strings.TrimSpace(string(raw))
-			if val != "" && val != p.APIKey {
-				updated = true
-			}
-		}
-	}
-	if raw, err := mygo.Secrets.Get("autoreview.jev.apikey"); err == nil {
-		val := strings.TrimSpace(string(raw))
-		if val != "" && val != snap.Preferences.AutoReview.JevAPIKey {
-			updated = true
-		}
-	}
-	if !updated {
+func (s *Service) hydrateSecrets() {
+	if s.secrets == nil {
 		return
 	}
-	s.store.Update(func(st *types.ValetSnapshot) {
-		for i := range st.Providers {
-			if raw, err := mygo.Secrets.Get("provider.apikey." + st.Providers[i].ID); err == nil {
-				val := strings.TrimSpace(string(raw))
-				if val != "" {
-					st.Providers[i].APIKey = val
-					st.Providers[i].APIKeyMasked = maskSecretKey(val)
-				}
-			}
+	var getter func(key string) ([]byte, error)
+	if s.opts.DesktopReady {
+		getter = s.opts.KeychainGet
+		if getter == nil {
+			getter = mygo.Secrets.Get
 		}
-		if raw, err := mygo.Secrets.Get("autoreview.jev.apikey"); err == nil {
-			val := strings.TrimSpace(string(raw))
-			if val != "" {
-				st.Preferences.AutoReview.JevAPIKey = val
-				st.Preferences.AutoReview.JevAPIKeyMasked = maskSecretKey(val)
-			}
-		}
-	})
+	}
+	if err := s.secrets.HydrateSnapshot(s.store, store.HydrateSecretsOptions{
+		DesktopReady: s.opts.DesktopReady,
+		KeychainGet:  getter,
+	}, maskSecretKey); err != nil {
+		fmt.Fprintf(os.Stderr, "[valet] hydrate secrets error: %v\n", err)
+	}
 }
 
 func (s *Service) refreshPermissionsOnStartup() {
@@ -991,9 +984,6 @@ func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, r
 	case "host.kernel.readFile":
 		return s.execKernelReadFile(snap, raw)
 
-	case "host.kernel.listDir":
-		return s.execKernelListDir(snap, raw)
-
 	case "host.kernel.writeFile":
 		return s.execKernelWriteFile(snap, raw)
 
@@ -1254,6 +1244,8 @@ func (s *Service) execKernelBash(ctx context.Context, _ types.ValetSnapshot, raw
 		strings.Contains(low, "/.gnupg") ||
 		strings.Contains(low, "/.aws") ||
 		strings.Contains(low, "keychains") ||
+		strings.Contains(low, "valet/secrets.json") ||
+		strings.Contains(low, ".valet-data/secrets.json") ||
 		strings.Contains(low, "rm -rf /") ||
 		strings.Contains(low, "mkfs") ||
 		strings.HasPrefix(low, "sudo ") ||
@@ -1371,7 +1363,7 @@ func resolveSafeHostPath(rawPath, homeDir string) (string, error) {
 		return "", err
 	}
 	low := strings.ToLower(filepath.Clean(abs))
-	for _, seg := range []string{"/.ssh", "/.gnupg", "/.aws", "/library/keychains"} {
+	for _, seg := range []string{"/.ssh", "/.gnupg", "/.aws", "/library/keychains", "/valet/secrets.json", "/.valet-data/secrets.json"} {
 		if strings.HasSuffix(low, seg) || strings.Contains(low, seg+"/") {
 			return "", fmt.Errorf("安全边界拒绝：禁止访问敏感凭据路径 %q", rawPath)
 		}
@@ -1397,7 +1389,7 @@ func (s *Service) execKernelReadFile(_ types.ValetSnapshot, raw json.RawMessage)
 		return nil, err
 	}
 	if info.IsDir() {
-		return nil, fmt.Errorf("%q 是目录，请使用 list_dir 读取目录内容", req.Path)
+		return nil, fmt.Errorf("%q 是目录，请使用 bash（如 ls -la）查看目录内容", req.Path)
 	}
 	if info.Size() > 4*1024*1024 {
 		return nil, fmt.Errorf("文件过大 (%d bytes)，建议用 bash head/tail 或 offsetLine 分段查看", info.Size())
@@ -1443,59 +1435,6 @@ func (s *Service) execKernelReadFile(_ types.ValetSnapshot, raw json.RawMessage)
 		"startLine":  startIdx + 1,
 		"endLine":    endIdx,
 		"content":    content,
-	}, nil
-}
-
-func (s *Service) execKernelListDir(_ types.ValetSnapshot, raw json.RawMessage) (any, error) {
-	var req struct {
-		Path       string `json:"path"`
-		MaxEntries int    `json:"maxEntries"`
-	}
-	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, err
-	}
-	target := strings.TrimSpace(req.Path)
-	if target == "" {
-		target = "~"
-	}
-	abs, err := resolveSafeHostPath(target, s.opts.HomeDir)
-	if err != nil {
-		return nil, err
-	}
-	entries, err := os.ReadDir(abs)
-	if err != nil {
-		return nil, err
-	}
-	maxEntries := req.MaxEntries
-	if maxEntries <= 0 {
-		maxEntries = 100
-	} else if maxEntries > 500 {
-		maxEntries = 500
-	}
-	out := make([]map[string]any, 0, min(len(entries), maxEntries))
-	for _, entry := range entries {
-		if len(out) >= maxEntries {
-			break
-		}
-		info, iErr := entry.Info()
-		sizeBytes := int64(0)
-		modTime := ""
-		if iErr == nil {
-			sizeBytes = info.Size()
-			modTime = info.ModTime().Format(time.RFC3339)
-		}
-		out = append(out, map[string]any{
-			"name":      entry.Name(),
-			"path":      filepath.Join(abs, entry.Name()),
-			"isDir":     entry.IsDir(),
-			"sizeBytes": sizeBytes,
-			"modTime":   modTime,
-		})
-	}
-	return map[string]any{
-		"path":       abs,
-		"totalCount": len(entries),
-		"entries":    out,
 	}, nil
 }
 
@@ -1844,12 +1783,8 @@ func (s *Service) ResetAllData() (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
-	if s.opts.DesktopReady {
-		snap := s.store.Snapshot()
-		for _, p := range snap.Providers {
-			_ = mygo.Secrets.Delete("provider.apikey." + p.ID)
-		}
-		_ = mygo.Secrets.Delete("autoreview.jev.apikey")
+	if s.secrets != nil {
+		_ = s.secrets.Reset()
 	}
 	seed := store.NewSeedSnapshot(s.opts.HomeDir)
 	next := s.store.Update(func(st *types.ValetSnapshot) {
@@ -2256,7 +2191,10 @@ func deriveFallbackChatTitle(prompt string, attachments []types.ChatAttachment) 
 
 	if isDeictic && len(attachments) > 0 {
 		for _, att := range attachments {
-			if att.Kind != "notebook_context" && att.Kind != "inbox_item" && att.Kind != "timeline_event" {
+			if att.Kind != "notebook_context" &&
+				att.Kind != "inbox_item" &&
+				att.Kind != "timeline_event" &&
+				att.Kind != "message_quote" {
 				continue
 			}
 			candidate := ""
@@ -4603,17 +4541,15 @@ func (s *Service) SelectProvider(providerID string) (types.ValetSnapshot, error)
 	return next, nil
 }
 
-// UpdateProvider updates API keys (stored in OS Keychain when available), base URLs, and connection status for a provider.
+// UpdateProvider updates API keys (stored in isolated 0600 secrets.json), base URLs, and connection status for a provider.
 func (s *Service) UpdateProvider(providerID string, patch types.AgentProviderConfig) (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
 	trimmedKey := strings.TrimSpace(patch.APIKey)
-	if s.opts.DesktopReady {
-		if trimmedKey != "" {
-			_ = mygo.Secrets.Set("provider.apikey."+providerID, []byte(trimmedKey))
-		} else {
-			_ = mygo.Secrets.Delete("provider.apikey." + providerID)
+	if s.secrets != nil {
+		if err := s.secrets.SetProviderKey(providerID, trimmedKey); err != nil {
+			fmt.Fprintf(os.Stderr, "[valet] failed to persist provider key to secrets.json: %v\n", err)
 		}
 	}
 	patch.ID = providerID
@@ -4829,11 +4765,9 @@ func (s *Service) UpdatePreferences(prefs types.ValetPreferences) (types.ValetSn
 		return types.ValetSnapshot{}, err
 	}
 	trimmedJevKey := strings.TrimSpace(prefs.AutoReview.JevAPIKey)
-	if s.opts.DesktopReady {
-		if trimmedJevKey != "" {
-			_ = mygo.Secrets.Set("autoreview.jev.apikey", []byte(trimmedJevKey))
-		} else {
-			_ = mygo.Secrets.Delete("autoreview.jev.apikey")
+	if s.secrets != nil {
+		if err := s.secrets.SetAutoReviewJevAPIKey(trimmedJevKey); err != nil {
+			fmt.Fprintf(os.Stderr, "[valet] failed to persist auto-review key to secrets.json: %v\n", err)
 		}
 	}
 	prefs.AutoReview.JevAPIKey = trimmedJevKey
@@ -4894,7 +4828,7 @@ func (s *Service) CheckPermissions() (types.ValetSnapshot, error) {
 	if err := s.ensureStarted(); err != nil {
 		return types.ValetSnapshot{}, err
 	}
-	return s.store.Update(func(st *types.ValetSnapshot) {
+	next := s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.Permissions {
 			granted := sys.CheckPermissionStatus(st.Permissions[i].ID, st.Permissions[i].Granted, s.opts.DesktopReady)
 			st.Permissions[i].Granted = granted
@@ -4904,7 +4838,11 @@ func (s *Service) CheckPermissions() (types.ValetSnapshot, error) {
 				}
 			}
 		}
-	}), nil
+	})
+	if s.engine != nil {
+		s.engine.Sync(next)
+	}
+	return next, nil
 }
 
 // OpenSystemSettings opens macOS System Settings for the requested permission ID.
@@ -4932,7 +4870,7 @@ func (s *Service) PollPermissionStatus(permissionID string) (bool, error) {
 	if !s.opts.DesktopReady {
 		granted = true
 	}
-	s.store.Update(func(st *types.ValetSnapshot) {
+	next := s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.Permissions {
 			if st.Permissions[i].ID == permissionID {
 				st.Permissions[i].Granted = granted
@@ -4944,6 +4882,9 @@ func (s *Service) PollPermissionStatus(permissionID string) (bool, error) {
 			}
 		}
 	})
+	if s.engine != nil {
+		s.engine.Sync(next)
+	}
 	return granted, nil
 }
 
@@ -5254,7 +5195,7 @@ func (s *Service) ClearMemories() (types.ValetSnapshot, error) {
 func (s *Service) measureStorageStats() types.StorageStats {
 	dataDir := s.opts.DataDir
 	dbBytes := fileOrGlobSize(dataDir, "pi-agent.sqlite", "pi-agent.sqlite-wal", "pi-agent.sqlite-shm")
-	stateBytes := fileOrGlobSize(dataDir, "state.json")
+	stateBytes := fileOrGlobSize(dataDir, "state.json", "secrets.json")
 	vaultBytes := dirSizeBytes(filepath.Join(dataDir, "trash"))
 	totalBytes := dbBytes + stateBytes + vaultBytes
 	return types.StorageStats{

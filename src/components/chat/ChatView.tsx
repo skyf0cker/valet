@@ -1,7 +1,11 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useValet } from "../../store/ValetContext";
 import { DEFAULT_PROJECT_ID } from "../../types/valet";
-import { isQuoteAttachment } from "../../utils/chatQuotes";
+import {
+  buildMessageQuoteAttachment,
+  isMessageQuoteAttachment,
+  isQuoteAttachment,
+} from "../../utils/chatQuotes";
 import { SidebarToggleButton } from "../Sidebar";
 import {
   ArrowLeftIcon,
@@ -11,6 +15,7 @@ import {
   FileTextIcon,
   InboxIcon,
   PlusIcon,
+  QuoteBlockIcon,
 } from "../ui/Icons";
 import { SelectMenu } from "../ui/SelectMenu";
 import { AgentWorkTrace } from "./AgentWorkTrace";
@@ -21,6 +26,7 @@ import {
   PluginDraftCard,
   ProcessTableCard,
 } from "./MessageCards";
+import { SelectionQuotePopover } from "./SelectionQuotePopover";
 
 export const ChatView: React.FC = () => {
   const {
@@ -35,6 +41,7 @@ export const ChatView: React.FC = () => {
     returnToProjectNotebook,
     syncSessionSummaryToNotebook,
     sendChatMessage,
+    quoteMessageToChat,
     resolveChatPermission,
     abortChatMessage,
     performProcessAction,
@@ -46,6 +53,42 @@ export const ChatView: React.FC = () => {
   } = useValet();
 
   const bottomRef = useRef<HTMLDivElement>(null);
+  const messageStreamRef = useRef<HTMLDivElement>(null);
+  const [highlightedMsgId, setHighlightedMsgId] = useState<string | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+    };
+  }, []);
+
+  const jumpToQuotedMessage = (targetId: string) => {
+    const container = messageStreamRef.current;
+    if (!container) return;
+    const escaped =
+      typeof CSS !== "undefined" && typeof CSS.escape === "function"
+        ? CSS.escape(targetId)
+        : targetId.replace(/["\\]/g, "\\$&");
+    const targetEl = container.querySelector<HTMLElement>(
+      `[data-message-id="${escaped}"]`
+    );
+    if (!targetEl) {
+      pushToast("未在当前会话中找到原消息");
+      return;
+    }
+    targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
+    setHighlightedMsgId(targetId);
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+    highlightTimerRef.current = window.setTimeout(() => {
+      highlightTimerRef.current = null;
+      setHighlightedMsgId(null);
+    }, 1400);
+  };
 
   const activeThreads = state.chatThreads.filter((t) => !t.archived);
   const thread =
@@ -237,6 +280,7 @@ export const ChatView: React.FC = () => {
 
       {/* Message stream */}
       <div
+        ref={messageStreamRef}
         className={`min-h-0 flex-1 overflow-y-auto pb-4 ${
           sidebarCollapsed ? "px-[22px] pt-3.5" : "px-6 pt-6"
         }`}
@@ -244,12 +288,63 @@ export const ChatView: React.FC = () => {
         <div className="mx-auto flex w-full max-w-[680px] flex-col gap-3.5 lg:gap-[18px]">
           {thread.messages.map((msg) =>
             msg.role === "user" ? (
-              <div key={msg.id} className="flex justify-end">
+              <div
+                key={msg.id}
+                data-message-id={msg.id}
+                className={`flex justify-end rounded-[12px] transition-colors ${
+                  highlightedMsgId === msg.id
+                    ? "-m-1.5 bg-[var(--bg-subtle)]/55 p-1.5 ring-1 ring-[var(--ink-primary)]/40"
+                    : ""
+                }`}
+              >
                 <div className="flex max-w-[460px] flex-col items-end gap-1.5">
                   {msg.attachments && msg.attachments.length > 0 && (
                     <div className="flex flex-wrap justify-end gap-1.5">
                       {msg.attachments.map((att) =>
-                        isQuoteAttachment(att) ? (
+                        isMessageQuoteAttachment(att) ? (
+                          (() => {
+                            const canJump = Boolean(
+                              att.refId && thread.messages.some((m) => m.id === att.refId)
+                            );
+                            const quoteBody = (
+                              <>
+                                <div className="flex items-center gap-1.5">
+                                  <div className="flex h-4 w-4 shrink-0 items-center justify-center rounded-[4px] border border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-primary)]">
+                                    <QuoteBlockIcon size={10.5} />
+                                  </div>
+                                  <span className="shrink-0 font-mono text-[9.5px] font-medium text-[var(--ink-muted)]">
+                                    {att.badge ?? "引用内容"}
+                                  </span>
+                                  {att.meta && (
+                                    <span className="truncate font-mono text-[9.5px] text-[var(--ink-subtle)]">
+                                      {att.meta}
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="line-clamp-3 whitespace-pre-wrap break-words text-[11.5px] leading-[17px] text-[var(--ink-secondary)]">
+                                  {att.textExcerpt || att.name}
+                                </div>
+                              </>
+                            );
+                            const baseClass =
+                              "flex max-w-[400px] flex-col gap-1 overflow-hidden rounded-[9px] border border-[var(--border-card)] bg-[var(--bg-subtle)] px-2.5 py-2 text-left shadow-[inset_3px_0_0_var(--ink-primary)]";
+                            return canJump && att.refId ? (
+                              <button
+                                key={att.id}
+                                type="button"
+                                onClick={() => jumpToQuotedMessage(att.refId!)}
+                                title="点击定位到原消息"
+                                className={`${baseClass} cursor-pointer transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]/65`}
+                              >
+                                {quoteBody}
+                              </button>
+                            ) : (
+                              <div key={att.id} className={baseClass}>
+                                {quoteBody}
+                              </div>
+                            );
+                          })()
+                        ) : isQuoteAttachment(att) ? (
                           <button
                             key={att.id}
                             type="button"
@@ -375,13 +470,25 @@ export const ChatView: React.FC = () => {
                       )}
                     </div>
                   )}
-                  <div className="rounded-t-[16px] rounded-bl-[16px] rounded-br-[4px] border border-[var(--border-light)] bg-[var(--bg-elevated)] px-3.5 py-2 text-[13px] leading-[20px] text-[var(--ink-body)] lg:px-[15px] lg:py-[11px] lg:text-[14px] lg:leading-[22px]">
+                  <div
+                    data-quote-message-id={msg.id}
+                    data-quote-role="user"
+                    className="rounded-t-[16px] rounded-bl-[16px] rounded-br-[4px] border border-[var(--border-light)] bg-[var(--bg-elevated)] px-3.5 py-2 text-[13px] leading-[20px] text-[var(--ink-body)] lg:px-[15px] lg:py-[11px] lg:text-[14px] lg:leading-[22px]"
+                  >
                     {msg.content}
                   </div>
                 </div>
               </div>
             ) : (
-              <div key={msg.id} className="flex gap-2.5 lg:gap-3.5">
+              <div
+                key={msg.id}
+                data-message-id={msg.id}
+                className={`flex gap-2.5 rounded-[12px] transition-colors lg:gap-3.5 ${
+                  highlightedMsgId === msg.id
+                    ? "-m-1.5 bg-[var(--bg-subtle)]/55 p-1.5 ring-1 ring-[var(--ink-primary)]/40"
+                    : ""
+                }`}
+              >
                 <div
                   className={`flex shrink-0 items-center justify-center border border-[var(--brand-icon-border)] bg-[var(--brand-icon-bg)] text-[var(--brand-icon-fg)] ${
                     sidebarCollapsed
@@ -412,7 +519,11 @@ export const ChatView: React.FC = () => {
                     />
                   )}
 
-                  <div className="text-[13px] leading-[20px] text-[var(--ink-body)] lg:text-[14px] lg:leading-[23px]">
+                  <div
+                    data-quote-message-id={msg.id}
+                    data-quote-role="assistant"
+                    className="text-[13px] leading-[20px] text-[var(--ink-body)] lg:text-[14px] lg:leading-[23px]"
+                  >
                     <FormattedText text={msg.content} />
                   </div>
 
@@ -491,7 +602,11 @@ export const ChatView: React.FC = () => {
                 )}
 
                 {activeStream?.partialText && (
-                  <div className="text-[13px] leading-[20px] text-[var(--ink-body)] lg:text-[14px] lg:leading-[23px]">
+                  <div
+                    data-quote-message-id=""
+                    data-quote-role="assistant"
+                    className="text-[13px] leading-[20px] text-[var(--ink-body)] lg:text-[14px] lg:leading-[23px]"
+                  >
                     <FormattedText text={activeStream.partialText} />
                   </div>
                 )}
@@ -502,6 +617,20 @@ export const ChatView: React.FC = () => {
           <div ref={bottomRef} />
         </div>
       </div>
+
+      <SelectionQuotePopover
+        containerRef={messageStreamRef}
+        onQuote={({ text, messageId, role }) => {
+          const att = buildMessageQuoteAttachment({
+            text,
+            messageId,
+            role,
+          });
+          if (!att) return;
+          quoteMessageToChat(thread.id, att);
+        }}
+        onCopy={() => pushToast("已复制选中内容", "success")}
+      />
 
       {/* Composer */}
       <ChatComposer

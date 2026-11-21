@@ -91,7 +91,6 @@ const ValetThreadsDoc = defineDoc<{ map: Record<string, ConversationId> }>({
 const TOOL_STATUS_LABELS: Record<string, string> = {
   system_overview: "正在读取系统状态概览…",
   read_file: "正在读取本地文件…",
-  list_dir: "正在扫描目录列表…",
   write_file: "正在写入本地文件…",
   trash_files: "正在移入废纸篓…",
   kill_process: "正在处理目标进程…",
@@ -208,10 +207,6 @@ export function humanizeToolStepLabel(
     case "read_file": {
       const p = typeof args?.path === "string" ? args.path : "";
       return p ? `读取 · ${p.split("/").pop() || p}` : "读取文件";
-    }
-    case "list_dir": {
-      const p = typeof args?.path === "string" ? args.path : "";
-      return p ? `浏览目录 · ${p}` : "浏览目录";
     }
     case "write_file": {
       const p = typeof args?.path === "string" ? args.path : "";
@@ -525,7 +520,8 @@ export function deriveFallbackChatTitle(
       (a) =>
         a.kind === "notebook_context" ||
         a.kind === "inbox_item" ||
-        a.kind === "timeline_event",
+        a.kind === "timeline_event" ||
+        a.kind === "message_quote",
     );
     if (refAtt) {
       let candidate = "";
@@ -759,12 +755,6 @@ export class ValetDurableRuntime {
     this.registry.install(builtinSkillsExt);
 
     this.syncPluginExtensions(params.state.plugins);
-    await this.mcp.syncServers(
-      params.state.mcpServers ?? [],
-      this.policyRegistry,
-      (ext) => this.registry.install(ext),
-      (ext) => this.registry.uninstall(ext),
-    );
 
     const { storage, db } = await openUniversalSqliteBundle(
       params.dbPath || join(params.state.dataDir, "pi-agent.sqlite"),
@@ -945,6 +935,17 @@ export class ValetDurableRuntime {
       BACKGROUND_CONTEXT,
     );
 
+    try {
+      await this.mcp.syncServers(
+        params.state.mcpServers ?? [],
+        this.policyRegistry,
+        (ext) => this.registry.install(ext),
+        (ext) => this.registry.uninstall(ext),
+      );
+    } catch (err) {
+      console.error("[valet-sidecar] mcp.syncServers failed during init:", err);
+    }
+
     this.harness.resume();
     await this.recomputeWakeup();
     return { resumed: true };
@@ -1005,12 +1006,16 @@ export class ValetDurableRuntime {
       nextState.preferences.activeProviderId,
     );
     this.syncPluginExtensions(nextState.plugins);
-    await this.mcp.syncServers(
-      nextState.mcpServers ?? [],
-      this.policyRegistry,
-      (ext) => this.registry.install(ext),
-      (ext) => this.registry.uninstall(ext),
-    );
+    try {
+      await this.mcp.syncServers(
+        nextState.mcpServers ?? [],
+        this.policyRegistry,
+        (ext) => this.registry.install(ext),
+        (ext) => this.registry.uninstall(ext),
+      );
+    } catch (err) {
+      console.error("[valet-sidecar] mcp.syncServers failed during syncState:", err);
+    }
     if (wasPaused && !nextState.isPaused) {
       void this.alwaysOnTick();
     } else {
@@ -1116,9 +1121,19 @@ export class ValetDurableRuntime {
     const imageBlocks: Array<{ type: "image"; data: string; mimeType: string }> = [];
     const fileExcerpts: string[] = [];
     const itemQuoteExcerpts: string[] = [];
+    const messageQuoteExcerpts: string[] = [];
     const notebookContextExcerpts: string[] = [];
     const nonQuoteAttachments: typeof req.attachments = [];
     for (const att of req.attachments ?? []) {
+      if (att.kind === "message_quote") {
+        const quoteBody = (att.textExcerpt?.trim() || att.name || "").slice(0, 6_000);
+        if (quoteBody) {
+          messageQuoteExcerpts.push(
+            `[引用对话内容 · ${att.badge || "对话片段"}]\n${quoteBody}`,
+          );
+        }
+        continue;
+      }
       if (att.kind === "inbox_item" || att.kind === "timeline_event") {
         const kindLabel =
           att.kind === "inbox_item" ? "收件箱事项" : "时间线事件";
@@ -1204,8 +1219,12 @@ export class ValetDurableRuntime {
       itemQuoteExcerpts.length > 0
         ? `\n\n${itemQuoteExcerpts.join("\n\n")}\n\n[引用事项交互说明]\n以上是用户从收件箱或时间线引用的具体事项详情。若用户在提问或核实细节，请直接结合以上载荷、判断依据与只读探测工具解答；若用户明确指示批准、执行（含指定部分子项）、忽略或还原该事项，请调用 \`item_resolve\` 工具完成处理。`
         : "";
+    const messageQuoteBlock =
+      messageQuoteExcerpts.length > 0
+        ? `\n\n${messageQuoteExcerpts.join("\n\n")}\n\n[引用片段说明]\n以上是用户在当前对话中划词选中的引用片段。请优先围绕用户选中的这段具体内容回答其追问或执行其指令。`
+        : "";
     const mentionPrefix = mentionPlugin ? `@${mentionPlugin.name} ` : "";
-    const inputText = `${mentionPrefix}${req.prompt}${attachSummary}${excerptBlock}${notebookContextBlock}${quoteBlock}`;
+    const inputText = `${mentionPrefix}${req.prompt}${attachSummary}${excerptBlock}${notebookContextBlock}${quoteBlock}${messageQuoteBlock}`;
     const submitContent =
       imageBlocks.length > 0
         ? [{ type: "text" as const, text: inputText }, ...imageBlocks]
@@ -1569,6 +1588,14 @@ export class ValetDurableRuntime {
           if (snippet) {
             contextParts.push(snippet);
           }
+        }
+      } else if (att.kind === "message_quote") {
+        contextParts.push(
+          `引用对话片段：${att.name}${att.meta ? ` · ${att.meta}` : ""}`,
+        );
+        const excerpt = att.textExcerpt?.trim();
+        if (excerpt) {
+          contextParts.push(excerpt.slice(0, 400));
         }
       } else if (
         att.kind === "inbox_item" ||

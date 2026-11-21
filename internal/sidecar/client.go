@@ -44,6 +44,7 @@ type Client struct {
 	pending   map[string]chan rpcReply
 	doneCh    chan struct{}
 	closed    bool
+	onStart   func(ctx context.Context, call func(ctx context.Context, method string, params any, out any) error) error
 }
 
 // NewClient constructs a supervised Unix domain socket JSON-RPC client for the Pi Durable sidecar.
@@ -55,6 +56,14 @@ func NewClient(resourcesDir, repoRoot string, handler HostRequestHandler, notify
 		notify:       notify,
 		pending:      make(map[string]chan rpcReply),
 	}
+}
+
+// SetOnStart registers a synchronous initialization callback invoked whenever the sidecar
+// process starts or respawns, before callers proceed to send subsequent RPCs.
+func (c *Client) SetOnStart(fn func(ctx context.Context, call func(ctx context.Context, method string, params any, out any) error) error) {
+	c.mu.Lock()
+	c.onStart = fn
+	c.mu.Unlock()
 }
 
 // Start launches the sidecar subprocess if it is not already running.
@@ -127,8 +136,30 @@ func (c *Client) Start(ctx context.Context) error {
 	c.writeMu.Unlock()
 	c.sockDir = sockDir
 	c.doneCh = doneCh
+	onStart := c.onStart
 
 	go c.readLoop(conn, sockDir, cmd, doneCh)
+
+	if onStart != nil {
+		if initErr := onStart(ctx, c.callConnected); initErr != nil {
+			c.writeMu.Lock()
+			if c.conn == conn {
+				_ = c.conn.Close()
+				c.conn = nil
+			}
+			c.writeMu.Unlock()
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-doneCh
+			if c.cmd == cmd {
+				c.cmd = nil
+				c.doneCh = nil
+				c.sockDir = ""
+			}
+			return fmt.Errorf("sidecar init: %w", initErr)
+		}
+	}
 	return nil
 }
 

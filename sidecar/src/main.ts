@@ -28,6 +28,14 @@ console.log = (...args: unknown[]) => {
   console.error(...args);
 };
 
+// Keep stray async stream errors (e.g. broken stdio MCP child pipes) from terminating the sidecar.
+process.on("uncaughtException", (err) => {
+  console.error("[valet-sidecar] uncaughtException:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[valet-sidecar] unhandledRejection:", reason);
+});
+
 interface RpcRequest {
   jsonrpc: "2.0";
   id?: string | number;

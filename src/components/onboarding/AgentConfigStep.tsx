@@ -110,7 +110,7 @@ export const AgentConfigStep: React.FC = () => {
       </h2>
 
       <p className="mt-1.5 text-[14px] leading-[22px] text-[var(--ink-muted)]">
-        密钥只保存在 macOS 钥匙串中。随时可在「设置 › 模型」中添加更多服务商。
+        密钥仅保存在本机 0600 受保护凭据文件中（与配置文件隔离）。随时可在「设置 › 模型」中添加更多服务商。
       </p>
 
       {/* 01 Provider */}

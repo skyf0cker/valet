@@ -42,12 +42,13 @@ type TriggerDispatch struct {
 
 // EngineConfig configures Valet's generic declarative plugin sensor runtime.
 type EngineConfig struct {
-	HomeDir    string
-	DataDir    string
-	BunPath    string
-	WatchDir   WatchDirFunc
-	TrashMover sys.TrashMover
-	OnTrigger  func(TriggerDispatch)
+	HomeDir              string
+	DataDir              string
+	BunPath              string
+	WatchDir             WatchDirFunc
+	TrashMover           sys.TrashMover
+	OnTrigger            func(TriggerDispatch)
+	GateProtectedFolders bool
 }
 
 // Engine manages live per-plugin sensors and cron automations.
@@ -231,6 +232,14 @@ func (e *Engine) Sync(snap types.ValetSnapshot) {
 	}{}
 	var cronPluginTriggers []pluginCronTrigger
 
+	fullDiskGranted := false
+	for _, perm := range snap.Permissions {
+		if perm.ID == "full_disk" && perm.Granted {
+			fullDiskGranted = true
+			break
+		}
+	}
+
 	for _, p := range snap.Plugins {
 		if !p.Installed || !p.Enabled {
 			continue
@@ -248,11 +257,16 @@ func (e *Engine) Sync(snap types.ValetSnapshot) {
 					if dir == "" {
 						continue
 					}
+					if e.cfg.GateProtectedFolders && isMacOSProtectedUserDir(dir, e.cfg.HomeDir) {
+						if !fullDiskGranted && !hasTruthyConfigFlag(p, "watchDownloads") {
+							continue
+						}
+					}
 					key := p.ID + "::" + dir
 					cur := desiredFS[key]
 					cur.pluginID = p.ID
 					cur.triggers = append(cur.triggers, trig)
-					cur.sig = p.Version + "|" + p.ManifestYAML
+					cur.sig = p.Version + "|" + p.ManifestYAML + "|" + string(cfgJSON)
 					desiredFS[key] = cur
 				}
 			case "http_poll":
@@ -1069,6 +1083,46 @@ func isForbiddenPluginShellCommand(raw string) bool {
 		}
 	}
 	return false
+}
+
+func isMacOSProtectedUserDir(dir, homeDir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return false
+	}
+	home := strings.TrimSpace(homeDir)
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	if home == "" {
+		return false
+	}
+	cleanDir := strings.ToLower(filepath.Clean(dir))
+	cleanHome := filepath.Clean(home)
+	for _, sub := range []string{"Downloads", "Desktop", "Documents"} {
+		target := strings.ToLower(filepath.Clean(filepath.Join(cleanHome, sub)))
+		if cleanDir == target || strings.HasPrefix(cleanDir, target+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTruthyConfigFlag(p types.PluginState, key string) bool {
+	if p.Config.Values == nil {
+		return false
+	}
+	raw, ok := p.Config.Values[key]
+	if !ok || raw == nil {
+		return false
+	}
+	switch v := raw.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	default:
+		return false
+	}
 }
 
 var _ = errors.New

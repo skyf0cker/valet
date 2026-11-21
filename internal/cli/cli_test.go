@@ -94,6 +94,25 @@ func TestCLIOfflineMode(t *testing.T) {
 	if !strings.Contains(rawProvList, "••••") {
 		t.Fatalf("expected masked apiKey in provider list, got: %s", rawProvList)
 	}
+	rawStateOnDisk, err := os.ReadFile(filepath.Join(dataDir, "state.json"))
+	if err != nil {
+		t.Fatalf("read state.json failed: %v", err)
+	}
+	if strings.Contains(string(rawStateOnDisk), secretKey) {
+		t.Fatalf("state.json must not store plaintext apiKey")
+	}
+	secPath := filepath.Join(dataDir, "secrets.json")
+	secInfo, err := os.Stat(secPath)
+	if err != nil {
+		t.Fatalf("expected secrets.json to exist: %v", err)
+	}
+	if secInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("expected secrets.json mode 0600, got %o", secInfo.Mode().Perm())
+	}
+	rawSecOnDisk, err := os.ReadFile(secPath)
+	if err != nil || !strings.Contains(string(rawSecOnDisk), secretKey) {
+		t.Fatalf("expected secrets.json to store apiKey (err=%v)", err)
+	}
 
 	// 5. heartbeat set & automation add / list / remove
 	_, hbSetRes := runCLI(t, "--data-dir", dataDir, "--json", "heartbeat", "set", "--enabled", "true", "--interval", "20")
@@ -271,6 +290,22 @@ func TestCLILiveDaemonModeAndAuth(t *testing.T) {
 	rawListProv, _ := runCLI(t, "--data-dir", dataDir, "--json", "provider", "list")
 	if strings.Contains(rawListProv, liveSecret) {
 		t.Fatalf("live provider list leaked plaintext apiKey: %s", rawListProv)
+	}
+
+	// 2b. HTTP MCP add with --header and --headers
+	runCLI(
+		t,
+		"--data-dir", dataDir,
+		"--json",
+		"mcp", "add",
+		"--name", "tower",
+		"--transport", "http",
+		"--url", "https://example.invalid/mcp",
+		"--header", "Authorization: Bearer tok123",
+	)
+	rawMcpList, _ := runCLI(t, "--data-dir", dataDir, "--json", "mcp", "list")
+	if !strings.Contains(rawMcpList, "Bearer tok123") || !strings.Contains(rawMcpList, "tower") {
+		t.Fatalf("expected mcp list to include Authorization header, got: %s", rawMcpList)
 	}
 
 	// 3. Plugin lifecycle in live daemon mode

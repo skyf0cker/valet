@@ -288,7 +288,7 @@ type PluginDraftSpec struct {
 // ChatAttachment represents a file, image, screen, or quoted item attachment on a message.
 type ChatAttachment struct {
 	ID          string `json:"id"`
-	Kind        string `json:"kind"` // "image" | "file" | "screen" | "timeline_event" | "inbox_item"
+	Kind        string `json:"kind"` // "image" | "file" | "screen" | "timeline_event" | "inbox_item" | "notebook_context" | "message_quote"
 	RefID       string `json:"refId,omitempty"`
 	Name        string `json:"name"`
 	Meta        string `json:"meta,omitempty"`
@@ -452,11 +452,12 @@ type McpServerItem struct {
 	ToolCount      int      `json:"toolCount"`
 	Enabled        bool     `json:"enabled"`
 	AuthExpired    bool     `json:"authExpired,omitempty"`
-	Transport      string   `json:"transport,omitempty"` // "stdio" | "http"
-	Command        string   `json:"command,omitempty"`
-	Args           []string `json:"args,omitempty"`
-	URL            string   `json:"url,omitempty"`
-	StatusError    string   `json:"statusError,omitempty"`
+	Transport      string            `json:"transport,omitempty"` // "stdio" | "http"
+	Command        string            `json:"command,omitempty"`
+	Args           []string          `json:"args,omitempty"`
+	URL            string            `json:"url,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	StatusError    string            `json:"statusError,omitempty"`
 }
 
 // MemoryEntry holds a persisted user preference item.

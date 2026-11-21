@@ -55,7 +55,7 @@ function textResult(text: string, details?: Record<string, unknown>) {
 /**
  * Core Valet Steward extension (`valet:core`):
  * Injects persona, safety policy, memories, builtin skills, and active plugin index,
- * plus universal OS tools (`system_overview`, `bash`, `read_file`, `list_dir`,
+ * plus universal OS tools (`system_overview`, `bash`, `read_file`,
  * `write_file`, `trash_files`, `kill_process`, `ask_user`, `memory_remember`,
  * `plugin_draft_create`, `inbox_propose_approval`).
  */
@@ -101,19 +101,6 @@ export function createStewardCoreExtension(options: {
       iconKind: "disk",
       reversible7d: false,
       approveLabel: "读取",
-      dismissLabel: "取消",
-    },
-    {
-      toolName: "list_dir",
-      pluginId: "valet-core",
-      pluginName: "Valet Core",
-      actionId: "fs.list",
-      eventCode: "system.inspect",
-      safety: "readonly",
-      category: "files",
-      iconKind: "disk",
-      reversible7d: false,
-      approveLabel: "列出",
       dismissLabel: "取消",
     },
     {
@@ -398,31 +385,6 @@ export function createStewardCoreExtension(options: {
     },
   });
 
-  const listDirTool = defineTool({
-    name: "list_dir",
-    description:
-      "List entries in a directory (supports ~) to inspect caches, logs, Applications, or plugin bundles.",
-    parameters: obj({
-      path: str({ description: "Directory path (supports ~)." }),
-      maxEntries: opt(num({ description: "Maximum entries to return (default 100)." })),
-    }),
-    replay: "safe",
-    execute: async (args) => {
-      const res = await bridge.callHost<{
-        path: string;
-        totalCount: number;
-        entries: Array<{
-          name: string;
-          path: string;
-          isDir: boolean;
-          sizeBytes: number;
-          modTime: string;
-        }>;
-      }>("host.kernel.listDir", args as unknown as Record<string, unknown>);
-      return textResult(JSON.stringify(res, null, 2), { dirListing: res as never });
-    },
-  });
-
   const writeFileTool = defineTool({
     name: "write_file",
     description:
@@ -694,7 +656,7 @@ export function createStewardCoreExtension(options: {
           `- 当通过 \`${resolvedSensor}\` 收到 \`${args.eventCode}\` 事件时触发本插件。`,
           ``,
           `### 处理流程`,
-          `1. 使用 \`read_file\` / \`list_dir\` / \`bash\` 检查事件 \`payload\` 中的变更对象与上下文。`,
+          `1. 使用 \`read_file\` / \`bash\` 检查事件 \`payload\` 中的变更对象与上下文。`,
           `2. 根据状况调用通用核心工具（${args.targetPath ? `如涉及 \`${args.targetPath}\` 的 \`trash_files\` / \`write_file\`` : "如 \`trash_files\`、\`write_file\`、\`bash\`"}）执行响应；如需人工裁决可调用 \`ask_user\`，危险工具调用也会自动请求用户批准。`,
         ].join("\n");
 
@@ -1093,8 +1055,8 @@ export function createStewardCoreExtension(options: {
           `受保护路径（严禁改动）：${s.preferences.cleanupPolicy.protectedDirs.join(", ")}`,
           `严禁触碰的应用：${s.preferences.blockedApps.join(", ")}`,
           "通用核心工具（所有插件共享这套原语）：",
-          "- 只读探测工具：`system_overview`、`read_file`、`list_dir`、`ask_user`、`memory_remember`、`plugin_draft_create`、`bash`（纯只读命令与插件 `scripts/poll-*`/`import-*`/`read-*`/`inspect-*`/`scan-*`/`sample-*` 脚本直接放行）。",
-          "- 工具使用优先顺序：查看目录文件请优先用 `list_dir`、查看文件内容请优先用 `read_file`；仅在需要系统探测（进程/网络/磁盘元数据）或执行变更命令时使用 `bash`。",
+          "- 只读探测工具：`system_overview`、`read_file`、`ask_user`、`memory_remember`、`plugin_draft_create`、`bash`（纯只读命令与插件 `scripts/poll-*`/`import-*`/`read-*`/`inspect-*`/`scan-*`/`sample-*` 脚本直接放行）。",
+          "- 工具使用优先顺序：查看文件内容请优先用 `read_file`；查看目录结构、系统探测（进程/网络/磁盘占用）或执行变更命令时使用 `bash`。",
           "- 变更执行工具：`trash_files`（移入废纸篓，7 天可还原）、`write_file`、`kill_process`、`bash`（修改系统/配置命令）、`item_resolve`（仅限前台对话中按用户明确指示批准、忽略、部分勾选执行或还原被引用的收件箱/时间线事项）。",
           "双模安全审批机制：在 `auto_review` 模式下，非纯只读调用会先由 Auto Review 模型评估风险，低风险自动放行，高风险或未配置时升级为人工确认（前台对话实时弹窗、后台任务推送收件箱）；在 `always_ask` 下每次变更都会确认；在 `full_access` 下除受保护目录/应用与安全护栏外的操作均自动放行。严禁访问 `~/.ssh`、`~/.gnupg`、`~/.aws`、Keychain 或使用 `sudo`。",
         ].join("\n");
@@ -1180,7 +1142,6 @@ export function createStewardCoreExtension(options: {
     tools: [
       systemOverviewTool,
       readFileTool,
-      listDirTool,
       writeFileTool,
       trashFilesTool,
       killProcessTool,

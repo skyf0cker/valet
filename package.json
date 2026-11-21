@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "mygo dev",
-    "build": "mygo build",
+    "build": "mygo build && bash scripts/sign-macos-local.sh",
+    "signing:setup": "bash scripts/setup-macos-signing.sh",
     "generate": "mygo generate",
     "dev:web": "vite",
     "build:web": "tsc --noEmit && vite build",

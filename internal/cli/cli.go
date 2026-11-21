@@ -1187,12 +1187,44 @@ func runMcpCmd(args []string, b cliBackend, opts globalOpts, stdout io.Writer) e
 					return errors.New("--url 缺少地址")
 				}
 				srv.URL = rest[i]
+			case "--header":
+				i++
+				if i >= len(rest) {
+					return errors.New("--header 缺少请求头（格式 \"Key: Value\"）")
+				}
+				hk, hv, ok := strings.Cut(rest[i], ":")
+				hk = strings.TrimSpace(hk)
+				hv = strings.TrimSpace(hv)
+				if !ok || hk == "" {
+					return fmt.Errorf("--header 格式无效 %q，应为 \"Key: Value\"", rest[i])
+				}
+				if srv.Headers == nil {
+					srv.Headers = map[string]string{}
+				}
+				srv.Headers[hk] = hv
+			case "--headers":
+				i++
+				if i >= len(rest) {
+					return errors.New("--headers 缺少 JSON 对象")
+				}
+				var parsedHeaders map[string]string
+				if err := json.Unmarshal([]byte(rest[i]), &parsedHeaders); err != nil {
+					return fmt.Errorf("--headers JSON 解析失败: %w", err)
+				}
+				if srv.Headers == nil {
+					srv.Headers = map[string]string{}
+				}
+				for hk, hv := range parsedHeaders {
+					if tk := strings.TrimSpace(hk); tk != "" {
+						srv.Headers[tk] = strings.TrimSpace(hv)
+					}
+				}
 			default:
 				return fmt.Errorf("未知参数: %s", rest[i])
 			}
 		}
 		if strings.TrimSpace(srv.Name) == "" {
-			return errors.New("用法: valet mcp add --name \"...\" --transport stdio|http [--command ... --args ...] [--url ...]")
+			return errors.New("用法: valet mcp add --name \"...\" --transport stdio|http [--command ... --args ...] [--url ... --header \"Key: Value\"]")
 		}
 		res, err := b.mcpAdd(srv)
 		if err != nil {

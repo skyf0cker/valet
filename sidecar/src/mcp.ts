@@ -1,4 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   type Extension,
   defineExtension,
@@ -35,8 +38,66 @@ function isReadOnlyMcpTool(name: string): boolean {
   );
 }
 
+export function buildEnhancedMcpEnv(): NodeJS.ProcessEnv {
+  const home = homedir();
+  const basePaths = [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    join(home, ".bun", "bin"),
+    join(home, ".local", "bin"),
+    join(home, ".cargo", "bin"),
+    join(home, ".volta", "bin"),
+    join(home, ".fnm", "current", "bin"),
+    join(home, ".asdf", "shims"),
+    join(home, ".mise", "shims"),
+    dirname(process.execPath),
+  ];
+
+  const nvmDir = join(home, ".nvm", "versions", "node");
+  if (existsSync(nvmDir)) {
+    try {
+      const versions = readdirSync(nvmDir)
+        .filter((v) => !v.startsWith("."))
+        .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+      if (versions[0]) {
+        basePaths.push(join(nvmDir, versions[0], "bin"));
+      }
+    } catch {
+      // ignore unreadable nvm dir
+    }
+  }
+
+  const existing = (process.env.PATH || "")
+    .split(":")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const p of [...existing, ...basePaths]) {
+    if (p && !seen.has(p)) {
+      seen.add(p);
+      merged.push(p);
+    }
+  }
+
+  return {
+    ...process.env,
+    PATH: merged.join(":"),
+  };
+}
+
+function formatMcpSpawnError(command: string, err: NodeJS.ErrnoException): Error {
+  const code = err.code || err.message || "SPAWN_ERROR";
+  return new Error(
+    `无法启动 MCP 命令 "${command}" (${code})：请确认该命令已安装或填写完整可执行路径`,
+  );
+}
+
 class StdioMcpConnection {
   private child: ChildProcessWithoutNullStreams | null = null;
+  private startError: Error | null = null;
   private nextId = 1;
   private readonly pending = new Map<
     number,
@@ -49,13 +110,32 @@ class StdioMcpConnection {
     private readonly args: string[],
   ) {}
 
-  async start(): Promise<void> {
+  private rejectAllPending(err: Error): void {
+    for (const p of this.pending.values()) {
+      p.reject(err);
+    }
+    this.pending.clear();
+  }
+
+  async start(timeoutMs = 8000): Promise<void> {
     if (this.child) return;
+    this.startError = null;
     const child = spawn(this.command, this.args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: buildEnhancedMcpEnv(),
     });
     this.child = child;
+    child.stdin.on("error", () => {
+      // Swallow EPIPE when child exits mid-write
+    });
+    child.on("error", (err: NodeJS.ErrnoException) => {
+      const wrapped = formatMcpSpawnError(this.command, err);
+      this.startError = wrapped;
+      if (this.child === child) {
+        this.child = null;
+      }
+      this.rejectAllPending(wrapped);
+    });
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       this.buffer += chunk;
@@ -87,26 +167,36 @@ class StdioMcpConnection {
       }
     });
     child.on("exit", (code) => {
-      for (const p of this.pending.values()) {
-        p.reject(new Error(`MCP process exited with code ${code ?? -1}`));
+      const err =
+        this.startError ??
+        new Error(`MCP process exited with code ${code ?? -1}`);
+      if (this.child === child) {
+        this.child = null;
       }
-      this.pending.clear();
-      this.child = null;
+      this.rejectAllPending(err);
     });
 
-    await this.request("initialize", {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "Valet", version: "0.1.0" },
-    });
+    await this.request(
+      "initialize",
+      {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "Valet", version: "0.1.0" },
+      },
+      timeoutMs,
+    );
     this.notify("notifications/initialized", {});
   }
 
   private notify(method: string, params: Record<string, unknown>): void {
-    if (!this.child) return;
-    this.child.stdin.write(
-      `${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`,
-    );
+    if (!this.child || this.child.stdin.destroyed) return;
+    try {
+      this.child.stdin.write(
+        `${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`,
+      );
+    } catch {
+      // Ignore write to closing stream
+    }
   }
 
   async request<T = unknown>(
@@ -114,6 +204,9 @@ class StdioMcpConnection {
     params: Record<string, unknown>,
     timeoutMs = 8000,
   ): Promise<T> {
+    if (this.startError) {
+      throw this.startError;
+    }
     if (!this.child) {
       throw new Error("MCP stdio process not started");
     }
@@ -136,16 +229,26 @@ class StdioMcpConnection {
           reject(err);
         },
       });
-      this.child!.stdin.write(
-        `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
-      );
+      try {
+        if (!this.child || this.child.stdin.destroyed) {
+          throw this.startError ?? new Error("MCP stdio stdin closed");
+        }
+        this.child.stdin.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
+        );
+      } catch (err) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
-  async listTools(): Promise<DiscoveredMcpTool[]> {
+  async listTools(timeoutMs = 8000): Promise<DiscoveredMcpTool[]> {
     const res = await this.request<{ tools?: DiscoveredMcpTool[] }>(
       "tools/list",
       {},
+      timeoutMs,
     );
     return Array.isArray(res?.tools) ? res.tools : [];
   }
@@ -160,10 +263,14 @@ class StdioMcpConnection {
 
   async close(): Promise<void> {
     if (this.child) {
-      this.child.kill();
+      try {
+        this.child.kill();
+      } catch {
+        // ignore kill error on already exited child
+      }
       this.child = null;
     }
-    this.pending.clear();
+    this.rejectAllPending(new Error("MCP stdio connection closed"));
   }
 }
 
@@ -171,7 +278,10 @@ class HttpMcpConnection {
   private nextId = 1;
   private sessionId: string | null = null;
 
-  constructor(private readonly url: string) {}
+  constructor(
+    private readonly url: string,
+    private readonly customHeaders?: Record<string, string>,
+  ) {}
 
   private async postJsonRpc<T = unknown>(
     payload: Record<string, unknown>,
@@ -181,6 +291,14 @@ class HttpMcpConnection {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
     };
+    if (this.customHeaders) {
+      for (const [k, v] of Object.entries(this.customHeaders)) {
+        const tk = k.trim();
+        if (tk && typeof v === "string" && v.trim()) {
+          headers[tk] = v.trim();
+        }
+      }
+    }
     if (this.sessionId) {
       headers["Mcp-Session-Id"] = this.sessionId;
     }
@@ -219,26 +337,32 @@ class HttpMcpConnection {
     return (parsed.result ?? parsed) as T;
   }
 
-  async initialize(): Promise<void> {
-    await this.postJsonRpc({
-      jsonrpc: "2.0",
-      id: this.nextId++,
-      method: "initialize",
-      params: {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: "Valet", version: "0.1.0" },
+  async initialize(timeoutMs = 8000): Promise<void> {
+    await this.postJsonRpc(
+      {
+        jsonrpc: "2.0",
+        id: this.nextId++,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "Valet", version: "0.1.0" },
+        },
       },
-    });
+      timeoutMs,
+    );
   }
 
-  async listTools(): Promise<DiscoveredMcpTool[]> {
-    const res = await this.postJsonRpc<{ tools?: DiscoveredMcpTool[] }>({
-      jsonrpc: "2.0",
-      id: this.nextId++,
-      method: "tools/list",
-      params: {},
-    });
+  async listTools(timeoutMs = 8000): Promise<DiscoveredMcpTool[]> {
+    const res = await this.postJsonRpc<{ tools?: DiscoveredMcpTool[] }>(
+      {
+        jsonrpc: "2.0",
+        id: this.nextId++,
+        method: "tools/list",
+        params: {},
+      },
+      timeoutMs,
+    );
     return Array.isArray(res?.tools) ? res.tools : [];
   }
 
@@ -274,7 +398,7 @@ export class McpClientManager {
         };
       }
       try {
-        const client = new HttpMcpConnection(server.url.trim());
+        const client = new HttpMcpConnection(server.url.trim(), server.headers);
         await client.initialize();
         const tools = await client.listTools();
         return {
@@ -334,6 +458,11 @@ export class McpClientManager {
     uninstallExt: (ext: Extension) => void,
   ): Promise<void> {
     const activeIds = new Set<string>();
+    const pendingConnects: Array<{
+      srv: McpServerConfig;
+      mode: "stdio" | "http";
+      sig: string;
+    }> = [];
 
     for (const srv of servers) {
       if (!srv.enabled) continue;
@@ -346,6 +475,7 @@ export class McpClientManager {
         command: srv.command ?? "",
         args: srv.args ?? [],
         url: srv.url ?? "",
+        headers: srv.headers ?? {},
       });
       const existing = this.sessions.get(srv.id);
       if (existing && existing.signature === sig) continue;
@@ -357,99 +487,111 @@ export class McpClientManager {
         this.sessions.delete(srv.id);
       }
 
-      try {
-        let tools: DiscoveredMcpTool[] = [];
-        let callToolFn: (name: string, args: Record<string, unknown>) => Promise<unknown>;
-        let closeFn: () => Promise<void> = async () => {};
-
-        if (mode === "stdio" && srv.command) {
-          const client = new StdioMcpConnection(srv.command, srv.args ?? []);
-          await client.start();
-          tools = await client.listTools();
-          callToolFn = (n, a) => client.callTool(n, a);
-          closeFn = () => client.close();
-        } else if (mode === "http" && srv.url) {
-          const client = new HttpMcpConnection(srv.url);
-          await client.initialize();
-          tools = await client.listTools();
-          callToolFn = (n, a) => client.callTool(n, a);
-        } else {
-          continue;
-        }
-
-        const pluginKey = `mcp:${srv.id}`;
-        policyRegistry.unregisterByPlugin(pluginKey);
-
-        const compiledTools = tools.map((t) => {
-          const safeToolName = `mcp_${sanitizeMcpIdent(srv.id)}_${sanitizeMcpIdent(t.name)}`;
-          const readonly = isReadOnlyMcpTool(t.name);
-          policyRegistry.register({
-            toolName: safeToolName,
-            pluginId: pluginKey,
-            pluginName: `MCP · ${srv.name}`,
-            actionId: t.name,
-            eventCode: "mcp.tool_call",
-            safety: readonly ? "readonly" : "confirm_always",
-            category: "outbound",
-            iconKind: "pulse",
-            warningTag: readonly ? undefined : "不可撤销",
-            reversible7d: false,
-            approveLabel: "批准调用",
-            dismissLabel: "拒绝",
-            checklistKey: readonly ? undefined : "runTerminalCommand",
-          });
-
-          const rawSchema: Record<string, unknown> =
-            t.inputSchema && typeof t.inputSchema === "object"
-              ? {
-                  type: "object",
-                  ...t.inputSchema,
-                }
-              : { type: "object", properties: {} };
-
-          return defineTool({
-            name: safeToolName,
-            description:
-              t.description || `External MCP tool ${t.name} from ${srv.name}.`,
-            parameters: unsafe<Record<string, unknown>>(rawSchema as unknown as Schema),
-            ...(readonly ? { replay: "safe" as const } : {}),
-            execute: async (args) => {
-              const res = await callToolFn(t.name, args ?? {});
-              return {
-                output: [
-                  {
-                    type: "text" as const,
-                    text: typeof res === "string" ? res : JSON.stringify(res, null, 2),
-                  },
-                ],
-              };
-            },
-          });
-        });
-
-        const ext = defineExtension({
-          name: pluginKey,
-          sections: [
-            section(`mcp_${sanitizeMcpIdent(srv.id)}`, () => {
-              return `已连接 MCP 服务器「${srv.name}」(${srv.transportLabel})：提供工具 ${tools.map((t) => `mcp_${sanitizeMcpIdent(srv.id)}_${sanitizeMcpIdent(t.name)}`).join(", ") || "无"}。`;
-            }),
-          ],
-          tools: compiledTools,
-        });
-
-        installExt(ext);
-        this.sessions.set(srv.id, {
-          config: srv,
-          signature: sig,
-          tools,
-          ext,
-          callTool: callToolFn,
-          close: closeFn,
-        });
-      } catch (err) {
-        console.error(`[mcp] failed connecting ${srv.name}:`, err);
-      }
+      pendingConnects.push({ srv, mode, sig });
     }
+
+    const connectTimeoutMs = 6000;
+    await Promise.allSettled(
+      pendingConnects.map(async ({ srv, mode, sig }) => {
+        try {
+          let tools: DiscoveredMcpTool[] = [];
+          let callToolFn: (name: string, args: Record<string, unknown>) => Promise<unknown>;
+          let closeFn: () => Promise<void> = async () => {};
+
+          if (mode === "stdio" && srv.command) {
+            const client = new StdioMcpConnection(srv.command, srv.args ?? []);
+            try {
+              await client.start(connectTimeoutMs);
+              tools = await client.listTools(connectTimeoutMs);
+              callToolFn = (n, a) => client.callTool(n, a);
+              closeFn = () => client.close();
+            } catch (err) {
+              await client.close().catch(() => {});
+              throw err;
+            }
+          } else if (mode === "http" && srv.url) {
+            const client = new HttpMcpConnection(srv.url, srv.headers);
+            await client.initialize(connectTimeoutMs);
+            tools = await client.listTools(connectTimeoutMs);
+            callToolFn = (n, a) => client.callTool(n, a);
+          } else {
+            return;
+          }
+
+          const pluginKey = `mcp:${srv.id}`;
+          policyRegistry.unregisterByPlugin(pluginKey);
+
+          const compiledTools = tools.map((t) => {
+            const safeToolName = `mcp_${sanitizeMcpIdent(srv.id)}_${sanitizeMcpIdent(t.name)}`;
+            const readonly = isReadOnlyMcpTool(t.name);
+            policyRegistry.register({
+              toolName: safeToolName,
+              pluginId: pluginKey,
+              pluginName: `MCP · ${srv.name}`,
+              actionId: t.name,
+              eventCode: "mcp.tool_call",
+              safety: readonly ? "readonly" : "confirm_always",
+              category: "outbound",
+              iconKind: "pulse",
+              warningTag: readonly ? undefined : "不可撤销",
+              reversible7d: false,
+              approveLabel: "批准调用",
+              dismissLabel: "拒绝",
+              checklistKey: readonly ? undefined : "runTerminalCommand",
+            });
+
+            const rawSchema: Record<string, unknown> =
+              t.inputSchema && typeof t.inputSchema === "object"
+                ? {
+                    type: "object",
+                    ...t.inputSchema,
+                  }
+                : { type: "object", properties: {} };
+
+            return defineTool({
+              name: safeToolName,
+              description:
+                t.description || `External MCP tool ${t.name} from ${srv.name}.`,
+              parameters: unsafe<Record<string, unknown>>(rawSchema as unknown as Schema),
+              ...(readonly ? { replay: "safe" as const } : {}),
+              execute: async (args) => {
+                const res = await callToolFn(t.name, args ?? {});
+                return {
+                  output: [
+                    {
+                      type: "text" as const,
+                      text: typeof res === "string" ? res : JSON.stringify(res, null, 2),
+                    },
+                  ],
+                };
+              },
+            });
+          });
+
+          const ext = defineExtension({
+            name: pluginKey,
+            sections: [
+              section(`mcp_${sanitizeMcpIdent(srv.id)}`, () => {
+                return `已连接 MCP 服务器「${srv.name}」(${srv.transportLabel})：提供工具 ${tools.map((t) => `mcp_${sanitizeMcpIdent(srv.id)}_${sanitizeMcpIdent(t.name)}`).join(", ") || "无"}。`;
+              }),
+            ],
+            tools: compiledTools,
+          });
+
+          installExt(ext);
+          this.sessions.set(srv.id, {
+            config: srv,
+            signature: sig,
+            tools,
+            ext,
+            callTool: callToolFn,
+            close: closeFn,
+          });
+        } catch (err) {
+          console.error(`[mcp] failed connecting ${srv.name}:`, err);
+        }
+      }),
+    );
 
     for (const [id, sess] of [...this.sessions.entries()]) {
       if (!activeIds.has(id)) {

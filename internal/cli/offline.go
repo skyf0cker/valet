@@ -278,12 +278,20 @@ type offlineBackend struct {
 	dataDir string
 	homeDir string
 	st      *store.Store
+	secrets *store.SecretsStore
 }
 
 func openOfflineBackend(dataDir string) (*offlineBackend, error) {
 	home, _ := os.UserHomeDir()
-	st, err := store.Open(dataDir, home)
+	st, err := store.OpenWithOptions(dataDir, home, true)
 	if err != nil {
+		return nil, err
+	}
+	secStore, err := store.OpenSecretsStore(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := secStore.HydrateSnapshot(st, store.HydrateSecretsOptions{DesktopReady: false}, maskSecretOffline); err != nil {
 		return nil, err
 	}
 	if bundles, dErr := plugins.DiscoverLocalPlugins(filepath.Join(dataDir, "plugins")); dErr == nil && len(bundles) > 0 {
@@ -293,7 +301,7 @@ func openOfflineBackend(dataDir string) (*offlineBackend, error) {
 			}
 		})
 	}
-	return &offlineBackend{dataDir: dataDir, homeDir: home, st: st}, nil
+	return &offlineBackend{dataDir: dataDir, homeDir: home, st: st, secrets: secStore}, nil
 }
 
 func (o *offlineBackend) mode() string { return "offline" }
@@ -457,6 +465,10 @@ func (o *offlineBackend) providerUpdate(body map[string]any) (map[string]any, er
 	pid, _ := body["providerId"].(string)
 	pid = strings.TrimSpace(pid)
 	found := false
+	var (
+		hasKeyUpdate bool
+		updatedKey   string
+	)
 	next := o.st.Update(func(st *types.ValetSnapshot) {
 		for i := range st.Providers {
 			if st.Providers[i].ID != pid {
@@ -465,6 +477,8 @@ func (o *offlineBackend) providerUpdate(body map[string]any) (map[string]any, er
 			found = true
 			if k, ok := body["apiKey"].(string); ok {
 				k = strings.TrimSpace(k)
+				hasKeyUpdate = true
+				updatedKey = k
 				st.Providers[i].APIKey = k
 				st.Providers[i].APIKeyMasked = maskSecretOffline(k)
 			}
@@ -492,6 +506,11 @@ func (o *offlineBackend) providerUpdate(body map[string]any) (map[string]any, er
 	})
 	if !found {
 		return nil, fmt.Errorf("未找到服务商: %q", pid)
+	}
+	if hasKeyUpdate && o.secrets != nil {
+		if err := o.secrets.SetProviderKey(pid, updatedKey); err != nil {
+			return nil, err
+		}
 	}
 	var updated types.AgentProviderConfig
 	for _, p := range redactProvidersOffline(next.Providers) {

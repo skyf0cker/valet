@@ -755,7 +755,8 @@ export function deriveFallbackSessionTitle(
       (a) =>
         a.kind === "notebook_context" ||
         a.kind === "inbox_item" ||
-        a.kind === "timeline_event"
+        a.kind === "timeline_event" ||
+        a.kind === "message_quote"
     );
     if (refAtt) {
       let candidate = "";

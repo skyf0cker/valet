@@ -14,6 +14,7 @@ export default defineConfig({
   out: "build",
   resourcesExclude: ["sidecar.entitlements.plist"],
   macos: {
+    signingIdentity: process.env.VALET_SIGNING_IDENTITY || undefined,
     helperEntitlements: {
       "bin/valet-bun": "resources/sidecar.entitlements.plist",
     },

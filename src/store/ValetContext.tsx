@@ -499,6 +499,7 @@ export interface ValetContextValue {
   setComposerDraft: (chatId: string, draft: ComposerDraft) => void;
   quoteInboxItemToChat: (itemId: string) => void;
   quoteTimelineEventToChat: (eventId: string) => void;
+  quoteMessageToChat: (chatId: string, attachment: ChatAttachment) => void;
   markChatRead: (chatId: string) => void;
   markAllChatsRead: (projectId?: string) => void;
   selectChatThread: (chatId: string) => void;
@@ -2580,6 +2581,32 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     [attachQuoteToChat]
   );
 
+  const quoteMessageToChat = useCallback(
+    (chatId: string, attachment: ChatAttachment) => {
+      const targetChatId = chatId || stateRef.current.activeChatId || "chat-default";
+      const existing = composerDraftsRef.current[targetChatId] ?? {
+        text: "",
+        attachments: [],
+        mentionPluginId: "",
+      };
+      const alreadyIdx = existing.attachments.findIndex((a) => a.id === attachment.id);
+      const nextAttachments =
+        alreadyIdx >= 0
+          ? existing.attachments.map((a, i) => (i === alreadyIdx ? attachment : a))
+          : [...existing.attachments, attachment];
+
+      composerDraftsRef.current[targetChatId] = {
+        ...existing,
+        attachments: nextAttachments,
+      };
+      setComposerQuoteSignal((prev) => ({
+        tick: (prev?.tick ?? 0) + 1,
+        chatId: targetChatId,
+      }));
+    },
+    []
+  );
+
   const openInboxItemInTimeline = useCallback(
     (itemId: string) => {
       const cur = stateRef.current;
@@ -4087,6 +4114,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setComposerDraft,
       quoteInboxItemToChat,
       quoteTimelineEventToChat,
+      quoteMessageToChat,
       markChatRead,
       markAllChatsRead,
       focusedNotebookBlock,
@@ -4193,6 +4221,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       pushToast,
       quoteInboxItemToChat,
       quoteTimelineEventToChat,
+      quoteMessageToChat,
       reconnectMcpServer,
       refreshPermissions,
       reloadPlugin,
