@@ -520,7 +520,13 @@ export interface HeartbeatRunLog {
 }
 
 export type AppearanceMode = "light" | "dark" | "auto";
-export type DarkThemeId = "obsidian" | "espresso" | "chronometer";
+export type DarkThemeId =
+  | "cursor"
+  | "vercel"
+  | "vesper"
+  | "onedark"
+  | "tokyo-night"
+  | "catppuccin";
 export type ToneStyle = "formal" | "concise" | "friendly";
 
 export interface SafetyConfirmationChecklist {

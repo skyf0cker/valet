@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { copyTextToClipboard } from "../../utils/chatClipboard";
 import {
   computeQuotePopoverPosition,
   normalizeSelectedQuoteText,
@@ -241,8 +242,11 @@ export const SelectionQuotePopover: React.FC<SelectionQuotePopoverProps> = ({
         type="button"
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => {
-          void navigator.clipboard?.writeText(active.text);
-          onCopy?.(active.text);
+          void copyTextToClipboard(active.text).then((ok) => {
+            if (ok) {
+              onCopy?.(active.text);
+            }
+          });
           clearSelection();
         }}
         className="inline-flex h-[26px] cursor-pointer items-center rounded-[7px] px-2 text-[11.5px] font-medium text-[var(--ink-muted)] transition-colors hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"

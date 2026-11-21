@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { copyTextToClipboard } from "../../utils/chatClipboard";
 
 const CodeBlockCard: React.FC<{ language: string; code: string }> = ({
   language,
@@ -7,7 +8,8 @@ const CodeBlockCard: React.FC<{ language: string; code: string }> = ({
   const [copied, setCopied] = useState(false);
 
   const handleCopy = () => {
-    void navigator.clipboard?.writeText(code).then(() => {
+    void copyTextToClipboard(code).then((ok) => {
+      if (!ok) return;
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1400);
     });
@@ -466,7 +468,7 @@ function renderInline(
         nodes.push(
           <code
             key={key}
-            className="rounded-[4px] bg-[var(--bg-muted)] px-1 py-0.5 font-mono text-[12px] font-semibold text-[var(--ink-strong)]"
+            className="break-words rounded-[4px] border border-[var(--border-subtle)] bg-[var(--bg-code)] px-1 py-[1px] font-mono text-[12px] font-semibold text-[var(--ink-strong)]"
           >
             {normalizeCodeSpanContent(text.slice(span.contentStart, span.closeStart))}
           </code>

@@ -68,7 +68,7 @@ func seedPreferences() types.ValetPreferences {
 		LaunchAtLogin:      false,
 		ShowMenuBarIcon:    true,
 		Appearance:         "auto",
-		DarkTheme:          "obsidian",
+		DarkTheme:          "cursor",
 		Language:           "简体中文",
 		GlobalHotkey:       []string{"⌥", "Space"},
 		BusyMessagePolicy:  "queue",

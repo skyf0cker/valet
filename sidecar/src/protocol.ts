@@ -89,7 +89,7 @@ export interface ValetPreferences {
   cleanupPolicy: CleanupPolicySettings;
   pluginRuntime: PluginRuntimeSettings;
   appearance?: "light" | "dark" | "auto";
-  darkTheme?: "obsidian" | "espresso" | "chronometer";
+  darkTheme?: "cursor" | "vercel" | "vesper" | "onedark" | "tokyo-night" | "catppuccin";
   busyMessagePolicy?: "queue" | "steer";
   heartbeat?: {
     enabled: boolean;

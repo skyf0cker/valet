@@ -517,7 +517,7 @@ type ValetPreferences struct {
 	LaunchAtLogin         bool                        `json:"launchAtLogin"`
 	ShowMenuBarIcon       bool                        `json:"showMenuBarIcon"`
 	Appearance            string                      `json:"appearance"` // "light" | "dark" | "auto"
-	DarkTheme             string                      `json:"darkTheme,omitempty"` // "obsidian" | "espresso" | "chronometer"
+	DarkTheme             string                      `json:"darkTheme,omitempty"` // "cursor" | "vercel" | "vesper" | "onedark" | "tokyo-night" | "catppuccin"
 	Language              string                      `json:"language"`
 	GlobalHotkey          []string                    `json:"globalHotkey"`
 	BusyMessagePolicy     string                      `json:"busyMessagePolicy,omitempty"` // "queue" | "steer"
@@ -756,10 +756,10 @@ type BuiltinSkillMeta struct {
 // NormalizeDarkTheme clamps darkTheme to a supported palette ID.
 func NormalizeDarkTheme(raw string) string {
 	switch raw {
-	case "obsidian", "espresso", "chronometer":
+	case "cursor", "vercel", "vesper", "onedark", "tokyo-night", "catppuccin":
 		return raw
 	default:
-		return "obsidian"
+		return "cursor"
 	}
 }
 

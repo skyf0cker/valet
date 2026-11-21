@@ -1855,7 +1855,7 @@ export const INITIAL_PREFERENCES: ValetPreferences = {
   launchAtLogin: true,
   showMenuBarIcon: true,
   appearance: "light",
-  darkTheme: "obsidian",
+  darkTheme: "cursor",
   language: "简体中文",
   globalHotkey: ["⌥", "Space"],
   busyMessagePolicy: "queue",

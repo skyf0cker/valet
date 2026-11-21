@@ -225,4 +225,43 @@ describe("MarkdownRenderer", () => {
     expect(html).toContain("-ml-4 flex list-none items-start gap-2");
     expect(html).toContain('class="pl-0.5">普通条目</li>');
   });
+
+  it("renders multi-line user queries with fenced code blocks, single newlines, indentation, and inline triple-backtick commands", () => {
+    const fencedUserQuery = [
+      "账号是 root，密码是 example-pass，",
+      "```",
+      "ssh root@192.0.2.1 -p 22",
+      "```",
+      "你自己去排查下吧",
+    ].join("\n");
+
+    const fencedHtml = render(fencedUserQuery);
+    expect(fencedHtml.match(/<p\b/g) ?? []).toHaveLength(2);
+    expect(fencedHtml.match(/<pre\b/g) ?? []).toHaveLength(1);
+    expect(fencedHtml).not.toContain("```");
+    expect(decodeHtml(fencedHtml)).toContain("<code>ssh root@192.0.2.1 -p 22</code>");
+
+    const jsonAndNewlines = [
+      "{",
+      '  "mcpServers": {',
+      '    "tower": "https://example.com/mcp"',
+      "  }",
+      "}",
+      "第一行",
+      "第二行",
+    ].join("\n");
+
+    const plainHtml = render(jsonAndNewlines);
+    expect(plainHtml).toContain('<p class="whitespace-pre-wrap break-words">');
+    expect(plainHtml).toContain('href="https://example.com/mcp"');
+    expect(decodeHtml(plainHtml).replace(/<[^>]+>/g, "")).toBe(
+      '{\n  "mcpServers": {\n    "tower": "https://example.com/mcp"\n  }\n}\n第一行\n第二行'
+    );
+
+    const inlineTriple = "试试 ``` ssh root@192.0.2.1 -p 22 ``` 这条命令";
+    const inlineHtml = render(inlineTriple);
+    expect(inlineHtml).not.toContain("<pre");
+    expect(inlineHtml).toContain("break-words");
+    expect(decodeHtml(inlineHtml)).toContain(">ssh root@192.0.2.1 -p 22</code>");
+  });
 });

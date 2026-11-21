@@ -871,3 +871,15 @@ export const DotRingSpinner: React.FC<IconProps> = ({ size = 15, className = "" 
     ))}
   </svg>
 );
+
+export const CopyIcon: React.FC<IconProps> = ({ size = 14, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
+    <rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.8" />
+    <path
+      d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+    />
+  </svg>
+);

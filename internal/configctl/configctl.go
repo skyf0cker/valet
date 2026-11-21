@@ -38,7 +38,7 @@ var registry = []keyHandler{
 	boolHandler("launchAtLogin", "general", false, "开机自动启动 Valet", func(p *types.ValetPreferences) *bool { return &p.LaunchAtLogin }),
 	boolHandler("showMenuBarIcon", "general", false, "在系统菜单栏常驻托盘图标", func(p *types.ValetPreferences) *bool { return &p.ShowMenuBarIcon }),
 	enumHandler("appearance", "general", false, []string{"light", "dark", "auto"}, "外观模式（浅色 / 深色 / 跟随系统）", func(p *types.ValetPreferences) *string { return &p.Appearance }),
-	enumHandler("darkTheme", "general", false, []string{"obsidian", "espresso", "chronometer"}, "深色主题配色（obsidian=午夜黑曜石 / espresso=暖岩黑胡桃 / chronometer=深松怀表）", func(p *types.ValetPreferences) *string { return &p.DarkTheme }),
+	enumHandler("darkTheme", "general", false, []string{"cursor", "vercel", "vesper", "onedark", "tokyo-night", "catppuccin"}, "深色主题配色（cursor=Cursor Dark / vercel=Vercel / vesper=Vesper / onedark=One Dark Pro / tokyo-night=Tokyo Night / catppuccin=Catppuccin Mocha）", func(p *types.ValetPreferences) *string { return &p.DarkTheme }),
 	strHandler("language", "general", false, false, "界面与对话首选语言", func(p *types.ValetPreferences) *string { return &p.Language }),
 	sliceHandler("globalHotkey", "general", false, "全局呼出快捷键按键列表", func(p *types.ValetPreferences) *[]string { return &p.GlobalHotkey }),
 	enumHandler("busyMessagePolicy", "general", false, []string{"queue", "steer"}, "对话生成期间收到新消息的策略（排队 / 立即插话）", func(p *types.ValetPreferences) *string { return &p.BusyMessagePolicy }),

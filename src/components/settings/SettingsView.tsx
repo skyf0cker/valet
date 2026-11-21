@@ -72,7 +72,7 @@ const SECTIONS: SectionMeta[] = [
     title: "通用",
     group: "Agent",
     subtitle: "启动、菜单栏驻留、浅色/深色多主题配色与运行中消息发送策略",
-    keywords: "通用 启动 外观 深色 浅色 自动 语言 消息 引导 排队 主题 配色 午夜黑曜石 暖岩黑胡桃 深松怀表 obsidian espresso chronometer theme",
+    keywords: "通用 启动 外观 深色 浅色 自动 语言 消息 引导 排队 主题 配色 cursor vercel vesper onedark tokyo-night catppuccin ide theme",
   },
   {
     id: "models",
@@ -986,7 +986,7 @@ export const SettingsView: React.FC = () => {
                       </span>
                     </div>
                     <span className="font-mono text-[10.5px] text-[var(--ink-muted)]">
-                      {activeDarkMeta.enName}
+                      {activeDarkMeta.name}
                     </span>
                   </div>
 

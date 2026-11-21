@@ -5,6 +5,7 @@ import type {
   PluginDraftSpec,
 } from "../../types/valet";
 import { CheckIcon } from "../ui/Icons";
+import { stripThinkMarkup } from "../../utils/chatClipboard";
 import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { Modal } from "../ui/Modal";
 import { AgentWorkTrace } from "./AgentWorkTrace";
@@ -237,15 +238,6 @@ export const PluginDraftCard: React.FC<{
     </>
   );
 };
-
-function stripThinkMarkup(raw: string): string {
-  if (!raw) return "";
-  let clean = raw.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "");
-  if (/<think(?:ing)?>/i.test(clean)) {
-    clean = clean.replace(/<think(?:ing)?>[\s\S]*$/i, "");
-  }
-  return clean.replace(/^\s+/, "");
-}
 
 export const ToolStepsList: React.FC<{ steps: StepRowItem[] }> = ({ steps }) => {
   if (!steps || steps.length === 0) return null;

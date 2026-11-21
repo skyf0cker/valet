@@ -51,8 +51,8 @@ func TestSchemaAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get darkTheme failed: %v", err)
 	}
-	if darkThemeVal != "obsidian" {
-		t.Fatalf("expected darkTheme=\"obsidian\", got %#v", darkThemeVal)
+	if darkThemeVal != "cursor" {
+		t.Fatalf("expected darkTheme=\"cursor\", got %#v", darkThemeVal)
 	}
 
 	if _, err := configctl.Get(snap.Preferences, "nonexistent.key.xyz"); err == nil {
@@ -66,7 +66,7 @@ func TestApplyUpdatesAndValidation(t *testing.T) {
 	// 1. Scalar, enum, int range, float & heartbeat initialization
 	changes, err := configctl.ApplyUpdates(&snap, map[string]string{
 		"appearance":            "dark",
-		"darkTheme":             "espresso",
+		"darkTheme":             "vesper",
 		"dailySpendLimit":       "45.5",
 		"maxStepsPerTask":       "40",
 		"heartbeat.intervalMin": "15",
@@ -77,7 +77,7 @@ func TestApplyUpdatesAndValidation(t *testing.T) {
 	if len(changes) != 5 {
 		t.Fatalf("expected 5 ChangeRecords, got %d", len(changes))
 	}
-	if snap.Preferences.Appearance != "dark" || snap.Preferences.DarkTheme != "espresso" ||
+	if snap.Preferences.Appearance != "dark" || snap.Preferences.DarkTheme != "vesper" ||
 		snap.Preferences.DailySpendLimit != 45.5 ||
 		snap.Preferences.MaxStepsPerTask != 40 || snap.Preferences.Heartbeat.IntervalMin != 15 {
 		t.Fatalf("preferences not updated as expected: %+v", snap.Preferences)
@@ -196,6 +196,11 @@ func TestApplyUpdatesAndValidation(t *testing.T) {
 		"darkTheme": "neon",
 	}); err == nil {
 		t.Fatal("expected validation error for unsupported darkTheme")
+	}
+	if _, err := configctl.ApplyUpdates(&snap, map[string]string{
+		"darkTheme": "obsidian",
+	}); err == nil {
+		t.Fatal("expected validation error for removed legacy darkTheme")
 	}
 }
 

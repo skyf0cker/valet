@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useValet } from "../../store/ValetContext";
 import { DEFAULT_PROJECT_ID } from "../../types/valet";
+import { getCopyableMessageText } from "../../utils/chatClipboard";
 import {
   buildMessageQuoteAttachment,
   isMessageQuoteAttachment,
@@ -17,6 +18,7 @@ import {
   PlusIcon,
   QuoteBlockIcon,
 } from "../ui/Icons";
+import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { SelectMenu } from "../ui/SelectMenu";
 import { AgentWorkTrace } from "./AgentWorkTrace";
 import { ChatComposer } from "./ChatComposer";
@@ -26,6 +28,7 @@ import {
   PluginDraftCard,
   ProcessTableCard,
 } from "./MessageCards";
+import { MessageCopyButton } from "./MessageCopyButton";
 import { SelectionQuotePopover } from "./SelectionQuotePopover";
 
 export const ChatView: React.FC = () => {
@@ -291,13 +294,21 @@ export const ChatView: React.FC = () => {
               <div
                 key={msg.id}
                 data-message-id={msg.id}
-                className={`flex justify-end rounded-[12px] transition-colors ${
+                className={`group flex items-end justify-end gap-1.5 rounded-[12px] transition-colors ${
                   highlightedMsgId === msg.id
                     ? "-m-1.5 bg-[var(--bg-subtle)]/55 p-1.5 ring-1 ring-[var(--ink-primary)]/40"
                     : ""
                 }`}
               >
-                <div className="flex max-w-[460px] flex-col items-end gap-1.5">
+                <MessageCopyButton
+                  text={msg.content}
+                  title="复制消息"
+                  showCopiedText={false}
+                  iconSize={13}
+                  className="mb-1 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 data-[copied=true]:opacity-100"
+                  onError={() => pushToast("复制失败，请手动选择复制", "danger")}
+                />
+                <div className="flex min-w-0 max-w-[min(84%,540px)] flex-col items-end gap-1.5">
                   {msg.attachments && msg.attachments.length > 0 && (
                     <div className="flex flex-wrap justify-end gap-1.5">
                       {msg.attachments.map((att) =>
@@ -470,13 +481,15 @@ export const ChatView: React.FC = () => {
                       )}
                     </div>
                   )}
-                  <div
-                    data-quote-message-id={msg.id}
-                    data-quote-role="user"
-                    className="rounded-t-[16px] rounded-bl-[16px] rounded-br-[4px] border border-[var(--border-light)] bg-[var(--bg-elevated)] px-3.5 py-2 text-[13px] leading-[20px] text-[var(--ink-body)] lg:px-[15px] lg:py-[11px] lg:text-[14px] lg:leading-[22px]"
-                  >
-                    {msg.content}
-                  </div>
+                  {msg.content.trim().length > 0 && (
+                    <div
+                      data-quote-message-id={msg.id}
+                      data-quote-role="user"
+                      className="min-w-0 max-w-full rounded-t-[16px] rounded-bl-[16px] rounded-br-[4px] border border-[var(--border-light)] bg-[var(--bg-elevated)] px-3.5 py-2 text-[13px] leading-[20px] text-[var(--ink-body)] lg:px-[15px] lg:py-[11px] lg:text-[14px] lg:leading-[22px]"
+                    >
+                      <MarkdownRenderer text={msg.content} />
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
@@ -542,6 +555,26 @@ export const ChatView: React.FC = () => {
                       }
                     />
                   )}
+
+                  {(() => {
+                    const copyableReply = getCopyableMessageText(msg.content);
+                    if (!copyableReply) return null;
+                    return (
+                      <div className="mt-0.5 flex select-none items-center gap-2">
+                        <MessageCopyButton
+                          text={copyableReply}
+                          title="复制回复"
+                          className="-ml-1.5"
+                          onError={() => pushToast("复制失败，请手动选择复制", "danger")}
+                        />
+                        {msg.createdAt && (
+                          <span className="font-mono text-[11px] text-[var(--ink-subtle)]">
+                            {msg.createdAt}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
             )
