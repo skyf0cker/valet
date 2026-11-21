@@ -383,6 +383,8 @@ export interface ChatMessage {
   createdAt: string;
   attachments?: ChatAttachment[];
   steps?: ChatStreamStep[];
+  workDurationMs?: number;
+  thinkingSummary?: string;
   processTable?: {
     rows: ProcessSampleRow[];
     primaryActionDone?: boolean;

@@ -830,3 +830,44 @@ export const ProjectGlyph: React.FC<{ icon?: string; size?: number; className?: 
       return <BookOpenIcon size={size} className={className} />;
   }
 };
+
+export const GlobeIcon: React.FC<IconProps> = ({ size = 14, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
+    <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.65" />
+    <ellipse cx="12" cy="12" rx="4" ry="9" stroke="currentColor" strokeWidth="1.65" />
+    <path d="M3.6 9h16.8M3.6 15h16.8" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" />
+  </svg>
+);
+
+const DOT_RING_COORDS: ReadonlyArray<{ cx: number; cy: number; opacity: number }> = [
+  { cx: 10, cy: 3.5, opacity: 1 },
+  { cx: 14.6, cy: 5.4, opacity: 0.84 },
+  { cx: 16.5, cy: 10, opacity: 0.68 },
+  { cx: 14.6, cy: 14.6, opacity: 0.54 },
+  { cx: 10, cy: 16.5, opacity: 0.4 },
+  { cx: 5.4, cy: 14.6, opacity: 0.28 },
+  { cx: 3.5, cy: 10, opacity: 0.18 },
+  { cx: 5.4, cy: 5.4, opacity: 0.1 },
+];
+
+export const DotRingSpinner: React.FC<IconProps> = ({ size = 15, className = "" }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 20 20"
+    fill="none"
+    className={`animate-valet-dot-spin ${className}`.trim()}
+    aria-hidden="true"
+  >
+    {DOT_RING_COORDS.map((dot, idx) => (
+      <circle
+        key={idx}
+        cx={dot.cx}
+        cy={dot.cy}
+        r="1.35"
+        fill="currentColor"
+        opacity={dot.opacity}
+      />
+    ))}
+  </svg>
+);

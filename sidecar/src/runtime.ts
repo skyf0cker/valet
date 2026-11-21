@@ -135,6 +135,36 @@ export function stripThinkTags(raw: string): {
   };
 }
 
+export function extractThinkingFromMessage(
+  contentBlocks?: readonly unknown[],
+  rawText?: string,
+): string {
+  const parts: string[] = [];
+  if (Array.isArray(contentBlocks)) {
+    for (const block of contentBlocks) {
+      if (!block || typeof block !== "object") continue;
+      const b = block as { type?: unknown; thinking?: unknown; text?: unknown };
+      if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) {
+        parts.push(b.thinking.trim());
+      } else if (b.type === "text" && typeof b.text === "string" && !rawText) {
+        const matches = b.text.matchAll(/<think(?:ing)?>([\s\S]*?)(?:<\/think(?:ing)?>|$)/gi);
+        for (const m of matches) {
+          if (m[1]?.trim()) parts.push(m[1].trim());
+        }
+      }
+    }
+  }
+  if (rawText) {
+    const matches = rawText.matchAll(/<think(?:ing)?>([\s\S]*?)(?:<\/think(?:ing)?>|$)/gi);
+    for (const m of matches) {
+      if (m[1]?.trim()) parts.push(m[1].trim());
+    }
+  }
+  const combined = parts.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!combined) return "";
+  return combined.length > 1500 ? `…${combined.slice(-1499)}` : combined;
+}
+
 export function summarizeStreamStatus(
   steps: ChatStreamStep[],
   hasPartialText: boolean,
@@ -154,12 +184,19 @@ export function summarizeStreamStatus(
   return "正在思考与分析…";
 }
 
-function humanizeToolStepLabel(
+export function humanizeToolStepLabel(
   name: string,
   args?: Record<string, unknown>,
 ): string {
   switch (name) {
     case "bash": {
+      const reason =
+        typeof args?.reason === "string"
+          ? args.reason.trim().replace(/\s+/g, " ")
+          : "";
+      if (reason) {
+        return reason.length > 42 ? `${reason.slice(0, 41)}…` : reason;
+      }
       const rawCmd =
         typeof args?.command === "string"
           ? args.command.trim().replace(/\s+/g, " ")
@@ -230,23 +267,89 @@ function humanizeToolStepLabel(
       return args?.title
         ? `发送通知 · ${String(args.title)}`
         : "发送 Outbox 通知";
-    default:
-      return name.replace(/^(plugin_|mcp_)/, "").replace(/_/g, " ");
+    default: {
+      if (name.startsWith("mcp_")) {
+        const stripped = name.replace(/^mcp_(?:mcp_)?[a-z0-9]+_/i, "");
+        if (/web_?search|search/i.test(stripped)) {
+          const query =
+            typeof args?.query === "string"
+              ? args.query.trim().replace(/\s+/g, " ")
+              : "";
+          if (query) {
+            const shortQ = query.length > 32 ? `${query.slice(0, 31)}…` : query;
+            return `搜索网络 · ${shortQ}`;
+          }
+          return "搜索网络";
+        }
+        if (/web_?fetch|fetch|crawl|browse/i.test(stripped)) {
+          const rawUrl =
+            (Array.isArray(args?.urls) && typeof args.urls[0] === "string"
+              ? args.urls[0]
+              : undefined) ??
+            (typeof args?.url === "string" ? args.url : undefined);
+          if (rawUrl) {
+            let formatted = rawUrl.trim();
+            try {
+              const u = new URL(formatted);
+              formatted = `${u.hostname}${u.pathname && u.pathname !== "/" ? u.pathname : ""}`;
+            } catch {
+              // keep raw string
+            }
+            const shortUrl =
+              formatted.length > 36 ? `${formatted.slice(0, 35)}…` : formatted;
+            return `读取网页 · ${shortUrl}`;
+          }
+          return "读取网页";
+        }
+        return stripped.replace(/_/g, " ") || name;
+      }
+      return name.replace(/^plugin_/, "").replace(/_/g, " ");
+    }
   }
 }
 
-function summarizeToolOutput(rawText: string): string | undefined {
-  const trimmed = rawText.trim();
-  if (!trimmed) return undefined;
-  if (trimmed.includes("NEEDS_APPROVAL(")) {
+export function summarizeToolOutput(rawText: string): string | undefined {
+  let source = rawText.trim();
+  if (!source) return undefined;
+  if (source.includes("NEEDS_APPROVAL(")) {
     return "已转入收件箱等待确认";
   }
-  const lines = trimmed
+
+  if (source.startsWith("{") || source.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(source) as {
+        content?: Array<{ type?: unknown; text?: unknown }>;
+      };
+      if (parsed && Array.isArray(parsed.content)) {
+        const textParts = parsed.content
+          .filter((item) => item && item.type === "text" && typeof item.text === "string")
+          .map((item) => (item.text as string).trim())
+          .filter(Boolean);
+        if (textParts.length > 0) {
+          source = textParts.join("\n");
+        }
+      }
+    } catch {
+      // Fall back to line-based extraction for partial/non-JSON output
+    }
+  }
+
+  const lines = source
     .split(/\r?\n/)
     .map((l) => l.trim())
-    .filter(Boolean);
-  const picked =
-    lines.find((l) => !l.startsWith("{") && !l.startsWith("[")) ?? lines[0];
+    .filter(Boolean)
+    .filter((l) => !/^\[exit=\d+,\s*cwd=[^\]]+\]$/.test(l));
+
+  const isNoisyLine = (l: string): boolean =>
+    /^[\[\]{},]+$/.test(l) ||
+    /^"[a-zA-Z0-9_-]+"\s*:\s*[\[{]*$/.test(l) ||
+    /^[-=_]{2,}$/.test(l) ||
+    /^==\s*.+$/.test(l) ||
+    /^\d{1,4}$/.test(l);
+
+  const picked = lines.find(
+    (l) => !l.startsWith("{") && !l.startsWith("[") && !isNoisyLine(l),
+  );
   if (!picked) return undefined;
   const singleLine = picked.replace(/\s+/g, " ");
   return singleLine.length > 64 ? `${singleLine.slice(0, 63)}…` : singleLine;
@@ -1110,11 +1213,13 @@ export class ValetDurableRuntime {
 
     this.turnSideEffects.set(conv.id, { inboxIds: [], timelineIds: [] });
 
+    const turnStartedAt = Date.now();
     const stepMap = new Map<string, ChatStreamStep>();
     const baselineEntryIds = new Set<EntryId>();
     let lastStreamSig = "";
     let lastPartialText = "";
     let lastThinkingText = "正在思考与分析…";
+    let lastReasoningText = "";
     let lastPhase: ChatStreamPayload["phase"] = "thinking";
 
     const emitStream = (pending?: PendingPermissionRequest) => {
@@ -1126,12 +1231,14 @@ export class ValetDurableRuntime {
       const payload: ChatStreamPayload = {
         chatId: req.chatId,
         phase: activePending ? "tools" : lastPhase,
+        startedAt: turnStartedAt,
         partialText: lastPartialText || undefined,
         thinkingText: activePending
           ? activePending.toolName === "ask_user"
             ? "等待你的回答或确认…"
             : "等待你的权限批准…"
           : lastThinkingText,
+        ...(lastReasoningText ? { reasoningText: lastReasoningText } : {}),
         steps: steps.length > 0 ? steps : undefined,
         ...(activePending ? { pendingPermission: activePending } : {}),
       };
@@ -1156,6 +1263,10 @@ export class ValetDurableRuntime {
         if (AssistantEntry.is(entry)) {
           const msg = entry.model?.[0] as AssistantMessage | undefined;
           if (!msg || !Array.isArray(msg.content)) continue;
+          const entryThinking = extractThinkingFromMessage(msg.content);
+          if (entryThinking) {
+            lastReasoningText = entryThinking;
+          }
           for (const block of msg.content) {
             if (block.type !== "toolCall") continue;
             const prev = stepMap.get(block.id);
@@ -1163,10 +1274,11 @@ export class ValetDurableRuntime {
               block.arguments && typeof block.arguments === "object"
                 ? (block.arguments as Record<string, unknown>)
                 : undefined;
+            const richLabel = humanizeToolStepLabel(block.name, args);
             stepMap.set(block.id, {
               id: block.id,
               name: block.name,
-              label: prev?.label || humanizeToolStepLabel(block.name, args),
+              label: args ? richLabel : prev?.label || richLabel,
               status:
                 prev?.status === "done" || prev?.status === "error"
                   ? prev.status
@@ -1222,6 +1334,14 @@ export class ValetDurableRuntime {
             }
           }
 
+          const liveReasoning = extractThinkingFromMessage(
+            partialMsg?.content,
+            rawPartialText,
+          );
+          if (liveReasoning) {
+            lastReasoningText = liveReasoning;
+          }
+
           const { cleanText: cleanPartialText } = stripThinkTags(rawPartialText);
           if (cleanPartialText) {
             lastPartialText = cleanPartialText;
@@ -1265,6 +1385,7 @@ export class ValetDurableRuntime {
       });
 
       this.permissionCoordinator.recordUserIntent(req.chatId, req.prompt);
+      emitStream();
 
       const submission = await conv.submit(
         {
@@ -1373,6 +1494,7 @@ export class ValetDurableRuntime {
         usingLocalFallback ? "本地管家引擎" : `${ref.provider} · ${ref.modelId}`,
       ];
       if (mentionPlugin) metaParts.push(`@${mentionPlugin.name}`);
+      const workDurationMs = Math.max(1, Date.now() - turnStartedAt);
 
       return {
         replyMessage: {
@@ -1384,6 +1506,8 @@ export class ValetDurableRuntime {
           metaLabel: metaParts.join(" · "),
           createdAt: formatHHMM(),
           content: answerText || "已完成处理。",
+          workDurationMs,
+          ...(lastReasoningText ? { thinkingSummary: lastReasoningText } : {}),
           ...(finalSteps.length > 0 ? { steps: finalSteps } : {}),
           ...(processTable ? { processTable } : {}),
           ...(pluginDraft ? { pluginDraft } : {}),

@@ -542,6 +542,35 @@ body,
   }
 }
 
+@keyframes valet-dot-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes valet-thinking-sheen {
+  0% {
+    background-position: 120% 0;
+  }
+  100% {
+    background-position: -120% 0;
+  }
+}
+
+@keyframes valet-trace-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .animate-valet-pulse {
   animation: valet-pulse var(--dur-ambient) ease-out infinite;
 }
@@ -604,6 +633,41 @@ body,
 
 .animate-valet-spin {
   animation: valet-spin 0.9s linear infinite;
+}
+
+.animate-valet-dot-spin {
+  animation: valet-dot-spin 1.05s linear infinite;
+}
+
+.valet-thinking-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--ink-muted) 0%,
+    var(--ink-muted) 35%,
+    var(--ink-strong) 50%,
+    var(--ink-muted) 65%,
+    var(--ink-muted) 100%
+  );
+  background-size: 240% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: valet-thinking-sheen 1.9s ease-in-out infinite;
+}
+
+.animate-valet-trace-in {
+  animation: valet-trace-in 180ms var(--ease-valet) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-valet-dot-spin {
+    animation: none;
+  }
+  .valet-thinking-shimmer {
+    animation: none;
+    background: none;
+    color: var(--ink-secondary);
+  }
 }
 
 /* Subtle custom scrollbars */

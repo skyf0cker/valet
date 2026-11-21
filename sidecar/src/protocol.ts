@@ -222,6 +222,8 @@ export interface ChatMessage {
   createdAt: string;
   attachments?: ChatAttachment[];
   steps?: ChatStreamStep[];
+  workDurationMs?: number;
+  thinkingSummary?: string;
   processTable?: {
     rows: ProcessSampleRow[];
     primaryActionDone?: boolean;
@@ -377,6 +379,8 @@ export interface ChatStreamPayload {
   phase: "thinking" | "tools" | "streaming" | "done" | "error";
   partialText?: string;
   thinkingText?: string;
+  reasoningText?: string;
+  startedAt?: number;
   steps?: ChatStreamStep[];
   pendingPermission?: PendingPermissionRequest;
   error?: string;

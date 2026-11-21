@@ -163,6 +163,8 @@ export interface ChatMessage {
   createdAt: string;
   attachments?: ChatAttachment[];
   steps?: ChatStreamStep[];
+  workDurationMs?: number;
+  thinkingSummary?: string;
   processTable?: ProcessTablePayload;
   pluginDraft?: PluginDraftSpec;
 }
@@ -172,6 +174,8 @@ export interface ChatStreamPayload {
   phase: string;
   partialText?: string;
   thinkingText?: string;
+  reasoningText?: string;
+  startedAt?: number;
   steps?: ChatStreamStep[];
   pendingPermission?: PendingPermissionRequest;
   error?: string;

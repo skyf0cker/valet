@@ -13,13 +13,13 @@ import {
   PlusIcon,
 } from "../ui/Icons";
 import { SelectMenu } from "../ui/SelectMenu";
+import { AgentWorkTrace } from "./AgentWorkTrace";
 import { ChatComposer } from "./ChatComposer";
 import {
   FormattedText,
   PermissionAskCard,
   PluginDraftCard,
   ProcessTableCard,
-  ToolStepsList,
 } from "./MessageCards";
 
 export const ChatView: React.FC = () => {
@@ -389,8 +389,12 @@ export const ChatView: React.FC = () => {
                     )}
                   </div>
 
-                  {msg.steps && msg.steps.length > 0 && (
-                    <ToolStepsList steps={msg.steps} />
+                  {((msg.steps && msg.steps.length > 0) || msg.thinkingSummary) && (
+                    <AgentWorkTrace
+                      steps={msg.steps}
+                      workDurationMs={msg.workDurationMs}
+                      reasoningText={msg.thinkingSummary}
+                    />
                   )}
 
                   <div className="text-[13px] leading-[20px] text-[var(--ink-body)] lg:text-[14px] lg:leading-[23px]">
@@ -437,9 +441,24 @@ export const ChatView: React.FC = () => {
                   </span>
                 </div>
 
-                {activeStream?.steps && activeStream.steps.length > 0 && (
-                  <ToolStepsList steps={activeStream.steps} />
-                )}
+                <AgentWorkTrace
+                  isStreaming
+                  phase={
+                    activeStream?.phase as
+                      | "thinking"
+                      | "tools"
+                      | "streaming"
+                      | "done"
+                      | "error"
+                      | undefined
+                  }
+                  startedAt={activeStream?.startedAt}
+                  steps={activeStream?.steps}
+                  hasPartialText={Boolean(activeStream?.partialText)}
+                  thinkingText={activeStream?.thinkingText}
+                  reasoningText={activeStream?.reasoningText}
+                  hasPendingPermission={Boolean(activeStream?.pendingPermission)}
+                />
 
                 {activeStream?.pendingPermission && (
                   <PermissionAskCard
@@ -456,21 +475,10 @@ export const ChatView: React.FC = () => {
                   />
                 )}
 
-                {activeStream?.partialText ? (
+                {activeStream?.partialText && (
                   <div className="text-[13px] leading-[20px] text-[var(--ink-body)] lg:text-[14px] lg:leading-[23px]">
                     <FormattedText text={activeStream.partialText} />
                   </div>
-                ) : (
-                  !activeStream?.steps?.some(
-                    (s) => s.status === "running" || s.status === "pending"
-                  ) && (
-                    <div className="flex items-center gap-2 py-0.5 text-[13px] text-[var(--ink-muted)]">
-                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--ink-muted)]" />
-                      <span>
-                        {activeStream?.steps?.length ? "正在整理结果…" : "思考中…"}
-                      </span>
-                    </div>
-                  )
                 )}
               </div>
             </div>

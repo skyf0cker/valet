@@ -7,6 +7,10 @@ import type {
 import { CheckIcon } from "../ui/Icons";
 import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { Modal } from "../ui/Modal";
+import { AgentWorkTrace } from "./AgentWorkTrace";
+import type { StepRowItem } from "./workTraceUtils";
+
+export type { StepRowItem };
 
 export const ProcessTableCard: React.FC<{
   data: NonNullable<ChatMessage["processTable"]>;
@@ -243,48 +247,9 @@ function stripThinkMarkup(raw: string): string {
   return clean.replace(/^\s+/, "");
 }
 
-export interface StepRowItem {
-  id: string;
-  name: string;
-  label?: string;
-  status: string;
-  detail?: string;
-}
-
 export const ToolStepsList: React.FC<{ steps: StepRowItem[] }> = ({ steps }) => {
   if (!steps || steps.length === 0) return null;
-  return (
-    <div className="flex flex-col gap-1 rounded-[10px] border border-[var(--border-light)] bg-[var(--bg-subtle)]/60 px-3 py-2">
-      {steps.map((step) => {
-        const isRunning = step.status === "running" || step.status === "pending";
-        const isError = step.status === "error";
-        return (
-          <div
-            key={step.id}
-            className="flex items-center gap-2 text-[12px] leading-[18px]"
-          >
-            <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center font-mono text-[11px]">
-              {isError ? (
-                <span className="text-[var(--danger)]">✕</span>
-              ) : isRunning ? (
-                <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--ink-primary)]" />
-              ) : (
-                <span className="text-[var(--ink-muted)]">✓</span>
-              )}
-            </span>
-            <span className="shrink-0 font-medium text-[var(--ink-strong)]">
-              {step.label || step.name}
-            </span>
-            {(step.detail || isRunning) && (
-              <span className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--ink-muted)]">
-                {step.detail || "执行中…"}
-              </span>
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
+  return <AgentWorkTrace steps={steps} />;
 };
 
 export const FormattedText: React.FC<{ text: string }> = ({ text }) => {

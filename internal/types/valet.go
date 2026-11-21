@@ -314,10 +314,12 @@ type ChatMessage struct {
 	Content      string               `json:"content"`
 	MetaLabel    string               `json:"metaLabel,omitempty"`
 	CreatedAt    string               `json:"createdAt"`
-	Attachments  []ChatAttachment     `json:"attachments,omitempty"`
-	Steps        []ChatStreamStep     `json:"steps,omitempty"`
-	ProcessTable *ProcessTablePayload `json:"processTable,omitempty"`
-	PluginDraft  *PluginDraftSpec     `json:"pluginDraft,omitempty"`
+	Attachments     []ChatAttachment     `json:"attachments,omitempty"`
+	Steps           []ChatStreamStep     `json:"steps,omitempty"`
+	WorkDurationMs  int64                `json:"workDurationMs,omitempty"`
+	ThinkingSummary string               `json:"thinkingSummary,omitempty"`
+	ProcessTable    *ProcessTablePayload `json:"processTable,omitempty"`
+	PluginDraft     *PluginDraftSpec     `json:"pluginDraft,omitempty"`
 }
 
 // ChatThread represents one persistent agent conversation.
@@ -713,6 +715,8 @@ type ChatStreamPayload struct {
 	Phase             string                    `json:"phase"` // "thinking" | "tools" | "streaming" | "done" | "error"
 	PartialText       string                    `json:"partialText,omitempty"`
 	ThinkingText      string                    `json:"thinkingText,omitempty"`
+	ReasoningText     string                    `json:"reasoningText,omitempty"`
+	StartedAt         int64                     `json:"startedAt,omitempty"`
 	Steps             []ChatStreamStep          `json:"steps,omitempty"`
 	PendingPermission *PendingPermissionRequest `json:"pendingPermission,omitempty"`
 	Error             string                    `json:"error,omitempty"`
