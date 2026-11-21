@@ -1,43 +1,60 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useValet } from "../../store/ValetContext";
 import type { ChatThread, NotebookBlockType } from "../../types/valet";
+import { makeRootPageRefId } from "../../utils/notebookPages";
 import {
+  BookOpenIcon,
   BowtieSvg,
   CheckSquareIcon,
   ClockIcon,
   CodeBlockIcon,
   DividerIcon,
+  FileTextIcon,
   HashIcon,
   InboxIcon,
   ListBulletIcon,
   ListOrderedIcon,
   QuoteBlockIcon,
+  TableIcon,
 } from "../ui/Icons";
 
 export type MentionAction =
   | { kind: "new_valet_session" }
   | { kind: "link_session"; thread: ChatThread }
+  | {
+      kind: "link_page";
+      pageRefId: string;
+      title: string;
+      projectTitle: string;
+      isRoot: boolean;
+    }
+  | { kind: "create_and_link_page"; title: string }
   | { kind: "link_inbox"; itemId: string; title: string }
   | { kind: "link_timeline"; eventId: string; title: string };
 
 export const NotebookMentionPopover: React.FC<{
   projectId: string;
+  currentPageId?: string | null;
+  trigger?: "@" | "[[";
   query: string;
   onSelect: (action: MentionAction) => void;
   onClose: () => void;
-}> = ({ projectId, query, onSelect, onClose }) => {
+}> = ({ projectId, currentPageId, trigger = "@", query, onSelect, onClose }) => {
   const { state, chatStreams, runningChatIds } = useValet();
   const [activeIdx, setActiveIdx] = useState(0);
 
   const normalizedQuery = query.trim().toLowerCase();
 
   const items = useMemo(() => {
-    const out: Array<{
+    const createEntries: Array<{
       id: string;
-      section: "create" | "session" | "context";
+      section: "create" | "page" | "session" | "context";
       action: MentionAction;
       searchText: string;
     }> = [];
+    const pageEntries: typeof createEntries = [];
+    const sessionEntries: typeof createEntries = [];
+    const contextEntries: typeof createEntries = [];
 
     if (
       !normalizedQuery ||
@@ -45,11 +62,99 @@ export const NotebookMentionPopover: React.FC<{
       "新建对话".includes(normalizedQuery) ||
       "session".includes(normalizedQuery)
     ) {
-      out.push({
+      createEntries.push({
         id: "create-valet",
         section: "create",
         action: { kind: "new_valet_session" },
         searchText: "valet 新建会话 对话",
+      });
+    }
+
+    const activeProjects = state.projects.filter((p) => !p.archived);
+    const currentProject = activeProjects.find((p) => p.id === projectId);
+    const pageCandidates: Array<{
+      pageRefId: string;
+      title: string;
+      projectTitle: string;
+      isRoot: boolean;
+      matchText: string;
+    }> = [];
+
+    if (currentProject) {
+      if (currentPageId) {
+        const rootTitle = `${currentProject.title} · Notebook`;
+        pageCandidates.push({
+          pageRefId: makeRootPageRefId(currentProject.id),
+          title: rootTitle,
+          projectTitle: currentProject.title,
+          isRoot: true,
+          matchText: `${currentProject.title} notebook root 主页 根目录`.toLowerCase(),
+        });
+      }
+      for (const pg of currentProject.pages ?? []) {
+        if (pg.id === currentPageId) continue;
+        const pageTitle = pg.title || "未命名页面";
+        pageCandidates.push({
+          pageRefId: pg.id,
+          title: pageTitle,
+          projectTitle: currentProject.title,
+          isRoot: false,
+          matchText: `${pageTitle} ${currentProject.title} 页面 page`.toLowerCase(),
+        });
+      }
+    }
+
+    for (const proj of activeProjects) {
+      if (proj.id === projectId) continue;
+      const rootTitle = `${proj.title} · Notebook`;
+      pageCandidates.push({
+        pageRefId: makeRootPageRefId(proj.id),
+        title: rootTitle,
+        projectTitle: proj.title,
+        isRoot: true,
+        matchText: `${proj.title} notebook root`.toLowerCase(),
+      });
+      for (const pg of proj.pages ?? []) {
+        const pageTitle = pg.title || "未命名页面";
+        pageCandidates.push({
+          pageRefId: pg.id,
+          title: pageTitle,
+          projectTitle: proj.title,
+          isRoot: false,
+          matchText: `${pageTitle} ${proj.title}`.toLowerCase(),
+        });
+      }
+    }
+
+    const filteredPages = pageCandidates
+      .filter((c) => !normalizedQuery || c.matchText.includes(normalizedQuery))
+      .slice(0, 8);
+
+    for (const cand of filteredPages) {
+      pageEntries.push({
+        id: `page-${cand.pageRefId}`,
+        section: "page",
+        action: {
+          kind: "link_page",
+          pageRefId: cand.pageRefId,
+          title: cand.title,
+          projectTitle: cand.projectTitle,
+          isRoot: cand.isRoot,
+        },
+        searchText: cand.matchText,
+      });
+    }
+
+    const trimmedTitle = query.trim();
+    if (trimmedTitle.length > 0 || trigger === "[[") {
+      pageEntries.push({
+        id: "create-page",
+        section: "page",
+        action: {
+          kind: "create_and_link_page",
+          title: trimmedTitle || "未命名页面",
+        },
+        searchText: `${trimmedTitle} 新建子页面 page`.toLowerCase(),
       });
     }
 
@@ -62,7 +167,7 @@ export const NotebookMentionPopover: React.FC<{
       .slice(0, 5);
 
     for (const thread of projectSessions) {
-      out.push({
+      sessionEntries.push({
         id: `sess-${thread.id}`,
         section: "session",
         action: { kind: "link_session", thread },
@@ -81,7 +186,7 @@ export const NotebookMentionPopover: React.FC<{
       .slice(0, 2);
 
     for (const it of pendingInbox) {
-      out.push({
+      contextEntries.push({
         id: `inb-${it.id}`,
         section: "context",
         action: { kind: "link_inbox", itemId: it.id, title: it.title },
@@ -99,7 +204,7 @@ export const NotebookMentionPopover: React.FC<{
       .slice(0, 2);
 
     for (const ev of recentEvents) {
-      out.push({
+      contextEntries.push({
         id: `evt-${ev.id}`,
         section: "context",
         action: { kind: "link_timeline", eventId: ev.id, title: ev.title },
@@ -107,8 +212,20 @@ export const NotebookMentionPopover: React.FC<{
       });
     }
 
-    return out;
-  }, [normalizedQuery, projectId, state.chatThreads, state.inboxItems, state.timelineEvents]);
+    return trigger === "[["
+      ? [...pageEntries, ...sessionEntries, ...contextEntries, ...createEntries]
+      : [...createEntries, ...sessionEntries, ...pageEntries, ...contextEntries];
+  }, [
+    currentPageId,
+    normalizedQuery,
+    projectId,
+    query,
+    state.chatThreads,
+    state.inboxItems,
+    state.projects,
+    state.timelineEvents,
+    trigger,
+  ]);
 
   useEffect(() => {
     setActiveIdx(0);
@@ -139,8 +256,13 @@ export const NotebookMentionPopover: React.FC<{
   }, [activeIdx, items, onClose, onSelect]);
 
   const createItems = items.filter((i) => i.section === "create");
+  const pageItems = items.filter((i) => i.section === "page");
   const sessionItems = items.filter((i) => i.section === "session");
   const contextItems = items.filter((i) => i.section === "context");
+  const sectionOrder: Array<"create" | "page" | "session" | "context"> =
+    trigger === "[["
+      ? ["page", "session", "context", "create"]
+      : ["create", "session", "page", "context"];
 
   const getSessionStatus = (thread: ChatThread) => {
     const stream = chatStreams[thread.id];
@@ -159,6 +281,8 @@ export const NotebookMentionPopover: React.FC<{
     return { kind: "done" as const, label: "已完成" };
   };
 
+  let renderedSections = 0;
+
   return (
     <div
       onMouseDown={(e) => e.preventDefault()}
@@ -166,161 +290,255 @@ export const NotebookMentionPopover: React.FC<{
     >
       {items.length === 0 ? (
         <div className="px-4 py-6 text-center text-[12px] text-[var(--ink-muted)]">
-          没有匹配「@{query}」的选项
+          没有匹配「{trigger}
+          {query}」的选项
         </div>
       ) : (
         <div className="max-h-[340px] overflow-y-auto">
-          {createItems.length > 0 && (
-            <div className="p-1.5">
-              <div className="px-2.5 pt-1 pb-1 font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--ink-subtle)]">
-                新建对话 · CREATE SESSION
-              </div>
-              {createItems.map((entry) => {
-                const idx = items.indexOf(entry);
-                const selected = idx === activeIdx;
-                return (
-                  <button
-                    key={entry.id}
-                    type="button"
-                    onMouseEnter={() => setActiveIdx(idx)}
-                    onClick={() => onSelect(entry.action)}
-                    className={`flex w-full cursor-pointer items-center gap-2.5 rounded-[8px] px-2.5 py-2 text-left transition-colors ${
-                      selected ? "bg-[var(--bg-subtle)]" : "hover:bg-[var(--bg-subtle)]/70"
-                    }`}
-                  >
-                    <span className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[7px] bg-[var(--brand-icon-bg)] text-[var(--brand-icon-fg)]">
-                      <BowtieSvg size={14} />
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-1.5">
-                        <span className="font-mono text-[13px] font-semibold text-[var(--ink-strong)]">
-                          @valet
+          {sectionOrder.map((sec) => {
+            if (sec === "create" && createItems.length > 0) {
+              const needsBorder = renderedSections > 0;
+              renderedSections += 1;
+              return (
+                <div
+                  key="sec-create"
+                  className={`${needsBorder ? "border-t border-[var(--border-light)] " : ""}p-1.5`}
+                >
+                  <div className="px-2.5 pt-1 pb-1 font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--ink-subtle)]">
+                    新建对话 · CREATE SESSION
+                  </div>
+                  {createItems.map((entry) => {
+                    const idx = items.indexOf(entry);
+                    const selected = idx === activeIdx;
+                    return (
+                      <button
+                        key={entry.id}
+                        type="button"
+                        onMouseEnter={() => setActiveIdx(idx)}
+                        onClick={() => onSelect(entry.action)}
+                        className={`flex w-full cursor-pointer items-center gap-2.5 rounded-[8px] px-2.5 py-2 text-left transition-colors ${
+                          selected ? "bg-[var(--bg-subtle)]" : "hover:bg-[var(--bg-subtle)]/70"
+                        }`}
+                      >
+                        <span className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[7px] bg-[var(--brand-icon-bg)] text-[var(--brand-icon-fg)]">
+                          <BowtieSvg size={14} />
                         </span>
-                        <span className="rounded-[4px] bg-[var(--ink-primary)] px-1.5 py-[1px] text-[10px] font-medium text-[var(--ink-on-primary)]">
-                          新建会话
-                        </span>
-                      </div>
-                      <div className="truncate text-[12px] text-[var(--ink-muted)]">
-                        在当前位置发起新对话并自动插入引用卡片
-                      </div>
-                    </div>
-                    <kbd className="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-canvas)] font-mono text-[11px] text-[var(--ink-secondary)]">
-                      ⏎
-                    </kbd>
-                  </button>
-                );
-              })}
-            </div>
-          )}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-mono text-[13px] font-semibold text-[var(--ink-strong)]">
+                              @valet
+                            </span>
+                            <span className="rounded-[4px] bg-[var(--ink-primary)] px-1.5 py-[1px] text-[10px] font-medium text-[var(--ink-on-primary)]">
+                              新建会话
+                            </span>
+                          </div>
+                          <div className="truncate text-[12px] text-[var(--ink-muted)]">
+                            在当前位置发起新对话并自动插入引用卡片
+                          </div>
+                        </div>
+                        <kbd className="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-canvas)] font-mono text-[11px] text-[var(--ink-secondary)]">
+                          ⏎
+                        </kbd>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            }
 
-          {sessionItems.length > 0 && (
-            <div className="border-t border-[var(--border-light)] p-1.5">
-              <div className="px-2.5 pt-1 pb-1 font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--ink-subtle)]">
-                引用本项目已有会话 · LINK SESSION
-              </div>
-              {sessionItems.map((entry) => {
-                if (entry.action.kind !== "link_session") return null;
-                const { thread } = entry.action;
-                const idx = items.indexOf(entry);
-                const selected = idx === activeIdx;
-                const st = getSessionStatus(thread);
-                return (
-                  <button
-                    key={entry.id}
-                    type="button"
-                    onMouseEnter={() => setActiveIdx(idx)}
-                    onClick={() => onSelect(entry.action)}
-                    className={`flex h-[34px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2.5 text-left transition-colors ${
-                      selected ? "bg-[var(--bg-subtle)]" : "hover:bg-[var(--bg-subtle)]/70"
-                    }`}
-                  >
-                    <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center">
-                      {st.kind === "running" ? (
-                        <svg
-                          width="11"
-                          height="11"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          className="animate-valet-spin text-[var(--ink-primary)]"
-                          aria-hidden="true"
-                        >
-                          <path
-                            d="M12 3a9 9 0 109 9"
-                            stroke="currentColor"
-                            strokeWidth="3"
-                            strokeLinecap="round"
-                          />
-                        </svg>
-                      ) : (
-                        <span
-                          className={`h-[7px] w-[7px] rounded-full ${
-                            st.kind === "pending"
-                              ? "bg-[var(--amber-icon)]"
-                              : "bg-[var(--ink-primary)]"
+            if (sec === "page" && pageItems.length > 0) {
+              const needsBorder = renderedSections > 0;
+              renderedSections += 1;
+              return (
+                <div
+                  key="sec-page"
+                  className={`${needsBorder ? "border-t border-[var(--border-light)] " : ""}p-1.5`}
+                >
+                  <div className="px-2.5 pt-1 pb-1 font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--ink-subtle)]">
+                    引用页面 · LINK PAGE
+                  </div>
+                  {pageItems.map((entry) => {
+                    const idx = items.indexOf(entry);
+                    const selected = idx === activeIdx;
+                    if (entry.action.kind === "create_and_link_page") {
+                      return (
+                        <button
+                          key={entry.id}
+                          type="button"
+                          onMouseEnter={() => setActiveIdx(idx)}
+                          onClick={() => onSelect(entry.action)}
+                          className={`flex h-[34px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2.5 text-left transition-colors ${
+                            selected ? "bg-[var(--bg-subtle)]" : "hover:bg-[var(--bg-subtle)]/70"
                           }`}
-                        />
-                      )}
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--ink-strong)]">
-                      {thread.title}
-                    </span>
-                    <span
-                      className={`shrink-0 rounded-[5px] px-1.5 py-0.5 font-mono text-[10px] ${
-                        st.kind === "pending"
-                          ? "border border-[var(--amber-border)] bg-[var(--amber-bg)] text-[var(--amber-text)]"
-                          : "bg-[var(--bg-muted)] text-[var(--ink-muted)]"
-                      }`}
-                    >
-                      {st.label}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
+                        >
+                          <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center text-[var(--ink-primary)]">
+                            <FileTextIcon size={13} />
+                          </span>
+                          <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-[var(--ink-strong)]">
+                            + 新建并引用子页面「{entry.action.title}」
+                          </span>
+                          <span className="shrink-0 font-mono text-[10px] text-[var(--ink-subtle)]">
+                            NEW PAGE
+                          </span>
+                        </button>
+                      );
+                    }
+                    if (entry.action.kind !== "link_page") return null;
+                    return (
+                      <button
+                        key={entry.id}
+                        type="button"
+                        onMouseEnter={() => setActiveIdx(idx)}
+                        onClick={() => onSelect(entry.action)}
+                        className={`flex h-[34px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2.5 text-left transition-colors ${
+                          selected ? "bg-[var(--bg-subtle)]" : "hover:bg-[var(--bg-subtle)]/70"
+                        }`}
+                      >
+                        <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center text-[var(--ink-primary)]">
+                          {entry.action.isRoot ? (
+                            <BookOpenIcon size={13} />
+                          ) : (
+                            <FileTextIcon size={13} />
+                          )}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--ink-strong)]">
+                          {entry.action.title}
+                        </span>
+                        <span className="max-w-[110px] shrink-0 truncate font-mono text-[10px] text-[var(--ink-subtle)]">
+                          {entry.action.projectTitle}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            }
 
-          {contextItems.length > 0 && (
-            <div className="border-t border-[var(--border-light)] p-1.5">
-              <div className="px-2.5 pt-1 pb-1 font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--ink-subtle)]">
-                引用工作区上下文 · CONTEXT
-              </div>
-              {contextItems.map((entry) => {
-                const idx = items.indexOf(entry);
-                const selected = idx === activeIdx;
-                const isInbox = entry.action.kind === "link_inbox";
-                const title =
-                  entry.action.kind === "link_inbox" || entry.action.kind === "link_timeline"
-                    ? entry.action.title
-                    : "";
-                return (
-                  <button
-                    key={entry.id}
-                    type="button"
-                    onMouseEnter={() => setActiveIdx(idx)}
-                    onClick={() => onSelect(entry.action)}
-                    className={`flex h-[34px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2.5 text-left transition-colors ${
-                      selected ? "bg-[var(--bg-subtle)]" : "hover:bg-[var(--bg-subtle)]/70"
-                    }`}
-                  >
-                    <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center text-[var(--ink-muted)]">
-                      {isInbox ? <InboxIcon size={14} /> : <ClockIcon size={14} />}
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--ink-strong)]">
-                      {title}
-                    </span>
-                    <span className="shrink-0 font-mono text-[10px] text-[var(--ink-subtle)]">
-                      {isInbox ? "#收件箱" : "#时间线"}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
+            if (sec === "session" && sessionItems.length > 0) {
+              const needsBorder = renderedSections > 0;
+              renderedSections += 1;
+              return (
+                <div
+                  key="sec-session"
+                  className={`${needsBorder ? "border-t border-[var(--border-light)] " : ""}p-1.5`}
+                >
+                  <div className="px-2.5 pt-1 pb-1 font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--ink-subtle)]">
+                    引用本项目已有会话 · LINK SESSION
+                  </div>
+                  {sessionItems.map((entry) => {
+                    if (entry.action.kind !== "link_session") return null;
+                    const { thread } = entry.action;
+                    const idx = items.indexOf(entry);
+                    const selected = idx === activeIdx;
+                    const st = getSessionStatus(thread);
+                    return (
+                      <button
+                        key={entry.id}
+                        type="button"
+                        onMouseEnter={() => setActiveIdx(idx)}
+                        onClick={() => onSelect(entry.action)}
+                        className={`flex h-[34px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2.5 text-left transition-colors ${
+                          selected ? "bg-[var(--bg-subtle)]" : "hover:bg-[var(--bg-subtle)]/70"
+                        }`}
+                      >
+                        <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center">
+                          {st.kind === "running" ? (
+                            <svg
+                              width="11"
+                              height="11"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              className="animate-valet-spin text-[var(--ink-primary)]"
+                              aria-hidden="true"
+                            >
+                              <path
+                                d="M12 3a9 9 0 109 9"
+                                stroke="currentColor"
+                                strokeWidth="3"
+                                strokeLinecap="round"
+                              />
+                            </svg>
+                          ) : (
+                            <span
+                              className={`h-[7px] w-[7px] rounded-full ${
+                                st.kind === "pending"
+                                  ? "bg-[var(--amber-icon)]"
+                                  : "bg-[var(--ink-primary)]"
+                              }`}
+                            />
+                          )}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--ink-strong)]">
+                          {thread.title}
+                        </span>
+                        <span
+                          className={`shrink-0 rounded-[5px] px-1.5 py-0.5 font-mono text-[10px] ${
+                            st.kind === "pending"
+                              ? "border border-[var(--amber-border)] bg-[var(--amber-bg)] text-[var(--amber-text)]"
+                              : "bg-[var(--bg-muted)] text-[var(--ink-muted)]"
+                          }`}
+                        >
+                          {st.label}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            }
+
+            if (sec === "context" && contextItems.length > 0) {
+              const needsBorder = renderedSections > 0;
+              renderedSections += 1;
+              return (
+                <div
+                  key="sec-context"
+                  className={`${needsBorder ? "border-t border-[var(--border-light)] " : ""}p-1.5`}
+                >
+                  <div className="px-2.5 pt-1 pb-1 font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--ink-subtle)]">
+                    引用工作区上下文 · CONTEXT
+                  </div>
+                  {contextItems.map((entry) => {
+                    const idx = items.indexOf(entry);
+                    const selected = idx === activeIdx;
+                    const isInbox = entry.action.kind === "link_inbox";
+                    const title =
+                      entry.action.kind === "link_inbox" || entry.action.kind === "link_timeline"
+                        ? entry.action.title
+                        : "";
+                    return (
+                      <button
+                        key={entry.id}
+                        type="button"
+                        onMouseEnter={() => setActiveIdx(idx)}
+                        onClick={() => onSelect(entry.action)}
+                        className={`flex h-[34px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2.5 text-left transition-colors ${
+                          selected ? "bg-[var(--bg-subtle)]" : "hover:bg-[var(--bg-subtle)]/70"
+                        }`}
+                      >
+                        <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center text-[var(--ink-muted)]">
+                          {isInbox ? <InboxIcon size={14} /> : <ClockIcon size={14} />}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--ink-strong)]">
+                          {title}
+                        </span>
+                        <span className="shrink-0 font-mono text-[10px] text-[var(--ink-subtle)]">
+                          {isInbox ? "#收件箱" : "#时间线"}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            }
+
+            return null;
+          })}
         </div>
       )}
 
       <div className="border-t border-[var(--border-light)] bg-[var(--bg-subtle)]/70 px-3.5 py-2 font-mono text-[10px] text-[var(--ink-subtle)]">
-        ↑↓ 选择 · ⏎ 确认 · / 切换 Markdown 块菜单
+        ↑↓ 选择 · ⏎ 确认 · [[ 引用页面 · / 切换 Markdown 块菜单
       </div>
     </div>
   );
@@ -328,6 +546,7 @@ export const NotebookMentionPopover: React.FC<{
 
 export type SlashBlockChoice =
   | { kind: "valet_session" }
+  | { kind: "new_subpage" }
   | { kind: "block_type"; blockType: NotebookBlockType; label: string };
 
 const SLASH_OPTIONS: Array<{
@@ -345,6 +564,14 @@ const SLASH_OPTIONS: Array<{
     hint: "@valet",
     choice: { kind: "valet_session" },
     icon: <BowtieSvg size={12} />,
+  },
+  {
+    id: "page",
+    label: "新建子页面",
+    desc: "创建嵌套子页面并插入引用卡片",
+    hint: "/page",
+    choice: { kind: "new_subpage" },
+    icon: <FileTextIcon size={13} />,
   },
   {
     id: "h1",
@@ -417,6 +644,14 @@ const SLASH_OPTIONS: Array<{
     hint: "```",
     choice: { kind: "block_type", blockType: "code", label: "代码块" },
     icon: <CodeBlockIcon size={13} />,
+  },
+  {
+    id: "table",
+    label: "表格 Table",
+    desc: "插入 Markdown 表格，支持行内格式与链接",
+    hint: "/table",
+    choice: { kind: "block_type", blockType: "table", label: "表格" },
+    icon: <TableIcon size={13} />,
   },
   {
     id: "divider",

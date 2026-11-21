@@ -166,17 +166,17 @@ triggers:
 execution_mode: workflow   # skill (默认) | workflow
 ```
 
-`workflow.yaml` 采用有向无环图 (DAG)，支持以下节点类型 (`nodes[].type`)：
+`workflow.yaml` 采用有向无环图 (DAG)，支持以下节点类型 (`nodes[].type`) 与对应输出字段（供下游 `{{steps.<nodeId>.output.*}}` 引用）：
 - `trigger`：触发入口（注入 `{{trigger.event}}`、`{{trigger.payload}}`、`{{config.*}}`）
-- `script`：执行本地脚本 (`command`, `args`, `cwd`, `timeoutMs`, `parseJson`)
-- `http`：HTTP 请求 (`url`, `method`, `headers`, `body`, `timeoutMs`)
+- `script`：执行本地脚本 (`command`, `args`, `cwd`, `timeoutMs`, `parseJson`)；运行时自动将 bundled `bun` 注入 `PATH` 最前；输出 `{ exitCode, stdout, stderr, json?, durationMs }`
+- `http`：HTTP 请求 (`url`, `method`, `headers`, `body`, `timeoutMs`)；输出 `{ status, ok, headers, text, json?, durationMs }`
 - `tool`：调用 Valet 内置安全工具 (`tool`, `args`)
-- `agent`：单步 LLM 推理 (`prompt`, `systemPrompt`, `model`, `allowTools`)
-- `condition`：条件分支 (`expr: { path, op, value }`，边上使用 `when: "true"` / `when: "false"`)
+- `agent`：单步 LLM 推理 (`prompt`, `systemPrompt`, `model`, `allowTools`)；输出 `{ text, queuedInboxIds, timelineEventIds, providerUsed }`（即正文文本在 `output.text`）
+- `condition`：条件分支 (`expr: { path, op, value }`，边上使用 `when: "true"` / `when: "false"`)；输出 `{ result, branch, actual, expected }`
 - `transform`：数据重组映射 (`output`)
 - `sleep`：持久化休眠 (`duration: "5s" | "10m"`)
-- `approval`：挂起工作流并在收件箱生成审批卡 (`title`, `detail`, `riskLevel`，边可用 `when: "approved"` / `when: "rejected"`)
-- `notify`：写入时间线或管家通知 (`title`, `message`, `level`, `kind: timeline | outbox | both`)
+- `approval`：挂起工作流并在收件箱生成审批卡 (`title`, `detail`, `riskLevel`，边可用 `when: "approved"` / `when: "rejected"`)；输出 `{ approved, comment, decidedBy, decidedAt }`
+- `notify`：写入时间线或管家通知 (`title`, `message`, `level`, `kind: timeline | outbox | both`)。当 `kind: both` 时，会发送一条系统/Outbox 通知并只在时间线写入**一条**归属当前插件的记录（正文放入 `message`）；推荐直接引用 `{{steps.<agentNodeId>.output.text}}` 或 `{{steps.<scriptNodeId>.output.stdout}}`。
 
 ---
 

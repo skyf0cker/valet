@@ -16,6 +16,7 @@ import {
   type EntryRecord,
   type Extension,
   Harness,
+  LiveDoc,
   type LiveState,
   ToolResultEntry,
   UsageDoc,
@@ -134,6 +135,22 @@ export function stripThinkTags(raw: string): {
     cleanText: clean.replace(/^\s+/, ""),
     hadThink,
   };
+}
+
+export function summarizeMarkdownForTimeline(raw: string): string {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  for (const rawLine of normalized.split("\n")) {
+    let trimmed = rawLine.trim();
+    trimmed = trimmed.replace(/^[#*\-\s]+/, "");
+    trimmed = trimmed.replaceAll("**", "").trim();
+    if (!trimmed) continue;
+    const cps = Array.from(trimmed);
+    if (cps.length > 160) {
+      return `${cps.slice(0, 159).join("")}…`;
+    }
+    return trimmed;
+  }
+  return "";
 }
 
 export function extractThinkingFromMessage(
@@ -282,6 +299,12 @@ export function humanizeToolStepLabel(
           return "删除项目 Notebook 内容块";
         case "replace_all":
           return "重写项目 Notebook 内容";
+        case "create_page":
+          return args?.title
+            ? `创建项目子页面 · ${String(args.title)}`
+            : "创建项目子页面";
+        case "rename_page":
+          return "重命名项目页面";
         default:
           return "编辑项目 Notebook";
       }
@@ -615,6 +638,11 @@ export class ValetDurableRuntime {
     ConversationId,
     { inboxIds: string[]; timelineIds: string[] }
   >();
+  private readonly activeConvSendCounts = new Map<ConversationId, number>();
+  private readonly activeChatStreamQueue = new Map<
+    string,
+    Array<{ token: symbol; emit: () => void }>
+  >();
   private alwaysOn: ValetAlwaysOnStore | null = null;
   private workflows: ValetWorkflowManager | null = null;
   private fauxScriptQueue: Promise<unknown> = Promise.resolve();
@@ -832,7 +860,11 @@ export class ValetDurableRuntime {
           const plugin = this.state.plugins.find(
             (p) => p.id === req.__valetPluginId,
           );
+          const pluginName = plugin?.name ?? req.__valetPluginId;
           const kind = req.kind ?? "timeline";
+          const title = req.title?.trim() || pluginName || "Workflow 通知";
+          const body = (req.message ?? "").trim();
+          const summary = summarizeMarkdownForTimeline(body) || body || title;
           let timelineEventId: string | undefined;
           let outboxId: string | undefined;
 
@@ -841,12 +873,14 @@ export class ValetDurableRuntime {
               const msg = await this.alwaysOn.appendOutbox({
                 run_id: req.__valetRunId ?? null,
                 kind: "message",
-                title: req.title?.trim() || plugin?.name || "Workflow 通知",
-                body: req.message,
+                title,
+                body: body || title,
                 detail: {
                   level: req.level ?? "info",
                   pluginId: req.__valetPluginId,
+                  pluginName,
                   nodeId: req.__valetNodeId,
+                  workflowRunId: req.__valetRunId ?? "",
                 },
                 dedupe_key: `wf:${req.__valetRunId ?? "direct"}:${req.__valetNodeId}`,
               });
@@ -854,6 +888,10 @@ export class ValetDurableRuntime {
               this.bridge.notifyHost("host.outboxNotify", {
                 message: msg,
                 level: req.level ?? "info",
+                skipTimeline: kind === "both",
+                pluginId: req.__valetPluginId,
+                pluginName,
+                workflowRunId: req.__valetRunId ?? "",
               });
               this.bridge.notifyHost("host.alwaysOnUpdate", { scope: "outbox" });
             }
@@ -864,12 +902,12 @@ export class ValetDurableRuntime {
               "host.recordTimelineEvent",
               {
                 pluginId: req.__valetPluginId,
-                pluginName: plugin?.name ?? req.__valetPluginId,
+                pluginName,
                 eventCode: "workflow.notify",
-                title: req.title?.trim() || plugin?.name || "Workflow 通知",
-                summary: req.message,
+                title,
+                summary,
                 status: req.level === "error" ? "failed" : "completed",
-                reasoning: req.message,
+                reasoning: body || title,
                 workflowRunId: req.__valetRunId,
                 payload: {
                   level: req.level ?? "info",
@@ -943,6 +981,7 @@ export class ValetDurableRuntime {
         },
         settings: {
           toolExecution: "sequential",
+          afterFailedRun: "withdraw",
           progress: {
             partialIntervalMs: 80,
             outputIntervalMs: 80,
@@ -1121,12 +1160,13 @@ export class ValetDurableRuntime {
     const mentionPlugin = req.mentionPluginId
       ? this.state.plugins.find((p) => p.id === req.mentionPluginId)
       : undefined;
+    const maxTurns = Math.max(1, this.state.preferences.maxStepsPerTask || 25);
 
     await conv.configure(
       {
         model: ref,
         thinkingLevel: "low",
-        maxTurns: Math.max(1, this.state.preferences.maxStepsPerTask || 25),
+        maxTurns,
         cwd: this.state.homeDir,
         instructions: mentionPlugin
           ? [
@@ -1254,7 +1294,20 @@ export class ValetDurableRuntime {
         ? [{ type: "text" as const, text: inputText }, ...imageBlocks]
         : inputText;
 
-    this.turnSideEffects.set(conv.id, { inboxIds: [], timelineIds: [] });
+    const prevConvSends = this.activeConvSendCounts.get(conv.id) ?? 0;
+    this.activeConvSendCounts.set(conv.id, prevConvSends + 1);
+    if (prevConvSends === 0) {
+      this.turnSideEffects.set(conv.id, { inboxIds: [], timelineIds: [] });
+    }
+
+    const streamToken = Symbol("chat-stream");
+    const streamQueue = this.activeChatStreamQueue.get(req.chatId) ?? [];
+    const queueEntry = {
+      token: streamToken,
+      emit: () => {},
+    };
+    streamQueue.push(queueEntry);
+    this.activeChatStreamQueue.set(req.chatId, streamQueue);
 
     const turnStartedAt = Date.now();
     const stepMap = new Map<string, ChatStreamStep>();
@@ -1265,12 +1318,21 @@ export class ValetDurableRuntime {
     let lastReasoningText = "";
     let lastPhase: ChatStreamPayload["phase"] = "thinking";
 
-    const emitStream = (pending?: PendingPermissionRequest) => {
+    const emitStream = (pending?: PendingPermissionRequest, forceSignatureReset = false) => {
       const steps = [...stepMap.values()];
       const activePending =
         pending !== undefined
           ? pending
           : this.permissionCoordinator.getPending(req.chatId);
+      const currentQueue = this.activeChatStreamQueue.get(req.chatId);
+      if (
+        !activePending &&
+        currentQueue &&
+        currentQueue.length > 0 &&
+        currentQueue[0]?.token !== streamToken
+      ) {
+        return;
+      }
       const payload: ChatStreamPayload = {
         chatId: req.chatId,
         phase: activePending ? "tools" : lastPhase,
@@ -1286,19 +1348,26 @@ export class ValetDurableRuntime {
         ...(activePending ? { pendingPermission: activePending } : {}),
       };
       const sig = JSON.stringify(payload);
-      if (sig !== lastStreamSig) {
+      if (forceSignatureReset || sig !== lastStreamSig) {
         lastStreamSig = sig;
         this.bridge.notifyHost("host.chatStream", payload);
       }
     };
+    queueEntry.emit = () => emitStream(undefined, true);
 
-    this.permissionCoordinator.setInteractiveChat(
-      req.chatId,
-      Boolean(req.interactive),
-    );
-    this.permissionCoordinator.registerStreamEmitter(req.chatId, (pending) => {
-      emitStream(pending);
-    });
+    if (req.interactive || streamQueue.length === 1) {
+      this.permissionCoordinator.setInteractiveChat(
+        req.chatId,
+        Boolean(req.interactive),
+      );
+      this.permissionCoordinator.registerStreamEmitter(req.chatId, (pending) => {
+        if (pending) {
+          emitStream(pending, true);
+        } else {
+          this.activeChatStreamQueue.get(req.chatId)?.[0]?.emit();
+        }
+      });
+    }
 
     const collectEntriesIntoStepMap = (entries: readonly EntryRecord[]) => {
       for (const entry of entries) {
@@ -1350,6 +1419,7 @@ export class ValetDurableRuntime {
     };
 
     let watch: WatchHandle<ConversationView> | null = null;
+    let streamErrored = false;
     try {
       watch = await conv.watch(BACKGROUND_CONTEXT, { min: 20, max: 60 });
       for (const e of watch.value.entries) {
@@ -1441,38 +1511,14 @@ export class ValetDurableRuntime {
       );
 
       const settled = await submission.wait(BACKGROUND_CONTEXT);
-      let answerText = "";
-      if (settled.status === "done" && settled.type === "input") {
-        const answerEntry = await conv.commit(
-          (tx) => tx.entry(AssistantEntry, settled.answer),
-          BACKGROUND_CONTEXT,
-        );
-        const assistantMsg = answerEntry?.model?.[0];
-        if (assistantMsg && assistantMsg.role === "assistant") {
-          for (const block of assistantMsg.content) {
-            if (block.type === "text") {
-              answerText += block.text;
-            }
-          }
-          answerText = stripThinkTags(answerText).cleanText.trim();
-        }
-      } else if (settled.status === "unanswered") {
-        if (settled.reason === "aborted") {
-          answerText = lastPartialText
-            ? `${lastPartialText}\n\n*(已停止生成)*`
-            : "已按你的要求停止生成。";
-        } else {
-          answerText = `本轮执行未完成（原因：${settled.reason ?? "unknown"}）。`;
-        }
-      }
 
-      // Inspect newly committed entries for rich card details (`processTable`, `pluginDraft`)
+      // Inspect newly committed entries first so step details, partial text & rich cards are complete
       const { items: recentEntries } = await conv.entries(
         {
           order: "descending",
           ...(initialLastEntryId ? { minEntryId: initialLastEntryId } : {}),
         },
-        30,
+        200,
         undefined,
         BACKGROUND_CONTEXT,
       );
@@ -1487,6 +1533,103 @@ export class ValetDurableRuntime {
           ? { ...s, status: "done" }
           : s,
       );
+
+      let latestAssistantText = lastPartialText.trim();
+      if (!latestAssistantText) {
+        for (const entry of newEntries) {
+          if (!AssistantEntry.is(entry)) continue;
+          const msg = entry.model?.[0] as AssistantMessage | undefined;
+          if (!msg || !Array.isArray(msg.content)) continue;
+          const raw = msg.content
+            .map((b) => (b.type === "text" ? b.text : ""))
+            .join("");
+          const cleaned = stripThinkTags(raw).cleanText.trim();
+          if (cleaned) {
+            latestAssistantText = cleaned;
+            break;
+          }
+        }
+      }
+
+      let answerText = "";
+      let replyId = `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+
+      if (settled.status === "done" && settled.type === "input") {
+        replyId = `msg-${settled.answer}`;
+        const answerEntry = await conv.commit(
+          (tx) => tx.entry(AssistantEntry, settled.answer),
+          BACKGROUND_CONTEXT,
+        );
+        const assistantMsg = answerEntry?.model?.[0];
+        if (assistantMsg && assistantMsg.role === "assistant") {
+          for (const block of assistantMsg.content) {
+            if (block.type === "text") {
+              answerText += block.text;
+            }
+          }
+          answerText = stripThinkTags(answerText).cleanText.trim();
+        }
+      } else if (settled.status === "unanswered") {
+        const liveSnap = await harness
+          .snapshot(LiveDoc, conv.id, BACKGROUND_CONTEXT)
+          .catch(() => undefined);
+        const matchingFailure =
+          liveSnap?.runFailure &&
+          (liveSnap.runFailure.inputs.includes(submission.id) ||
+            liveSnap.runFailure.reason === settled.reason ||
+            settled.reason === "run_failed")
+            ? liveSnap.runFailure
+            : undefined;
+        const effectiveReason =
+          settled.reason === "run_failed" && matchingFailure?.reason
+            ? matchingFailure.reason
+            : settled.reason;
+
+        if (matchingFailure?.taskId) {
+          replyId = `msg-unanswered-${matchingFailure.taskId}`;
+        } else if (newEntries[0]?.id) {
+          replyId = `msg-unanswered-${effectiveReason ?? "unknown"}-${newEntries[0].id}`;
+        } else {
+          replyId = `msg-unanswered-${submission.id}`;
+        }
+
+        const settledDetail =
+          "detail" in settled && typeof settled.detail === "string"
+            ? settled.detail.trim()
+            : "";
+        const failureDetail =
+          settledDetail ||
+          (typeof matchingFailure?.detail === "string"
+            ? matchingFailure.detail.trim()
+            : "");
+
+        if (effectiveReason === "aborted") {
+          answerText = latestAssistantText
+            ? `${latestAssistantText}\n\n*(已停止生成)*`
+            : "已按你的要求停止生成。";
+        } else if (effectiveReason === "turn_limit") {
+          const limitNotice = `已达到单次任务最大步数上限（${maxTurns} 轮），本轮已自动暂停。以上已执行的步骤与上下文均已保留，可直接回复「继续」接着完成，或在「设置 → 模型与预算」调高单次最大步数。`;
+          if (latestAssistantText) {
+            answerText = `${latestAssistantText}\n\n---\n${limitNotice}`;
+          } else if (finalSteps.length > 0) {
+            answerText = `已完成 ${finalSteps.length} 个执行步骤（可展开上方步骤列表查看详情）。\n\n${limitNotice}`;
+          } else {
+            answerText = limitNotice;
+          }
+        } else if (effectiveReason === "model_error") {
+          const reasonLine = `模型调用失败${failureDetail ? `：${failureDetail}` : "，请检查模型配置或稍后重试。"}`;
+          answerText = latestAssistantText
+            ? `${latestAssistantText}\n\n---\n${reasonLine}`
+            : reasonLine;
+        } else if (effectiveReason === "no_model") {
+          answerText = `未找到可用模型${failureDetail ? `（${failureDetail}）` : ""}，请在「设置 → 模型与预算」配置后重试。`;
+        } else {
+          const reasonLine = `本轮执行未完成（原因：${effectiveReason ?? "unknown"}${failureDetail ? ` · ${failureDetail}` : ""}）。`;
+          answerText = latestAssistantText
+            ? `${latestAssistantText}\n\n---\n${reasonLine}`
+            : reasonLine;
+        }
+      }
 
       let processTable: ChatMessage["processTable"] | undefined;
       let pluginDraft: PluginDraftSpec | undefined;
@@ -1525,13 +1668,6 @@ export class ValetDurableRuntime {
         inboxIds: [],
         timelineIds: [],
       };
-      this.turnSideEffects.delete(conv.id);
-
-      const donePayload: ChatStreamPayload = {
-        chatId: req.chatId,
-        phase: "done",
-      };
-      this.bridge.notifyHost("host.chatStream", donePayload);
 
       const metaParts = [
         usingLocalFallback ? "本地管家引擎" : `${ref.provider} · ${ref.modelId}`,
@@ -1541,10 +1677,7 @@ export class ValetDurableRuntime {
 
       return {
         replyMessage: {
-          id:
-            settled.status === "done" && settled.type === "input"
-              ? `msg-${settled.answer}`
-              : `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+          id: replyId,
           role: "assistant",
           metaLabel: metaParts.join(" · "),
           createdAt: formatHHMM(),
@@ -1561,17 +1694,49 @@ export class ValetDurableRuntime {
         providerUsed: `${ref.provider}/${ref.modelId}`,
       };
     } catch (error) {
-      this.turnSideEffects.delete(conv.id);
-      this.bridge.notifyHost("host.chatStream", {
-        chatId: req.chatId,
-        phase: "error",
-        error: error instanceof Error ? error.message : String(error),
-      } satisfies ChatStreamPayload);
+      streamErrored = true;
+      const currentQueue = this.activeChatStreamQueue.get(req.chatId);
+      if (!currentQueue || currentQueue.length <= 1) {
+        this.bridge.notifyHost("host.chatStream", {
+          chatId: req.chatId,
+          phase: "error",
+          error: error instanceof Error ? error.message : String(error),
+        } satisfies ChatStreamPayload);
+      }
       throw error;
     } finally {
-      this.permissionCoordinator.abortChat(req.chatId, "回合已结束");
-      this.permissionCoordinator.setInteractiveChat(req.chatId, false);
-      this.permissionCoordinator.unregisterStreamEmitter(req.chatId);
+      const nextConvCount = Math.max(
+        0,
+        (this.activeConvSendCounts.get(conv.id) ?? 1) - 1,
+      );
+      if (nextConvCount === 0) {
+        this.activeConvSendCounts.delete(conv.id);
+        this.turnSideEffects.delete(conv.id);
+      } else {
+        this.activeConvSendCounts.set(conv.id, nextConvCount);
+      }
+
+      const currentQueue = this.activeChatStreamQueue.get(req.chatId) ?? [];
+      const wasHead = currentQueue[0]?.token === streamToken;
+      const remainingQueue = currentQueue.filter((q) => q.token !== streamToken);
+      if (remainingQueue.length === 0) {
+        this.activeChatStreamQueue.delete(req.chatId);
+        if (!streamErrored) {
+          this.bridge.notifyHost("host.chatStream", {
+            chatId: req.chatId,
+            phase: "done",
+          } satisfies ChatStreamPayload);
+        }
+        this.permissionCoordinator.abortChat(req.chatId, "回合已结束");
+        this.permissionCoordinator.setInteractiveChat(req.chatId, false);
+        this.permissionCoordinator.unregisterStreamEmitter(req.chatId);
+      } else {
+        this.activeChatStreamQueue.set(req.chatId, remainingQueue);
+        if (wasHead) {
+          remainingQueue[0]?.emit();
+        }
+      }
+
       if (watch) {
         await watch.stop().catch(() => {});
       }

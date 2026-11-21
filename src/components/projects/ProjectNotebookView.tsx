@@ -6,6 +6,7 @@ import type {
   NotebookBlock,
   NotebookBlockType,
   Project,
+  ProjectPage,
 } from "../../types/valet";
 import { copyTextToClipboard } from "../../utils/chatClipboard";
 import {
@@ -15,12 +16,26 @@ import {
   findNearestHeading,
   joinTextWithInlineRefs,
   makeBlockId,
+  pageToMarkdown,
   parseInlineNotebookText,
   removeInlineRefAt,
   serializeBlocksToMarkdown,
   splitInlineRefs,
   type InlineRefToken,
 } from "../../utils/notebook";
+import {
+  findPageBacklinks,
+  getDirectChildPages,
+  makeRootPageRefId,
+} from "../../utils/notebookPages";
+import {
+  appendTableColumn,
+  appendTableRow,
+  createDefaultMarkdownTable,
+  isMarkdownTableDelimiterLine,
+  parseMarkdownTable,
+  splitMarkdownTableRow,
+} from "../../utils/notebookTable";
 import {
   applyCodeBlockEnter,
   applyCodeBlockTab,
@@ -49,9 +64,11 @@ import {
   ClockIcon,
   CloseIcon,
   DownloadIcon,
+  FileTextIcon,
   GripDotsIcon,
   InboxIcon,
   PlusIcon,
+  TableIcon,
 } from "../ui/Icons";
 import { InlineValetComposer } from "./InlineValetComposer";
 import { NotebookFormatToolbar } from "./NotebookFormatToolbar";
@@ -62,17 +79,17 @@ import {
   type SlashBlockChoice,
 } from "./NotebookMentionPopover";
 import { NotebookSelectionBar } from "./NotebookSelectionBar";
+import { InlinePageChip, PageRefBlockCard } from "./PageRefCard";
 import { InlineSessionChip, SessionRefBlockCard } from "./SessionRefCard";
 
-export function exportProjectMarkdownFile(project: Project, threads: ChatThread[]): void {
-  const md = blocksToMarkdown(project, threads);
+function downloadMarkdownFile(md: string, rawName: string, fallbackName: string): void {
   const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const safeName =
-    project.title
+    rawName
       .trim()
       .replace(/[\\/:*?"<>|]/g, "-")
-      .replace(/\s+/g, "-") || "project-notebook";
+      .replace(/\s+/g, "-") || fallbackName;
   const a = document.createElement("a");
   a.href = url;
   a.download = `${safeName}.md`;
@@ -80,6 +97,25 @@ export function exportProjectMarkdownFile(project: Project, threads: ChatThread[
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+export function exportProjectMarkdownFile(
+  project: Project,
+  threads: ChatThread[],
+  allProjects?: Project[]
+): void {
+  const md = blocksToMarkdown(project, threads, allProjects);
+  downloadMarkdownFile(md, project.title, "project-notebook");
+}
+
+export function exportPageMarkdownFile(
+  project: Project,
+  page: ProjectPage,
+  threads: ChatThread[],
+  allProjects?: Project[]
+): void {
+  const md = pageToMarkdown(project, page, threads, allProjects);
+  downloadMarkdownFile(md, page.title, "project-page");
 }
 
 const CopyIconSvg: React.FC<{ size?: number }> = ({ size = 12 }) => (
@@ -105,9 +141,10 @@ const CONVERT_OPTIONS: Array<{ type: NotebookBlockType; label: string }> = [
   { type: "callout", label: "提示框 Callout" },
   { type: "quote", label: "引用块 Quote" },
   { type: "code", label: "代码块 Code" },
+  { type: "table", label: "表格 Table" },
 ];
 
-const NON_TEXT_BLOCK_TYPES = new Set<NotebookBlockType>(["divider", "session_ref"]);
+const NON_TEXT_BLOCK_TYPES = new Set<NotebookBlockType>(["divider", "session_ref", "page_ref"]);
 
 const CODE_LANGUAGES = [
   "bash",
@@ -316,12 +353,19 @@ function getEditableTypographyClass(type: NotebookBlockType, checked?: boolean):
   }
 }
 
-export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project }) => {
+export const ProjectNotebookView: React.FC<{
+  project: Project;
+  page?: ProjectPage | null;
+}> = ({ project, page = null }) => {
   const {
     state,
     runningChatIds,
     focusedNotebookBlock,
     updateProject,
+    createProjectPage,
+    updateProjectPage,
+    openProjectPage,
+    returnToProjectNotebook,
     setProjectTab,
     spawnSessionFromNotebook,
     setActiveView,
@@ -330,7 +374,12 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     pushToast,
   } = useValet();
 
-  const [titleDraft, setTitleDraft] = useState(project.title);
+  const activePageId = page?.id ?? null;
+  const docKey = activePageId ? `${project.id}:${activePageId}` : project.id;
+  const activeTitle = page ? page.title : project.title;
+  const rawBlocks = page ? page.blocks : project.blocks;
+
+  const [titleDraft, setTitleDraft] = useState(activeTitle);
   const [descDraft, setDescDraft] = useState(project.description ?? "");
   const [workingDirDraft, setWorkingDirDraft] = useState(project.workingDir ?? "");
   const [addingTag, setAddingTag] = useState(false);
@@ -345,6 +394,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
   } | null>(null);
   const [mentionState, setMentionState] = useState<{
     blockId: string;
+    trigger: "@" | "[[";
     atIndex: number;
     cursorIndex: number;
     query: string;
@@ -374,8 +424,8 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     null
   );
   const lastCompositionEndRef = useRef(0);
-  const blocksRef = useRef<NotebookBlock[]>(project.blocks);
-  blocksRef.current = project.blocks;
+  const blocksRef = useRef<NotebookBlock[]>(rawBlocks);
+  blocksRef.current = rawBlocks;
   const focusedBlockIdRef = useRef<string | null>(null);
   focusedBlockIdRef.current = focusedBlockId;
   const selectedBlockIdsRef = useRef<string[]>([]);
@@ -405,9 +455,9 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     lastCoalesceAt: 0,
   });
 
-  // Reset local header drafts, selection & history when switching projects
+  // Reset local header drafts, selection & history when switching project or page
   useEffect(() => {
-    setTitleDraft(project.title);
+    setTitleDraft(activeTitle);
     setDescDraft(project.description ?? "");
     setWorkingDirDraft(project.workingDir ?? "");
     setFocusedBlockId(null);
@@ -428,11 +478,11 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       lastCoalesceKey: null,
       lastCoalesceAt: 0,
     };
-  }, [project.id]);
+  }, [docKey]);
 
   useEffect(() => {
-    setTitleDraft(project.title);
-  }, [project.title]);
+    setTitleDraft(activeTitle);
+  }, [activeTitle]);
 
   useEffect(() => {
     setDescDraft(project.description ?? "");
@@ -452,7 +502,13 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
   // Scroll & highlight when jumping back to a referenced Notebook block
   useEffect(() => {
-    if (!focusedNotebookBlock || focusedNotebookBlock.projectId !== project.id) return;
+    if (
+      !focusedNotebookBlock ||
+      focusedNotebookBlock.projectId !== project.id ||
+      (focusedNotebookBlock.pageId ?? null) !== activePageId
+    ) {
+      return;
+    }
     const targetId = focusedNotebookBlock.blockId;
     const el = document.querySelector<HTMLElement>(
       `[data-block-id="${CSS.escape(targetId)}"]`
@@ -465,7 +521,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       setHighlightedBlockId((cur) => (cur === targetId ? null : cur));
     }, 1800);
     return () => window.clearTimeout(timer);
-  }, [focusedNotebookBlock, project.id]);
+  }, [activePageId, focusedNotebookBlock, project.id]);
 
   // Auto-focus & resize active block textarea while preserving sub-control focus
   useEffect(() => {
@@ -489,7 +545,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       pendingSelectionRef.current = null;
       setTextSelection(start !== end ? { blockId: focusedBlockId, start, end } : null);
     }
-  }, [focusedBlockId, project.blocks]);
+  }, [focusedBlockId, rawBlocks]);
 
   const projectThreads = useMemo(
     () => state.chatThreads.filter((t) => (t.projectId || "proj-default") === project.id),
@@ -534,10 +590,25 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
   const blocks = useMemo<NotebookBlock[]>(
     () =>
-      project.blocks.length > 0
-        ? project.blocks
+      rawBlocks.length > 0
+        ? rawBlocks
         : [{ id: makeBlockId("blk"), type: "paragraph", content: "" }],
-    [project.blocks]
+    [rawBlocks]
+  );
+
+  const directChildPages = useMemo(
+    () => getDirectChildPages(project.pages, activePageId ?? undefined),
+    [activePageId, project.pages]
+  );
+
+  const currentPageRefId = useMemo(
+    () => (activePageId ? activePageId : makeRootPageRefId(project.id)),
+    [activePageId, project.id]
+  );
+
+  const backlinks = useMemo(
+    () => findPageBacklinks(state.projects, currentPageRefId),
+    [currentPageRefId, state.projects]
   );
 
   const numberedMarkers = useMemo(() => computeNumberedListMarkers(blocks), [blocks]);
@@ -577,9 +648,13 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         hist.lastCoalesceAt = options?.coalesceKey ? now : 0;
       }
 
-      updateProject(project.id, { blocks: normalized });
+      if (activePageId) {
+        updateProjectPage(project.id, activePageId, { blocks: normalized });
+      } else {
+        updateProject(project.id, { blocks: normalized });
+      }
     },
-    [project.id, updateProject]
+    [activePageId, project.id, updateProject, updateProjectPage]
   );
 
   const projectThreadsRef = useRef(projectThreads);
@@ -1138,11 +1213,15 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
   const commitTitle = () => {
     const trimmed = titleDraft.trim();
     if (!trimmed) {
-      setTitleDraft(project.title);
+      setTitleDraft(activeTitle);
       return;
     }
-    if (trimmed !== project.title) {
-      updateProject(project.id, { title: trimmed });
+    if (trimmed !== activeTitle) {
+      if (activePageId) {
+        updateProjectPage(project.id, activePageId, { title: trimmed });
+      } else {
+        updateProject(project.id, { title: trimmed });
+      }
     }
   };
 
@@ -1192,6 +1271,10 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       const nextBlk: NotebookBlock = {
         ...b,
         type: targetType,
+        content:
+          targetType === "table" && !b.content.trim()
+            ? createDefaultMarkdownTable()
+            : b.content,
         language: targetType === "code" ? b.language || "bash" : undefined,
         checked: targetType === "todo" ? Boolean(b.checked) : undefined,
       };
@@ -1353,7 +1436,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     rawVal: string,
     selectionStart: number
   ) => {
-    if (block.type === "code") {
+    if (block.type === "code" || block.type === "table") {
       updateBlockContentOrProps(block.id, { content: rawVal }, { coalesceKey: block.id });
       setMentionState(null);
       setSlashState(null);
@@ -1438,7 +1521,22 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       return;
     }
 
-    // 3. Typing `@...` opens Mention Popover
+    // 3a. Typing `[[...` opens Page Reference Mention Popover (wiki link)
+    const wikiMatch = /\[\[([^[\]\n]*)$/.exec(beforeCursor);
+    if (wikiMatch && !NON_TEXT_BLOCK_TYPES.has(block.type)) {
+      const triggerIndex = beforeCursor.length - wikiMatch[0].length;
+      setMentionState({
+        blockId: block.id,
+        trigger: "[[",
+        atIndex: triggerIndex,
+        cursorIndex: selectionStart,
+        query: wikiMatch[1] ?? "",
+      });
+      setSlashState(null);
+      return;
+    }
+
+    // 3b. Typing `@...` opens Mention Popover
     const mentionMatch = /(^|\s)@([^\s@]*)$/.exec(beforeCursor);
     if (mentionMatch) {
       const atIndex =
@@ -1447,6 +1545,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         mentionMatch[1]!.length;
       setMentionState({
         blockId: block.id,
+        trigger: "@",
         atIndex,
         cursorIndex: selectionStart,
         query: mentionMatch[2] ?? "",
@@ -1478,7 +1577,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     block: NotebookBlock,
     blockIndex: number
   ) => {
-    if (block.type === "code") return;
+    if (block.type === "code" || block.type === "table") return;
     const pasted = e.clipboardData?.getData("text/plain");
     if (!pasted) return;
     const el = e.currentTarget;
@@ -1497,7 +1596,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     focusBlockAt(res.focusBlockId, res.focusCursorPos);
   };
 
-  const handleMentionSelect = (action: MentionAction) => {
+  const handleMentionSelect = async (action: MentionAction) => {
     if (!mentionState) return;
     const { blockId, atIndex, cursorIndex } = mentionState;
     const cur = blocksRef.current;
@@ -1526,15 +1625,51 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       return;
     }
 
-    if (action.kind === "link_session" && !beforeText.trim() && !afterText.trim() && refs.length === 0) {
-      const next = [...cur];
-      next[idx] = {
-        id: blk.id,
-        type: "session_ref",
-        sessionId: action.thread.id,
-        content: action.thread.title,
-      };
-      if (idx === next.length - 1) {
+    let pageLink: { pageRefId: string; title: string } | null =
+      action.kind === "link_page"
+        ? { pageRefId: action.pageRefId, title: action.title }
+        : null;
+
+    if (action.kind === "create_and_link_page") {
+      const created = await createProjectPage({
+        projectId: project.id,
+        parentPageId: activePageId ?? undefined,
+        title: action.title,
+        switchToPage: false,
+      });
+      if (!created) return;
+      pageLink = { pageRefId: created.id, title: created.title };
+      pushToast(`已创建并引用子页面「${created.title}」`, "success");
+    }
+
+    const latestCur = blocksRef.current;
+    const latestIdx = latestCur.findIndex((b) => b.id === blockId);
+    const latestBlk = latestCur[latestIdx];
+    if (!latestBlk) return;
+
+    if (
+      (action.kind === "link_session" || pageLink) &&
+      !beforeText.trim() &&
+      !afterText.trim() &&
+      refs.length === 0
+    ) {
+      const next = [...latestCur];
+      if (action.kind === "link_session") {
+        next[latestIdx] = {
+          id: latestBlk.id,
+          type: "session_ref",
+          sessionId: action.thread.id,
+          content: action.thread.title,
+        };
+      } else if (pageLink) {
+        next[latestIdx] = {
+          id: latestBlk.id,
+          type: "page_ref",
+          pageId: pageLink.pageRefId,
+          content: pageLink.title,
+        };
+      }
+      if (latestIdx === next.length - 1) {
         next.push({ id: makeBlockId("blk"), type: "paragraph", content: "" });
       }
       commitBlocks(next);
@@ -1542,12 +1677,16 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       return;
     }
 
-    const refToken =
-      action.kind === "link_session"
+    const refToken = pageLink
+      ? `[[page:${pageLink.pageRefId}]]`
+      : action.kind === "link_session"
         ? `[[session:${action.thread.id}]]`
         : action.kind === "link_inbox"
           ? `[[inbox:${action.itemId}]]`
-          : `[[timeline:${action.eventId}]]`;
+          : action.kind === "link_timeline"
+            ? `[[timeline:${action.eventId}]]`
+            : "";
+    if (!refToken) return;
     const cleanAfter = afterText.trimStart();
     const mergedText = cleanAfter
       ? `${beforeText}${cleanAfter}`
@@ -1557,7 +1696,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     focusBlockAt(blockId, cleanAfter ? beforeText.length : mergedText.length);
   };
 
-  const handleSlashSelect = (choice: SlashBlockChoice) => {
+  const handleSlashSelect = async (choice: SlashBlockChoice) => {
     if (!slashState) return;
     const { blockId, mode } = slashState;
     const cur = blocksRef.current;
@@ -1586,6 +1725,43 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       return;
     }
 
+    if (choice.kind === "new_subpage") {
+      if (mode === "typing") {
+        updateBlockContentOrProps(blockId, { content: "" });
+      }
+      const created = await createProjectPage({
+        projectId: project.id,
+        parentPageId: activePageId ?? undefined,
+        title: "未命名页面",
+        switchToPage: false,
+      });
+      if (!created) return;
+      const latest = [...blocksRef.current];
+      const curIdx = latest.findIndex((b) => b.id === blockId);
+      if (curIdx !== -1) {
+        const refBlk: NotebookBlock = {
+          id: mode === "typing" ? blockId : makeBlockId("blk"),
+          type: "page_ref",
+          pageId: created.id,
+          content: created.title,
+        };
+        if (mode === "typing") {
+          latest[curIdx] = refBlk;
+          if (curIdx === latest.length - 1) {
+            latest.push({ id: makeBlockId("blk"), type: "paragraph", content: "" });
+          }
+        } else {
+          latest.splice(curIdx + 1, 0, refBlk);
+          if (curIdx + 1 === latest.length - 1) {
+            latest.push({ id: makeBlockId("blk"), type: "paragraph", content: "" });
+          }
+        }
+        commitBlocks(latest);
+      }
+      openProjectPage(project.id, created.id);
+      return;
+    }
+
     const chosenType = choice.blockType;
     if (mode === "typing") {
       if (chosenType === "divider") {
@@ -1606,7 +1782,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         const converted: NotebookBlock = {
           ...b,
           type: chosenType,
-          content: "",
+          content: chosenType === "table" ? createDefaultMarkdownTable() : "",
           language: chosenType === "code" ? b.language || "bash" : undefined,
           checked: chosenType === "todo" ? false : undefined,
         };
@@ -1616,16 +1792,20 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         return converted;
       });
       commitBlocks(normalizeBlockIndents(next));
-      focusBlockAt(blockId, 0);
+      focusBlockAt(
+        blockId,
+        chosenType === "table" ? next.find((b) => b.id === blockId)?.content.length ?? 0 : 0
+      );
       return;
     }
 
     // mode === "insert_after"
     const sourceIndent = cur[idx] ? clampBlockIndent(cur[idx]!.type, cur[idx]!.indent) : 0;
+    const newContent = chosenType === "table" ? createDefaultMarkdownTable() : "";
     const newBlk: NotebookBlock = {
       id: makeBlockId("blk"),
       type: chosenType,
-      content: "",
+      content: newContent,
       ...(sourceIndent > 0 && isIndentableBlockType(chosenType) ? { indent: sourceIndent } : {}),
       language: chosenType === "code" ? "bash" : undefined,
       checked: chosenType === "todo" ? false : undefined,
@@ -1644,7 +1824,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       return;
     }
     commitBlocks(normalizeBlockIndents(next));
-    focusBlockAt(newBlk.id, 0);
+    focusBlockAt(newBlk.id, newContent.length);
   };
 
   const handleTextareaKeyDown = (
@@ -1754,7 +1934,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         const candidate = cur[i];
         if (!candidate || NON_TEXT_BLOCK_TYPES.has(candidate.type)) continue;
         const candText =
-          candidate.type === "code"
+          candidate.type === "code" || candidate.type === "table"
             ? candidate.content
             : splitInlineRefs(candidate.content).editableText;
         if (direction === -1) {
@@ -1848,6 +2028,72 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       return;
     }
 
+    if (block.type === "table") {
+      if (e.key === "Enter" && (e.shiftKey || meta)) {
+        e.preventDefault();
+        const cur = blocksRef.current;
+        const nextBlk: NotebookBlock = {
+          id: makeBlockId("blk"),
+          type: "paragraph",
+          content: "",
+        };
+        const next = [...cur];
+        next.splice(blockIndex + 1, 0, nextBlk);
+        commitBlocks(next);
+        focusBlockAt(nextBlk.id, 0);
+        return;
+      }
+      if (e.key === "Enter" && !e.altKey) {
+        e.preventDefault();
+        const nextTableText = `${block.content.slice(0, selStart)}\n${block.content.slice(selEnd)}`;
+        pendingSelectionRef.current = {
+          blockId: block.id,
+          start: selStart + 1,
+          end: selStart + 1,
+        };
+        updateBlockContentOrProps(block.id, { content: nextTableText }, { coalesceKey: block.id });
+        return;
+      }
+      if (e.key === "Backspace" && block.content.trim() === "") {
+        e.preventDefault();
+        updateBlockContentOrProps(block.id, { type: "paragraph", content: "" });
+        focusBlockAt(block.id, 0);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        el.blur();
+        return;
+      }
+      if (
+        e.key === "ArrowUp" &&
+        !e.shiftKey &&
+        !e.altKey &&
+        !meta &&
+        selStart === selEnd &&
+        !block.content.slice(0, selStart).includes("\n")
+      ) {
+        if (focusAdjacentEditableBlock(-1, selStart)) {
+          e.preventDefault();
+        }
+        return;
+      }
+      if (
+        e.key === "ArrowDown" &&
+        !e.shiftKey &&
+        !e.altKey &&
+        !meta &&
+        selStart === selEnd &&
+        !block.content.slice(selEnd).includes("\n")
+      ) {
+        const lineStart = block.content.lastIndexOf("\n", Math.max(0, selStart - 1)) + 1;
+        if (focusAdjacentEditableBlock(1, selStart - lineStart)) {
+          e.preventDefault();
+        }
+      }
+      return;
+    }
+
     const { editableText, refs } = splitInlineRefs(block.content);
 
     // Tab / Shift+Tab indentation for indentable blocks (never let Tab escape the editor)
@@ -1903,6 +2149,35 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+
+      // Convert a header row + delimiter line entered across two consecutive paragraphs into a GFM table block
+      if (
+        block.type === "paragraph" &&
+        blockIndex > 0 &&
+        refs.length === 0 &&
+        isMarkdownTableDelimiterLine(editableText.trim())
+      ) {
+        const cur = blocksRef.current;
+        const prev = cur[blockIndex - 1];
+        if (prev && prev.type === "paragraph" && prev.content.includes("|")) {
+          const cols = Math.max(
+            splitMarkdownTableRow(prev.content).length,
+            splitMarkdownTableRow(editableText).length,
+            1
+          );
+          const starterRow = `| ${Array.from({ length: cols }, () => "").join(" | ")} |`;
+          const tableContent = `${prev.content.trim()}\n${editableText.trim()}\n${starterRow}`;
+          const next = [...cur];
+          next.splice(blockIndex - 1, 2, {
+            id: prev.id,
+            type: "table",
+            content: tableContent,
+          });
+          commitBlocks(normalizeBlockIndents(next));
+          focusBlockAt(prev.id, `${prev.content.trim()}\n${editableText.trim()}\n| `.length);
+          return;
+        }
+      }
 
       // Enter-triggered block conversion (e.g. ```ts, ---, > [!note])
       const enterShortcut = detectMarkdownShortcut(editableText, {
@@ -2036,7 +2311,12 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       }
       if (blockIndex > 0) {
         const prev = cur[blockIndex - 1];
-        if (prev && !NON_TEXT_BLOCK_TYPES.has(prev.type) && prev.type !== "code") {
+        if (
+          prev &&
+          !NON_TEXT_BLOCK_TYPES.has(prev.type) &&
+          prev.type !== "code" &&
+          prev.type !== "table"
+        ) {
           e.preventDefault();
           const prevSplit = splitInlineRefs(prev.content);
           const joinPos = prevSplit.editableText.length;
@@ -2089,15 +2369,26 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     ref: Pick<InlineRefToken, "kind" | "id">,
     blockId: string,
     refIndex: number,
-    key: React.Key
+    key: React.Key,
+    allowRemove = true
   ) => {
-    const onRemove = () => handleRemoveInlineRef(blockId, refIndex);
+    const onRemove = allowRemove ? () => handleRemoveInlineRef(blockId, refIndex) : undefined;
 
     if (ref.kind === "session") {
       return (
         <InlineSessionChip
           key={key}
           sessionId={ref.id}
+          onRemove={onRemove}
+        />
+      );
+    }
+
+    if (ref.kind === "page") {
+      return (
+        <InlinePageChip
+          key={key}
+          pageRefId={ref.id}
           onRemove={onRemove}
         />
       );
@@ -2146,7 +2437,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
             navigate();
           }}
           onKeyDown={(e) => {
-            if (e.key === "Backspace" || e.key === "Delete") {
+            if ((e.key === "Backspace" || e.key === "Delete") && onRemove) {
               e.preventDefault();
               e.stopPropagation();
               onRemove();
@@ -2167,41 +2458,54 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
           <span className="max-w-[180px] truncate font-medium">{label}</span>
           <span className="shrink-0 text-[11px] opacity-65">↗</span>
         </button>
-        <button
-          type="button"
-          aria-label="移除引用"
-          title="移除引用"
-          onMouseDown={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-          }}
-          onClick={(e) => {
-            e.stopPropagation();
-            onRemove();
-          }}
-          className={`inline-flex cursor-pointer items-center self-stretch border-l px-1 opacity-75 transition-colors hover:bg-[var(--bg-hover)] hover:opacity-100 ${
-            isInbox ? "border-[var(--amber-border)]" : "border-[var(--border-light)]"
-          }`}
-        >
-          <CloseIcon size={10} />
-        </button>
+        {onRemove && (
+          <button
+            type="button"
+            aria-label="移除引用"
+            title="移除引用"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onClick={(e) => {
+              e.stopPropagation();
+              onRemove();
+            }}
+            className={`inline-flex cursor-pointer items-center self-stretch border-l px-1 opacity-75 transition-colors hover:bg-[var(--bg-hover)] hover:opacity-100 ${
+              isInbox ? "border-[var(--amber-border)]" : "border-[var(--border-light)]"
+            }`}
+          >
+            <CloseIcon size={10} />
+          </button>
+        )}
       </span>
     );
   };
 
-  const renderInlineDisplay = (block: NotebookBlock) => {
-    const segments = parseInlineNotebookText(block.content);
-    if (segments.length === 0) {
-      const placeholder =
-        blocks.length === 1 || (focusedBlockId === null && block.id === blocks[blocks.length - 1]?.id)
-          ? "输入笔记，键入 / 插入 Markdown 块，或输入 @valet 发起新会话…"
-          : "";
-      return (
-        <span data-placeholder-text="true" className="text-[var(--ink-subtle)] select-none">
-          {placeholder || "\u00A0"}
-        </span>
-      );
-    }
+  const renderBoldChildren = (text: string, keyPrefix: string): React.ReactNode => {
+    if (!text.includes("`")) return text;
+    const parts = text.split(/(`[^`]+`)/g);
+    return parts.map((part, idx) =>
+      part.startsWith("`") && part.endsWith("`") && part.length >= 2 ? (
+        <code
+          key={`${keyPrefix}-c-${idx}`}
+          className="mx-0.5 rounded-[5px] border border-[var(--border-light)] bg-[var(--bg-code)] px-1.5 py-[1px] font-mono text-[12px] text-[var(--ink-strong)]"
+        >
+          {part.slice(1, -1)}
+        </code>
+      ) : (
+        <React.Fragment key={`${keyPrefix}-t-${idx}`}>{part}</React.Fragment>
+      )
+    );
+  };
+
+  const renderInlineSegments = (
+    rawText: string,
+    blockId: string,
+    allowChipRemove: boolean
+  ) => {
+    const segments = parseInlineNotebookText(rawText);
+    if (segments.length === 0) return null;
 
     let refIdx = 0;
     return segments.map((seg, i) => {
@@ -2209,7 +2513,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         case "bold":
           return (
             <strong key={i} className="font-semibold text-[var(--ink-strong)]">
-              {seg.text}
+              {renderBoldChildren(seg.text, `${blockId}-b-${i}`)}
             </strong>
           );
         case "italic":
@@ -2251,29 +2555,70 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         case "session":
           return renderInlineRefChip(
             { kind: "session", id: seg.sessionId },
-            block.id,
+            blockId,
             refIdx++,
-            i
+            i,
+            allowChipRemove
+          );
+        case "page":
+          return renderInlineRefChip(
+            { kind: "page", id: seg.pageId },
+            blockId,
+            refIdx++,
+            i,
+            allowChipRemove
           );
         case "inbox":
           return renderInlineRefChip(
             { kind: "inbox", id: seg.itemId },
-            block.id,
+            blockId,
             refIdx++,
-            i
+            i,
+            allowChipRemove
           );
         case "timeline":
           return renderInlineRefChip(
             { kind: "timeline", id: seg.eventId },
-            block.id,
+            blockId,
             refIdx++,
-            i
+            i,
+            allowChipRemove
           );
         case "text":
-        default:
+        default: {
+          if (!allowChipRemove && /<br\s*\/?>/i.test(seg.text)) {
+            const pieces = seg.text.split(/<br\s*\/?>/i);
+            return (
+              <React.Fragment key={i}>
+                {pieces.map((piece, pIdx) => (
+                  <React.Fragment key={pIdx}>
+                    {pIdx > 0 && <br />}
+                    {piece}
+                  </React.Fragment>
+                ))}
+              </React.Fragment>
+            );
+          }
           return <React.Fragment key={i}>{seg.text}</React.Fragment>;
+        }
       }
     });
+  };
+
+  const renderInlineDisplay = (block: NotebookBlock) => {
+    const rendered = renderInlineSegments(block.content, block.id, true);
+    if (!rendered) {
+      const placeholder =
+        blocks.length === 1 || (focusedBlockId === null && block.id === blocks[blocks.length - 1]?.id)
+          ? "输入笔记，键入 / 插入块、[[ 引用页面，或 @valet 发起新会话…"
+          : "";
+      return (
+        <span data-placeholder-text="true" className="text-[var(--ink-subtle)] select-none">
+          {placeholder || "\u00A0"}
+        </span>
+      );
+    }
+    return rendered;
   };
 
   const renderEditableTextOrDisplay = (block: NotebookBlock, blockIndex: number) => {
@@ -2519,7 +2864,11 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       <div className="mb-3 flex flex-wrap items-center gap-1.5 text-[11.5px] text-[var(--ink-muted)]">
         <button
           type="button"
-          onClick={() => exportProjectMarkdownFile(project, projectThreads)}
+          onClick={() =>
+            activePageId && page
+              ? exportPageMarkdownFile(project, page, projectThreads, state.projects)
+              : exportProjectMarkdownFile(project, projectThreads, state.projects)
+          }
           className="inline-flex cursor-pointer items-center gap-1.5 rounded-[6px] px-2 py-1 transition-colors hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
         >
           <DownloadIcon size={12} />
@@ -2529,10 +2878,17 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         <button
           type="button"
           onClick={() => {
-            const md = blocksToMarkdown(project, projectThreads);
+            const md =
+              activePageId && page
+                ? pageToMarkdown(project, page, projectThreads, state.projects)
+                : blocksToMarkdown(project, projectThreads, state.projects);
             void copyTextToClipboard(md).then((ok) => {
               pushToast(
-                ok ? "已复制 Notebook Markdown" : "复制失败，请检查剪贴板权限",
+                ok
+                  ? activePageId
+                    ? "已复制页面 Markdown"
+                    : "已复制 Notebook Markdown"
+                  : "复制失败，请检查剪贴板权限",
                 ok ? "success" : "warning"
               );
             });
@@ -2541,6 +2897,21 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         >
           <CopyIconSvg size={12} />
           <span>复制 Markdown</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() =>
+            void createProjectPage({
+              projectId: project.id,
+              parentPageId: activePageId ?? undefined,
+              switchToPage: true,
+            })
+          }
+          className="inline-flex cursor-pointer items-center gap-1.5 rounded-[6px] px-2 py-1 transition-colors hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+        >
+          <PlusIcon size={12} />
+          <span>{activePageId ? "新建子页面" : "新建页面"}</span>
         </button>
 
         <button
@@ -2572,133 +2943,211 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
             }
           }
         }}
-        placeholder="无标题项目"
+        placeholder={activePageId ? "无标题页面" : "无标题项目"}
         className="w-full bg-transparent font-[family-name:var(--font-serif-zh)] text-[30px] font-semibold leading-[40px] tracking-[-0.02em] text-[var(--ink-strong)] outline-none placeholder:text-[var(--ink-subtle)] lg:text-[32px] lg:leading-[44px]"
       />
 
-      {/* Subtitle / Description */}
-      <input
-        type="text"
-        value={descDraft}
-        onChange={(e) => setDescDraft(e.target.value)}
-        onBlur={commitDescription}
-        {...headerIme.compositionProps}
-        onKeyDown={(e) => {
-          if (headerIme.shouldIgnoreEnter(e)) return;
-          if (e.key === "Enter") {
-            e.preventDefault();
-            commitDescription();
-            e.currentTarget.blur();
-          }
-        }}
-        placeholder="添加项目背景、目标或约束说明…"
-        className="mt-1.5 w-full bg-transparent text-[13.5px] leading-[20px] text-[var(--ink-muted)] outline-none placeholder:text-[var(--ink-subtle)]"
-      />
+      {/* Subtitle / Description (Root Project Notebook) */}
+      {!activePageId && (
+        <input
+          type="text"
+          value={descDraft}
+          onChange={(e) => setDescDraft(e.target.value)}
+          onBlur={commitDescription}
+          {...headerIme.compositionProps}
+          onKeyDown={(e) => {
+            if (headerIme.shouldIgnoreEnter(e)) return;
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commitDescription();
+              e.currentTarget.blur();
+            }
+          }}
+          placeholder="添加项目背景、目标或约束说明…"
+          className="mt-1.5 w-full bg-transparent text-[13.5px] leading-[20px] text-[var(--ink-muted)] outline-none placeholder:text-[var(--ink-subtle)]"
+        />
+      )}
 
       {/* Compact Notion Properties Strip */}
       <div className="mt-4 flex flex-col gap-2 border-b border-[var(--border-light)] pb-4 text-[12px]">
-        <div className="flex items-center gap-3">
-          <span className="w-[72px] shrink-0 text-[var(--ink-subtle)]">关联会话</span>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setProjectTab("sessions")}
-              className="inline-flex cursor-pointer items-center gap-1.5 rounded-[6px] border border-[var(--border-light)] bg-[var(--bg-subtle)] px-2 py-0.5 text-[11.5px] font-medium text-[var(--ink-strong)] hover:border-[var(--border-strong)]"
-            >
-              <span>{projectThreads.length} 个会话</span>
-              <span className="text-[var(--ink-subtle)]">→</span>
-            </button>
-            {runningCount > 0 && (
-              <span className="inline-flex items-center gap-1 rounded-[6px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2 py-0.5 font-mono text-[10.5px] text-[var(--ink-strong)]">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--ink-primary)]" />
-                {runningCount} 进行中
-              </span>
-            )}
-            {pendingInboxCount > 0 && (
-              <span className="inline-flex items-center gap-1 rounded-[6px] border border-[var(--amber-border)] bg-[var(--amber-bg)] px-2 py-0.5 text-[11px] font-medium text-[var(--amber-text)]">
-                {pendingInboxCount} 待你确认
-              </span>
-            )}
-          </div>
-        </div>
-
-        <div className="flex items-center gap-3">
-          <span className="w-[72px] shrink-0 text-[var(--ink-subtle)]">标签</span>
-          <div className="flex flex-wrap items-center gap-1.5">
-            {project.tags.map((tag) => (
-              <span
-                key={tag}
-                className="inline-flex items-center gap-1 rounded-[6px] border border-[var(--border-light)] bg-[var(--bg-subtle)] px-2 py-0.5 text-[11px] text-[var(--ink-secondary)]"
-              >
-                <span>{tag}</span>
+        {!activePageId && (
+          <>
+            <div className="flex items-center gap-3">
+              <span className="w-[72px] shrink-0 text-[var(--ink-subtle)]">关联会话</span>
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  onClick={() =>
-                    updateProject(project.id, {
-                      tags: project.tags.filter((t) => t !== tag),
-                    })
-                  }
-                  className="cursor-pointer text-[10px] text-[var(--ink-subtle)] hover:text-[var(--ink-strong)]"
-                  title="移除标签"
+                  onClick={() => setProjectTab("sessions")}
+                  className="inline-flex cursor-pointer items-center gap-1.5 rounded-[6px] border border-[var(--border-light)] bg-[var(--bg-subtle)] px-2 py-0.5 text-[11.5px] font-medium text-[var(--ink-strong)] hover:border-[var(--border-strong)]"
                 >
-                  ×
+                  <span>{projectThreads.length} 个会话</span>
+                  <span className="text-[var(--ink-subtle)]">→</span>
                 </button>
-              </span>
-            ))}
+                {runningCount > 0 && (
+                  <span className="inline-flex items-center gap-1 rounded-[6px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2 py-0.5 font-mono text-[10.5px] text-[var(--ink-strong)]">
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--ink-primary)]" />
+                    {runningCount} 进行中
+                  </span>
+                )}
+                {pendingInboxCount > 0 && (
+                  <span className="inline-flex items-center gap-1 rounded-[6px] border border-[var(--amber-border)] bg-[var(--amber-bg)] px-2 py-0.5 text-[11px] font-medium text-[var(--amber-text)]">
+                    {pendingInboxCount} 待你确认
+                  </span>
+                )}
+              </div>
+            </div>
 
-            {addingTag ? (
+            <div className="flex items-center gap-3">
+              <span className="w-[72px] shrink-0 text-[var(--ink-subtle)]">标签</span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {project.tags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="inline-flex items-center gap-1 rounded-[6px] border border-[var(--border-light)] bg-[var(--bg-subtle)] px-2 py-0.5 text-[11px] text-[var(--ink-secondary)]"
+                  >
+                    <span>{tag}</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateProject(project.id, {
+                          tags: project.tags.filter((t) => t !== tag),
+                        })
+                      }
+                      className="cursor-pointer text-[10px] text-[var(--ink-subtle)] hover:text-[var(--ink-strong)]"
+                      title="移除标签"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+
+                {addingTag ? (
+                  <input
+                    type="text"
+                    autoFocus
+                    value={tagDraft}
+                    onChange={(e) => setTagDraft(e.target.value)}
+                    onBlur={handleAddTag}
+                    {...headerIme.compositionProps}
+                    onKeyDown={(e) => {
+                      if (headerIme.shouldIgnoreEnter(e)) return;
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        handleAddTag();
+                      } else if (e.key === "Escape") {
+                        setAddingTag(false);
+                        setTagDraft("");
+                      }
+                    }}
+                    placeholder="输入标签…"
+                    className="h-[22px] w-24 rounded-[6px] border border-[var(--ink-primary)] bg-[var(--bg-canvas)] px-2 text-[11px] text-[var(--ink-strong)] outline-none"
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setAddingTag(true)}
+                    className="cursor-pointer rounded-[6px] px-1.5 py-0.5 text-[11px] text-[var(--ink-subtle)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                  >
+                    + 添加标签
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <span className="w-[72px] shrink-0 text-[var(--ink-subtle)]">工作目录</span>
               <input
                 type="text"
-                autoFocus
-                value={tagDraft}
-                onChange={(e) => setTagDraft(e.target.value)}
-                onBlur={handleAddTag}
+                value={workingDirDraft}
+                onChange={(e) => setWorkingDirDraft(e.target.value)}
+                onBlur={commitWorkingDir}
                 {...headerIme.compositionProps}
                 onKeyDown={(e) => {
                   if (headerIme.shouldIgnoreEnter(e)) return;
                   if (e.key === "Enter") {
                     e.preventDefault();
-                    handleAddTag();
-                  } else if (e.key === "Escape") {
-                    setAddingTag(false);
-                    setTagDraft("");
+                    commitWorkingDir();
+                    e.currentTarget.blur();
                   }
                 }}
-                placeholder="输入标签…"
-                className="h-[22px] w-24 rounded-[6px] border border-[var(--ink-primary)] bg-[var(--bg-canvas)] px-2 text-[11px] text-[var(--ink-strong)] outline-none"
+                placeholder="~/Projects/... (可选)"
+                className="min-w-0 flex-1 bg-transparent font-mono text-[11.5px] text-[var(--ink-secondary)] outline-none placeholder:text-[var(--ink-subtle)]"
               />
-            ) : (
+            </div>
+          </>
+        )}
+
+        {/* Sub-pages */}
+        <div className="flex items-start gap-3">
+          <span className="w-[72px] shrink-0 pt-0.5 text-[var(--ink-subtle)]">
+            {activePageId ? "子页面" : "页面"}
+          </span>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {directChildPages.map((child) => (
               <button
+                key={child.id}
                 type="button"
-                onClick={() => setAddingTag(true)}
-                className="cursor-pointer rounded-[6px] px-1.5 py-0.5 text-[11px] text-[var(--ink-subtle)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                onClick={() => openProjectPage(project.id, child.id)}
+                className="inline-flex max-w-[200px] cursor-pointer items-center gap-1 rounded-[6px] border border-[var(--border-light)] bg-[var(--bg-subtle)] px-2 py-0.5 text-[11px] font-medium text-[var(--ink-strong)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]"
+                title={child.title || "未命名页面"}
               >
-                + 添加标签
+                <FileTextIcon size={11} className="shrink-0 text-[var(--ink-primary)]" />
+                <span className="truncate">{child.title || "未命名页面"}</span>
               </button>
-            )}
+            ))}
+            <button
+              type="button"
+              onClick={() =>
+                void createProjectPage({
+                  projectId: project.id,
+                  parentPageId: activePageId ?? undefined,
+                  switchToPage: true,
+                })
+              }
+              className="cursor-pointer rounded-[6px] px-1.5 py-0.5 text-[11px] text-[var(--ink-subtle)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+            >
+              + {activePageId ? "添加子页面" : "添加页面"}
+            </button>
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
-          <span className="w-[72px] shrink-0 text-[var(--ink-subtle)]">工作目录</span>
-          <input
-            type="text"
-            value={workingDirDraft}
-            onChange={(e) => setWorkingDirDraft(e.target.value)}
-            onBlur={commitWorkingDir}
-            {...headerIme.compositionProps}
-            onKeyDown={(e) => {
-              if (headerIme.shouldIgnoreEnter(e)) return;
-              if (e.key === "Enter") {
-                e.preventDefault();
-                commitWorkingDir();
-                e.currentTarget.blur();
-              }
-            }}
-            placeholder="~/Projects/... (可选)"
-            className="min-w-0 flex-1 bg-transparent font-mono text-[11.5px] text-[var(--ink-secondary)] outline-none placeholder:text-[var(--ink-subtle)]"
-          />
-        </div>
+        {/* Live Backlinks */}
+        {backlinks.length > 0 && (
+          <div className="flex items-start gap-3">
+            <span className="w-[72px] shrink-0 pt-0.5 text-[var(--ink-subtle)]">
+              反向引用
+            </span>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {backlinks.map((link) => (
+                <button
+                  key={`${link.sourceProjectId}:${link.sourcePageId ?? "root"}:${link.blockId}`}
+                  type="button"
+                  onClick={() =>
+                    returnToProjectNotebook(
+                      link.blockId,
+                      link.sourceProjectId,
+                      link.sourcePageId ?? undefined
+                    )
+                  }
+                  title={
+                    link.snippet ? `${link.sourceTitle}: ${link.snippet}` : link.sourceTitle
+                  }
+                  className="inline-flex max-w-[280px] cursor-pointer items-center gap-1 rounded-[6px] border border-[var(--border-light)] bg-[var(--bg-subtle)] px-2 py-0.5 text-[11px] text-[var(--ink-secondary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
+                >
+                  <FileTextIcon size={10.5} className="shrink-0 text-[var(--ink-muted)]" />
+                  <span className="shrink-0 font-medium text-[var(--ink-strong)]">
+                    {link.sourceTitle}
+                  </span>
+                  {link.snippet && (
+                    <span className="truncate text-[var(--ink-subtle)]">
+                      · {link.snippet}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
       </div>
 
@@ -2980,6 +3429,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                     onSubmit={async ({ prompt, model, includeNotebookContext }) => {
                       const created = await spawnSessionFromNotebook({
                         projectId: project.id,
+                        originPageId: activePageId ?? undefined,
                         prompt,
                         model,
                         includeNotebookContext,
@@ -3039,6 +3489,14 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                     sessionId={block.sessionId ?? ""}
                     fallbackTitle={block.content}
                     fallbackSummary={block.summary}
+                    onRemove={() => deleteBlock(block.id)}
+                  />
+                </div>
+              ) : block.type === "page_ref" ? (
+                <div className="my-1.5">
+                  <PageRefBlockCard
+                    pageRefId={block.pageId ?? ""}
+                    fallbackTitle={block.content}
                     onRemove={() => deleteBlock(block.id)}
                   />
                 </div>
@@ -3122,6 +3580,280 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                     className="w-full resize-none bg-transparent px-3.5 py-2.5 font-mono text-[12.5px] leading-[20px] text-[var(--ink-strong)] outline-none placeholder:text-[var(--ink-subtle)]"
                   />
                 </div>
+              ) : block.type === "table" ? (
+                (() => {
+                  const parsedTable = parseMarkdownTable(block.content);
+                  const isTableFocused = focusedBlockId === block.id;
+
+                  const renderTableElement = (tbl: NonNullable<typeof parsedTable>) => (
+                    <table className="w-full border-collapse text-left text-[12.5px] leading-[18px]">
+                      <thead>
+                        <tr className="bg-[var(--bg-subtle)]">
+                          {tbl.headers.map((headerCell, colIdx) => {
+                            const align = tbl.alignments[colIdx] ?? "left";
+                            return (
+                              <th
+                                key={colIdx}
+                                style={{ textAlign: align }}
+                                className="border-b border-[var(--border-light)] px-3 py-2 font-semibold text-[var(--ink-strong)]"
+                              >
+                                {headerCell
+                                  ? renderInlineSegments(headerCell, block.id, false)
+                                  : "\u00A0"}
+                              </th>
+                            );
+                          })}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {tbl.rows.map((row, rowIdx) => (
+                          <tr
+                            key={rowIdx}
+                            className="border-t border-[var(--border-subtle)] hover:bg-[var(--bg-subtle)]/40"
+                          >
+                            {row.map((cell, colIdx) => {
+                              const align = tbl.alignments[colIdx] ?? "left";
+                              return (
+                                <td
+                                  key={colIdx}
+                                  style={{ textAlign: align }}
+                                  className="px-3 py-2 align-top text-[var(--ink-body)]"
+                                >
+                                  {cell
+                                    ? renderInlineSegments(cell, block.id, false)
+                                    : "\u00A0"}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  );
+
+                  if (isTableFocused) {
+                    return (
+                      <div className="my-2 overflow-hidden rounded-[10px] border border-[var(--border-card)] bg-[var(--bg-surface)]">
+                        <div className="flex items-center justify-between border-b border-[var(--border-light)] bg-[var(--bg-subtle)] px-3 py-1.5">
+                          <div className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--ink-muted)]">
+                            <TableIcon size={12} />
+                            <span>Markdown 表格</span>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                              }}
+                              onClick={() => {
+                                updateBlockContentOrProps(block.id, {
+                                  content: appendTableRow(block.content),
+                                });
+                              }}
+                              className="cursor-pointer rounded-[5px] px-1.5 py-0.5 font-mono text-[10.5px] text-[var(--ink-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
+                            >
+                              + 行
+                            </button>
+                            <button
+                              type="button"
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                              }}
+                              onClick={() => {
+                                updateBlockContentOrProps(block.id, {
+                                  content: appendTableColumn(block.content),
+                                });
+                              }}
+                              className="cursor-pointer rounded-[5px] px-1.5 py-0.5 font-mono text-[10.5px] text-[var(--ink-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
+                            >
+                              + 列
+                            </button>
+                            <button
+                              type="button"
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                              }}
+                              onClick={() => {
+                                void copyTextToClipboard(block.content).then((ok) => {
+                                  pushToast(
+                                    ok ? "已复制表格 Markdown" : "复制失败，请手动选中复制",
+                                    ok ? "success" : "warning"
+                                  );
+                                });
+                              }}
+                              className="inline-flex cursor-pointer items-center gap-1 rounded-[5px] px-1.5 py-0.5 font-mono text-[10.5px] text-[var(--ink-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--ink-strong)]"
+                            >
+                              <CopyIconSvg size={11} />
+                              <span>复制</span>
+                            </button>
+                            <button
+                              type="button"
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                              }}
+                              onClick={() => {
+                                blockTextareaRefs.current[block.id]?.blur();
+                                setFocusedBlockId(null);
+                              }}
+                              className="cursor-pointer rounded-[5px] bg-[var(--ink-primary)] px-2 py-0.5 font-mono text-[10.5px] font-medium text-[var(--ink-on-primary)]"
+                            >
+                              完成
+                            </button>
+                          </div>
+                        </div>
+                        <textarea
+                          ref={(el) => {
+                            blockTextareaRefs.current[block.id] = el;
+                          }}
+                          rows={Math.max(3, block.content.split("\n").length)}
+                          value={block.content}
+                          onFocus={() => {
+                            clearBlockSelection();
+                            setFocusedBlockId(block.id);
+                          }}
+                          onBlur={() => {
+                            window.setTimeout(() => {
+                              setFocusedBlockId((cur) => {
+                                if (cur !== block.id) return cur;
+                                const activeEl = document.activeElement;
+                                if (activeEl === blockTextareaRefs.current[block.id]) return cur;
+                                return null;
+                              });
+                            }, 120);
+                          }}
+                          onChange={(e) =>
+                            handleBlockChange(
+                              block,
+                              e.target.value,
+                              e.target.selectionStart ?? e.target.value.length
+                            )
+                          }
+                          onKeyDown={(e) => handleTextareaKeyDown(e, block, idx)}
+                          placeholder="| 列 1 | 列 2 |&#10;| --- | --- |&#10;| 内容 | 内容 |"
+                          spellCheck={false}
+                          className="w-full resize-none bg-[var(--bg-code)] px-3.5 py-2.5 font-mono text-[12px] leading-[19px] text-[var(--ink-strong)] outline-none placeholder:text-[var(--ink-subtle)]"
+                        />
+                        {parsedTable && (
+                          <div className="border-t border-[var(--border-light)] bg-[var(--bg-surface)] p-2.5">
+                            <div className="mb-1.5 font-mono text-[10px] uppercase tracking-[0.06em] text-[var(--ink-subtle)]">
+                              实时预览 · Shift+Enter / ⌘Enter 跳至下一块
+                            </div>
+                            <div className="min-w-0 max-w-full overflow-x-auto rounded-[8px] border border-[var(--border-light)] bg-[var(--bg-surface)]">
+                              {renderTableElement(parsedTable)}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="group/tbl relative my-2">
+                      <div className="absolute top-1.5 right-1.5 z-10 hidden items-center gap-0.5 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-elevated)] p-0.5 shadow-xs group-hover/tbl:inline-flex">
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            updateBlockContentOrProps(block.id, {
+                              content: appendTableRow(block.content),
+                            });
+                          }}
+                          className="cursor-pointer rounded-[5px] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-muted)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                        >
+                          + 行
+                        </button>
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            updateBlockContentOrProps(block.id, {
+                              content: appendTableColumn(block.content),
+                            });
+                          }}
+                          className="cursor-pointer rounded-[5px] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-muted)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                        >
+                          + 列
+                        </button>
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            focusBlockAt(block.id, block.content.length);
+                          }}
+                          className="cursor-pointer rounded-[5px] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-muted)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                        >
+                          编辑
+                        </button>
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void copyTextToClipboard(block.content).then((ok) => {
+                              pushToast(
+                                ok ? "已复制表格 Markdown" : "复制失败，请手动选中复制",
+                                ok ? "success" : "warning"
+                              );
+                            });
+                          }}
+                          className="cursor-pointer rounded-[5px] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-muted)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                        >
+                          复制
+                        </button>
+                      </div>
+                      {parsedTable ? (
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          onClick={(e) => {
+                            if (suppressNextClickRef.current) return;
+                            if ((e.target as HTMLElement).closest("[data-inline-interactive]")) {
+                              return;
+                            }
+                            focusBlockAt(block.id, block.content.length);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              focusBlockAt(block.id, block.content.length);
+                            }
+                          }}
+                          className="min-w-0 max-w-full cursor-pointer overflow-x-auto rounded-[10px] border border-[var(--border-card)] bg-[var(--bg-surface)] transition-colors hover:border-[var(--border-strong)]"
+                        >
+                          {renderTableElement(parsedTable)}
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => focusBlockAt(block.id, block.content.length)}
+                          className="flex w-full cursor-pointer items-center gap-2 rounded-[10px] border border-dashed border-[var(--border-control)] bg-[var(--bg-subtle)]/50 px-3.5 py-2.5 text-left text-[12px] text-[var(--ink-muted)] hover:border-[var(--border-strong)] hover:text-[var(--ink-strong)]"
+                        >
+                          <TableIcon size={13} />
+                          <span>表格语法不完整，点击编辑修复</span>
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()
               ) : block.type === "callout" ? (
                 <div className="my-1 flex items-start gap-2.5 rounded-[10px] border border-[var(--border-card)] bg-[var(--bg-subtle)]/85 px-4 py-3">
                   <span className="mt-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-[var(--border-control)] bg-[var(--bg-surface)] font-mono text-[10px] font-semibold text-[var(--ink-muted)]">
@@ -3180,6 +3912,8 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                 <div data-popover="true">
                   <NotebookMentionPopover
                     projectId={project.id}
+                    currentPageId={activePageId}
+                    trigger={mentionState.trigger}
                     query={mentionState.query}
                     onSelect={handleMentionSelect}
                     onClose={() => setMentionState(null)}

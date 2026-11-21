@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -403,5 +403,91 @@ edges:
     expect(failNode?.status).toBe("failed");
     expect(failNode?.error).toContain("boom");
     expect(failed.nodes.find((n) => n.nodeId === "unreachable")?.status).toBe("pending");
+  });
+
+  it("falls back to predecessor/referenced step output text when notify template resolves empty and injects dataDir/bin bun onto script PATH", async () => {
+    const wfYaml = `
+version: 1
+nodes:
+  - id: trig
+    type: trigger
+  - id: draft
+    type: agent
+    config:
+      prompt: "总结最新 X 推文"
+  - id: notify_from_ref
+    type: notify
+    config:
+      title: X 巡检报告
+      message: "{{steps.draft.output.missingField}}"
+      kind: timeline
+  - id: check_bun
+    type: script
+    config:
+      command: 'which bun && test -n "$VALET_DATA_DIR" && echo bun-ok'
+edges:
+  - from: trig
+    to: draft
+  - from: draft
+    to: notify_from_ref
+  - from: notify_from_ref
+    to: check_bun
+`;
+    const plugin = makeWorkflowPlugin("wf-fallback-path", wfYaml);
+    const dir = await mkdtemp(join(tmpdir(), "valet-wf-bin-"));
+    const bundle = await openUniversalSqliteBundle(join(dir, "test.sqlite"));
+    const notified: Array<{ title: string; message: string }> = [];
+
+    // Seed an executable named `bun` inside `<dataDir>/bin`
+    const binDir = join(dir, "bin");
+    await mkdir(binDir, { recursive: true });
+    const fakeBunPath = join(binDir, "bun");
+    await writeFile(fakeBunPath, "#!/bin/sh\necho fake-bun\n", "utf8");
+    await chmod(fakeBunPath, 0o755);
+
+    const mgr = new ValetWorkflowManager(dir, bundle.db, {
+      getPlugin: (id) => (id === plugin.id ? plugin : undefined),
+      executeTool: async (req) => ({ tool: req.tool, args: req.args }),
+      runAgentPrompt: async () => ({
+        text: "## X 巡检：5 条新推文\n\n- @karpathy: LLM post-training notes",
+      }),
+      emitNotify: async (req) => {
+        notified.push({ title: req.title ?? "", message: req.message });
+        return { notified: true };
+      },
+      queueApproval: async (req) => ({
+        queued: true,
+        inboxId: "inbox-fallback-1",
+        token: req.hookToken,
+      }),
+      onRunUpdated: () => {},
+    });
+
+    cleanups.push(async () => {
+      await mgr.close();
+      await bundle.storage.close(BACKGROUND_CONTEXT);
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    await mgr.init();
+    const initial = await mgr.startPluginWorkflow({
+      plugin,
+      event: "test.event",
+      waitForCompletionMs: 100,
+    });
+    const done = await waitForRunDetail(
+      mgr,
+      initial.summary.runId,
+      (d) => d.summary.status === "completed",
+    );
+
+    expect(notified.length).toBe(1);
+    expect(notified[0]?.message).toContain("## X 巡检：5 条新推文");
+    expect(notified[0]?.message).toContain("@karpathy");
+
+    const scriptNode = done.nodes.find((n) => n.nodeId === "check_bun");
+    expect(scriptNode?.status).toBe("completed");
+    expect((scriptNode?.output as { stdout?: string })?.stdout).toContain(fakeBunPath);
+    expect((scriptNode?.output as { stdout?: string })?.stdout).toContain("bun-ok");
   });
 });

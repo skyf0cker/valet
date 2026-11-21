@@ -5,10 +5,17 @@ import {
   type NotebookBlock,
   type NotebookBlockType,
   type Project,
+  type ProjectPage,
   type ProjectTab,
   type ValetSnapshot,
 } from "../types/valet";
 import { clampBlockIndent, computeNumberedListMarkers } from "./notebookEditor";
+import {
+  collectReferencedPageIds,
+  normalizeProjectPages,
+  resolvePageRefTarget,
+} from "./notebookPages";
+import { coalesceTableParagraphBlocks } from "./notebookTable";
 
 const MAX_NOTEBOOK_EXCERPT_CHARS = 10_000;
 
@@ -38,7 +45,7 @@ export function normalizeProjectsState(snapshot: ValetSnapshot): ValetSnapshot {
 
   for (const p of rawProjects) {
     if (!p || !p.id) continue;
-    const normalizedBlocks: NotebookBlock[] =
+    const normalizedBlocks: NotebookBlock[] = coalesceTableParagraphBlocks(
       Array.isArray(p.blocks) && p.blocks.length > 0
         ? p.blocks.map((blk) => {
             const normIndent = clampBlockIndent(blk.type, blk.indent);
@@ -50,11 +57,13 @@ export function normalizeProjectsState(snapshot: ValetSnapshot): ValetSnapshot {
             }
             return nextBlk;
           })
-        : [{ id: makeBlockId("blk"), type: "paragraph", content: "" }];
+        : [{ id: makeBlockId("blk"), type: "paragraph", content: "" }]
+    );
     const normalized: Project = {
       ...p,
       tags: Array.isArray(p.tags) ? p.tags : [],
       blocks: normalizedBlocks,
+      pages: normalizeProjectPages(p.pages),
     };
     if (p.id === DEFAULT_PROJECT_ID) {
       defaultProj = {
@@ -88,7 +97,8 @@ export function normalizeProjectsState(snapshot: ValetSnapshot): ValetSnapshot {
   let activeProjectTab: ProjectTab =
     snapshot.activeProjectTab === "notebook" ||
     snapshot.activeProjectTab === "sessions" ||
-    snapshot.activeProjectTab === "session"
+    snapshot.activeProjectTab === "session" ||
+    snapshot.activeProjectTab === "page"
       ? snapshot.activeProjectTab
       : activeProjectId === DEFAULT_PROJECT_ID
         ? "sessions"
@@ -98,6 +108,20 @@ export function normalizeProjectsState(snapshot: ValetSnapshot): ValetSnapshot {
     activeProjectTab = "session";
   }
 
+  const activeProjObj = projects.find((p) => p.id === activeProjectId);
+  let activePageId: string | undefined = snapshot.activePageId;
+  if (activeProjectTab === "page") {
+    const hasPage = Boolean(
+      activePageId && activeProjObj?.pages?.some((pg) => pg.id === activePageId)
+    );
+    if (!hasPage) {
+      activePageId = undefined;
+      activeProjectTab = activeProjectId === DEFAULT_PROJECT_ID ? "sessions" : "notebook";
+    }
+  } else {
+    activePageId = undefined;
+  }
+
   return {
     ...snapshot,
     activeView,
@@ -105,6 +129,7 @@ export function normalizeProjectsState(snapshot: ValetSnapshot): ValetSnapshot {
     chatThreads,
     activeProjectId,
     activeProjectTab,
+    activePageId,
   };
 }
 
@@ -144,11 +169,19 @@ export function findNearestHeading(blocks: NotebookBlock[], beforeIndex: number)
   return "";
 }
 
-export function formatInlineTokensForMarkdown(text: string, threadsById: Map<string, ChatThread>): string {
+export function formatInlineTokensForMarkdown(
+  text: string,
+  threadsById: Map<string, ChatThread>,
+  pageTitleResolver?: (pageRefId: string) => string
+): string {
   return text
     .replace(/\[\[session:([^\]]+)\]\]/g, (_m, id: string) => {
       const t = threadsById.get(id);
       return `[会话: ${t?.title ?? id}]`;
+    })
+    .replace(/\[\[page:([^\]]+)\]\]/g, (_m, id: string) => {
+      const title = pageTitleResolver?.(id) ?? id;
+      return `[页面: ${title}]`;
     })
     .replace(/\[\[inbox:([^\]]+)\]\]/g, (_m, id: string) => `[收件箱: ${id}]`)
     .replace(/\[\[timeline:([^\]]+)\]\]/g, (_m, id: string) => `[时间线: ${id}]`);
@@ -159,6 +192,8 @@ export interface NotebookContextOriginOptions {
   originSection?: string;
   originBeforeText?: string;
   originAfterText?: string;
+  page?: ProjectPage | null;
+  allProjects?: Project[];
 }
 
 function toSingleLineSnippet(text: string, maxLen = 42): string {
@@ -187,10 +222,14 @@ function getNotebookBlockTypeLabel(blk: NotebookBlock): string {
       return "引用块";
     case "code":
       return "代码块";
+    case "table":
+      return "表格";
     case "divider":
       return "分割线";
     case "session_ref":
       return "关联会话卡片";
+    case "page_ref":
+      return "子页面链接";
     case "paragraph":
     default:
       return "正文段落";
@@ -201,10 +240,14 @@ function formatSingleBlockLines(
   blk: NotebookBlock,
   orderedNumber: number,
   threadsById: Map<string, ChatThread>,
-  overrideText?: string
+  overrideText?: string,
+  pageTitleResolver?: (pageRefId: string) => string
 ): { lines: string[]; trailingBlank: boolean } {
   const rawText = overrideText ?? blk.content ?? "";
-  const text = blk.type === "code" ? rawText : formatInlineTokensForMarkdown(rawText, threadsById);
+  const text =
+    blk.type === "code"
+      ? rawText
+      : formatInlineTokensForMarkdown(rawText, threadsById, pageTitleResolver);
   const indentPrefix = "  ".repeat(clampBlockIndent(blk.type, blk.indent));
   switch (blk.type) {
     case "h1":
@@ -234,6 +277,10 @@ function formatSingleBlockLines(
         lines: [`\`\`\`${blk.language ?? ""}`, rawText, "\`\`\`"],
         trailingBlank: true,
       };
+    case "table":
+      return text.trim()
+        ? { lines: text.split("\n"), trailingBlank: true }
+        : { lines: [], trailingBlank: false };
     case "divider":
       return { lines: ["---"], trailingBlank: true };
     case "session_ref": {
@@ -248,6 +295,14 @@ function formatSingleBlockLines(
         trailingBlank: true,
       };
     }
+    case "page_ref": {
+      const resolved = blk.pageId ? pageTitleResolver?.(blk.pageId) : undefined;
+      const title = resolved || text || "关联页面";
+      return {
+        lines: [`- [页面：${title}]`],
+        trailingBlank: false,
+      };
+    }
     case "paragraph":
     default:
       return text.trim()
@@ -260,23 +315,34 @@ function formatSingleBlockMarkdown(
   blk: NotebookBlock,
   orderedNumber: number,
   threadsById: Map<string, ChatThread>,
-  overrideText?: string
+  overrideText?: string,
+  pageTitleResolver?: (pageRefId: string) => string
 ): string {
-  return formatSingleBlockLines(blk, orderedNumber, threadsById, overrideText).lines.join("\n");
+  return formatSingleBlockLines(blk, orderedNumber, threadsById, overrideText, pageTitleResolver).lines.join("\n");
 }
 
 export function serializeBlocksToMarkdown(
   blocks: NotebookBlock[],
-  threads: ChatThread[]
+  threads: ChatThread[],
+  allProjects?: Project[]
 ): string {
   if (blocks.length === 0) return "";
   const threadsById = new Map(threads.map((t) => [t.id, t]));
+  const pageTitleResolver = allProjects
+    ? (refId: string) => resolvePageRefTarget(allProjects, refId)?.title ?? refId
+    : undefined;
   const markers = computeNumberedListMarkers(blocks);
   const lines: string[] = [];
 
   for (const blk of blocks) {
     const orderedNumber = markers[blk.id]?.index ?? 1;
-    const formatted = formatSingleBlockLines(blk, orderedNumber, threadsById);
+    const formatted = formatSingleBlockLines(
+      blk,
+      orderedNumber,
+      threadsById,
+      undefined,
+      pageTitleResolver
+    );
     if (formatted.lines.length > 0) {
       lines.push(...formatted.lines);
       if (formatted.trailingBlank) {
@@ -288,7 +354,11 @@ export function serializeBlocksToMarkdown(
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-export function blocksToMarkdown(project: Project, threads: ChatThread[]): string {
+export function blocksToMarkdown(
+  project: Project,
+  threads: ChatThread[],
+  allProjects?: Project[]
+): string {
   const lines: string[] = [`# ${project.title}`];
 
   if (project.tags.length > 0 || project.workingDir) {
@@ -298,11 +368,25 @@ export function blocksToMarkdown(project: Project, threads: ChatThread[]): strin
     lines.push("", meta.join(" · "));
   }
 
-  const body = serializeBlocksToMarkdown(project.blocks, threads);
+  const body = serializeBlocksToMarkdown(project.blocks, threads, allProjects ?? [project]);
   if (body) {
     lines.push("", body);
   }
 
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+}
+
+export function pageToMarkdown(
+  project: Project,
+  page: ProjectPage,
+  threads: ChatThread[],
+  allProjects?: Project[]
+): string {
+  const lines: string[] = [`# ${page.title}`, "", `所属项目: ${project.title}`];
+  const body = serializeBlocksToMarkdown(page.blocks, threads, allProjects ?? [project]);
+  if (body) {
+    lines.push("", body);
+  }
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
 }
 
@@ -316,10 +400,18 @@ export function buildNotebookContextAttachment(
     originSection,
     originBeforeText,
     originAfterText,
+    page,
+    allProjects,
   } = typeof origin === "string" ? { originSection: origin } : (origin ?? {});
 
+  const projectScope = allProjects && allProjects.length > 0 ? allProjects : [project];
+  const pageTitleResolver = (refId: string): string =>
+    resolvePageRefTarget(projectScope, refId)?.title ?? refId;
+  const targetBlocks = page ? page.blocks : project.blocks;
+  const targetTitle = page ? `${project.title} / ${page.title}` : project.title;
+
   const threadsById = new Map(threads.map((t) => [t.id, t]));
-  const markers = computeNumberedListMarkers(project.blocks);
+  const markers = computeNumberedListMarkers(targetBlocks);
 
   interface AnnotatedEntry {
     blockId: string;
@@ -335,7 +427,7 @@ export function buildNotebookContextAttachment(
   const entries: AnnotatedEntry[] = [];
   let lineNo = 0;
 
-  for (const blk of project.blocks) {
+  for (const blk of targetBlocks) {
     const orderedNumber = markers[blk.id]?.index ?? 1;
 
     const isOrigin = Boolean(originBlockId && blk.id === originBlockId);
@@ -363,13 +455,20 @@ export function buildNotebookContextAttachment(
       isOrigin &&
       blk.type !== "divider" &&
       blk.type !== "session_ref" &&
+      blk.type !== "page_ref" &&
       !effectiveRaw.trim();
 
     lineNo += 1;
     const typeLabel = getNotebookBlockTypeLabel(blk);
     const markdownText = isBlankOrigin
       ? "（空白行）"
-      : formatSingleBlockMarkdown(blk, orderedNumber, threadsById, effectiveOverride);
+      : formatSingleBlockMarkdown(
+          blk,
+          orderedNumber,
+          threadsById,
+          effectiveOverride,
+          pageTitleResolver
+        );
 
     let plainText = "";
     if (!isBlankOrigin) {
@@ -378,10 +477,13 @@ export function buildNotebookContextAttachment(
       } else if (blk.type === "session_ref") {
         const linked = blk.sessionId ? threadsById.get(blk.sessionId) : undefined;
         plainText = linked?.title || effectiveRaw || "关联会话";
+      } else if (blk.type === "page_ref") {
+        const linkedTitle = blk.pageId ? pageTitleResolver(blk.pageId) : undefined;
+        plainText = linkedTitle || effectiveRaw || "关联页面";
       } else if (blk.type === "code") {
         plainText = effectiveRaw;
       } else {
-        plainText = formatInlineTokensForMarkdown(effectiveRaw, threadsById);
+        plainText = formatInlineTokensForMarkdown(effectiveRaw, threadsById, pageTitleResolver);
       }
     }
 
@@ -420,6 +522,9 @@ export function buildNotebookContextAttachment(
   }
 
   const headerLines: string[] = ["[发起定位]", `- 所属项目：${project.title}`];
+  if (page) {
+    headerLines.push(`- 所属页面：${page.title} (pageId=${page.id})`);
+  }
   if (originSection) {
     headerLines.push(`- 所属章节：${originSection}`);
   }
@@ -441,7 +546,7 @@ export function buildNotebookContextAttachment(
     }
   }
 
-  const bodyHeaderLines = ["", "[完整 Notebook 上下文（已标注当前引用行）]"];
+  const bodyHeaderLines = ["", `[完整${page ? "页面" : " Notebook"} 上下文（已标注当前引用行）]`];
   const projectMetaParts: string[] = [];
   if (project.tags.length > 0) projectMetaParts.push(`标签: ${project.tags.join(", ")}`);
   if (project.workingDir) projectMetaParts.push(`工作目录: \`${project.workingDir}\``);
@@ -449,9 +554,28 @@ export function buildNotebookContextAttachment(
     bodyHeaderLines.push(projectMetaParts.join(" · "));
   }
 
+  const referencedExcerpts: string[] = [];
+  const referencedIds = collectReferencedPageIds(targetBlocks).slice(0, 3);
+  for (const refId of referencedIds) {
+    if (page && refId === page.id) continue;
+    const resolved = resolvePageRefTarget(projectScope, refId);
+    if (!resolved) continue;
+    const refBlocks = resolved.page ? resolved.page.blocks : resolved.project.blocks;
+    const refMd = serializeBlocksToMarkdown(refBlocks, threads, projectScope).slice(0, 1200).trim();
+    if (refMd) {
+      referencedExcerpts.push(
+        `### ${resolved.title} (${resolved.isRoot ? `项目 Notebook` : `pageId=${refId}`})\n${refMd}`
+      );
+    }
+  }
+
   const prefix = `${headerLines.join("\n")}\n${bodyHeaderLines.join("\n")}`;
   const fullBody = entries.map((e) => e.formattedBlock).join("\n");
-  const fullExcerpt = fullBody ? `${prefix}\n${fullBody}` : prefix;
+  const refSection =
+    referencedExcerpts.length > 0
+      ? `\n\n[引用页面参考]\n${referencedExcerpts.join("\n\n")}`
+      : "";
+  const fullExcerpt = `${fullBody ? `${prefix}\n${fullBody}` : prefix}${refSection}`;
 
   let excerpt: string;
   if (fullExcerpt.length <= MAX_NOTEBOOK_EXCERPT_CHARS) {
@@ -494,9 +618,9 @@ export function buildNotebookContextAttachment(
   }
 
   const name =
-    originSection && originSection !== project.title
-      ? `${project.title} / ${originSection}`
-      : project.title;
+    originSection && originSection !== targetTitle
+      ? `${targetTitle} / ${originSection}`
+      : targetTitle;
 
   let meta: string;
   if (originEntry) {
@@ -508,14 +632,14 @@ export function buildNotebookContextAttachment(
       meta = `第 ${originEntry.lineNo} 行（空白行）`;
     }
   } else {
-    meta = originSection ? `章节 · ${originSection}` : `${project.blocks.length} 个内容块`;
+    meta = originSection ? `章节 · ${originSection}` : `${targetBlocks.length} 个内容块`;
   }
 
   return {
-    id: `ctx-notebook-${project.id}`,
+    id: `ctx-notebook-${page ? `${project.id}-${page.id}` : project.id}`,
     kind: "notebook_context",
-    refId: project.id,
-    badge: "Notebook",
+    refId: page ? page.id : project.id,
+    badge: page ? "Page" : "Notebook",
     name,
     meta,
     textExcerpt: excerpt,
@@ -609,7 +733,7 @@ export function detectMarkdownShortcut(
   return null;
 }
 
-export type InlineRefKind = "session" | "inbox" | "timeline";
+export type InlineRefKind = "session" | "inbox" | "timeline" | "page";
 
 export interface InlineRefToken {
   kind: InlineRefKind;
@@ -619,10 +743,10 @@ export interface InlineRefToken {
   end: number;
 }
 
-const INLINE_REF_RE = /\[\[(session|inbox|timeline):([^\]]+)\]\]/g;
+const INLINE_REF_RE = /\[\[(session|inbox|timeline|page):([^\]]+)\]\]/g;
 
 /**
- * Extracts all inline reference tokens (`[[session:...]]`, `[[inbox:...]]`, `[[timeline:...]]`)
+ * Extracts all inline reference tokens (`[[session:...]]`, `[[inbox:...]]`, `[[timeline:...]]`, `[[page:...]]`)
  * in appearance order with their exact character offsets.
  */
 export function extractInlineRefs(content: string): InlineRefToken[] {
@@ -732,10 +856,11 @@ export type InlineSegment =
   | { kind: "link"; label: string; href: string }
   | { kind: "session"; sessionId: string }
   | { kind: "inbox"; itemId: string }
-  | { kind: "timeline"; eventId: string };
+  | { kind: "timeline"; eventId: string }
+  | { kind: "page"; pageId: string };
 
 const INLINE_TOKEN_RE =
-  /\[\[session:([^\]]+)\]\]|\[\[inbox:([^\]]+)\]\]|\[\[timeline:([^\]]+)\]\]|`([^`]+)`|\*\*([^*]+)\*\*|~~([^~]+)~~|\*([^*]+)\*|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>()'"\u0080-\uffff]+)/g;
+  /\[\[session:([^\]]+)\]\]|\[\[inbox:([^\]]+)\]\]|\[\[timeline:([^\]]+)\]\]|\[\[page:([^\]]+)\]\]|`([^`]+)`|\*\*((?:[^*\n]|\*(?!\*))+)\*\*|(?<![A-Za-z0-9_])__([^_\n]+?)__(?![A-Za-z0-9_])|~~([^~]+)~~|\*([^*]+)\*|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>()'"\u0080-\uffff]+)/g;
 
 function pushTextSegment(out: InlineSegment[], text: string): void {
   if (!text) return;
@@ -764,18 +889,22 @@ export function parseInlineNotebookText(text: string): InlineSegment[] {
       out.push({ kind: "inbox", itemId: match[2] });
     } else if (match[3]) {
       out.push({ kind: "timeline", eventId: match[3] });
-    } else if (match[4] !== undefined) {
-      out.push({ kind: "code", text: match[4] });
+    } else if (match[4]) {
+      out.push({ kind: "page", pageId: match[4] });
     } else if (match[5] !== undefined) {
-      out.push({ kind: "bold", text: match[5] });
+      out.push({ kind: "code", text: match[5] });
     } else if (match[6] !== undefined) {
-      out.push({ kind: "strike", text: match[6] });
+      out.push({ kind: "bold", text: match[6] });
     } else if (match[7] !== undefined) {
-      out.push({ kind: "italic", text: match[7] });
-    } else if (match[8] !== undefined && match[9] !== undefined) {
-      out.push({ kind: "link", label: match[8], href: match[9] });
-    } else if (match[10] !== undefined) {
-      const rawUrl = match[10];
+      out.push({ kind: "bold", text: match[7] });
+    } else if (match[8] !== undefined) {
+      out.push({ kind: "strike", text: match[8] });
+    } else if (match[9] !== undefined) {
+      out.push({ kind: "italic", text: match[9] });
+    } else if (match[10] !== undefined && match[11] !== undefined) {
+      out.push({ kind: "link", label: match[10], href: match[11] });
+    } else if (match[12] !== undefined) {
+      const rawUrl = match[12];
       const trailingMatch = /[.,;:!?)\]}>。，；：！？）】]+$/.exec(rawUrl);
       const cleanUrl = trailingMatch ? rawUrl.slice(0, trailingMatch.index) : rawUrl;
       const trailingText = trailingMatch ? trailingMatch[0] : "";

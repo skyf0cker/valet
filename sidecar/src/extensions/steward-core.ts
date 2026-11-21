@@ -1050,10 +1050,17 @@ export function createStewardCoreExtension(options: {
   const notebookReadTool = defineTool({
     name: "notebook_read",
     description:
-      "Read the live Project Notebook belonging to the current chat session, returning ordered blocks with blockId, type, indentation, todo status, and Markdown preview. Always inspect first before updating or deleting specific blocks.",
-    parameters: obj({}),
+      "Read the live Project Notebook (or a specific sub-page via pageId, or 'root' for the top-level Notebook) belonging to the current chat session. Returns page directory, ordered blocks with blockId, type, indentation, todo status, and Markdown preview. Also supports referencing other pages in text via [[page:<pageId>]].",
+    parameters: obj({
+      pageId: opt(
+        str({
+          description:
+            "Optional target page ID (from the page directory), or 'root' for the project root Notebook. Omit to read the originating page (or root Notebook).",
+        }),
+      ),
+    }),
     replay: "safe",
-    execute: async (_args, api) => {
+    execute: async (args, api) => {
       const chatId = permissionCoordinator?.getChatId(api.conversationId);
       if (!chatId) {
         return {
@@ -1070,14 +1077,21 @@ export function createStewardCoreExtension(options: {
         ok: boolean;
         projectId: string;
         projectTitle: string;
+        pageId?: string;
+        pageTitle?: string;
         originBlockId?: string;
         blockCount: number;
         formatted: string;
-      }>("host.notebook.read", { chatId });
+      }>("host.notebook.read", {
+        chatId,
+        ...(args.pageId !== undefined ? { pageId: args.pageId } : {}),
+      });
       return textResult(res.formatted, {
         notebook: {
           projectId: res.projectId,
           projectTitle: res.projectTitle,
+          pageId: res.pageId,
+          pageTitle: res.pageTitle,
           blockCount: res.blockCount,
           originBlockId: res.originBlockId,
         } as never,
@@ -1088,16 +1102,33 @@ export function createStewardCoreExtension(options: {
   const notebookEditTool = defineTool({
     name: "notebook_edit",
     description:
-      "Edit the Project Notebook belonging to the current chat session. Actions: \"append\" (append parsed Markdown blocks), \"insert_after\" / \"insert_before\" (insert Markdown relative to targetBlockId or 1-based lineNumber), \"update_block\" (patch content/type/checked/indent/language on one block), \"replace_blocks\" (replace [targetBlockId..endBlockId] with Markdown), \"delete_blocks\" (remove blockIds or target range), \"replace_all\" (rewrite full Notebook from Markdown while keeping session cards by default).",
+      "Edit the Project Notebook or its sub-pages belonging to the current chat session. Actions: \"append\", \"insert_after\", \"insert_before\", \"update_block\", \"replace_blocks\", \"delete_blocks\", \"replace_all\" (keeps session/page cards by default), \"create_page\" (creates a new sub-page under the project), \"rename_page\" (renames a sub-page). Use [[page:<pageId>]] inside Markdown to insert cross-page links.",
     parameters: obj({
       action: str({
         description:
-          "Edit operation: append | insert_after | insert_before | update_block | replace_blocks | delete_blocks | replace_all.",
+          "Edit operation: append | insert_after | insert_before | update_block | replace_blocks | delete_blocks | replace_all | create_page | rename_page.",
       }),
+      pageId: opt(
+        str({
+          description:
+            "Optional target sub-page ID, or 'root' for the project root Notebook. Omit to target the session's originating page (or root Notebook).",
+        }),
+      ),
+      title: opt(
+        str({
+          description: "Page title for action=\"create_page\" or action=\"rename_page\".",
+        }),
+      ),
+      parentPageId: opt(
+        str({
+          description:
+            "Optional parent page ID when creating a nested sub-page with action=\"create_page\" (omit or use 'root' for top-level under the project).",
+        }),
+      ),
       markdown: opt(
         str({
           description:
-            "Markdown content for append, insert_after, insert_before, replace_blocks, or replace_all (supports headings, nested lists, todos, code fences, quotes, callouts, dividers).",
+            "Markdown content for append, insert_after, insert_before, replace_blocks, replace_all, or initial content for create_page (supports headings, nested lists, todos, code fences, quotes, callouts, dividers, and [[page:<id>]] links).",
         }),
       ),
       targetBlockId: opt(
@@ -1152,7 +1183,7 @@ export function createStewardCoreExtension(options: {
       preserveSessionRefs: opt(
         bool({
           description:
-            "For action=\"replace_all\", preserve existing session_ref cards (defaults to true).",
+            "For action=\"replace_all\", preserve existing session_ref and page_ref cards (defaults to true).",
         }),
       ),
     }),
@@ -1184,6 +1215,9 @@ export function createStewardCoreExtension(options: {
         chatId,
         action: args.action,
       };
+      if (args.pageId !== undefined) payload.pageId = args.pageId;
+      if (args.title !== undefined) payload.title = args.title;
+      if (args.parentPageId !== undefined) payload.parentPageId = args.parentPageId;
       if (args.markdown !== undefined) payload.markdown = args.markdown;
       if (args.targetBlockId !== undefined) payload.targetBlockId = args.targetBlockId;
       if (args.endBlockId !== undefined) payload.endBlockId = args.endBlockId;
@@ -1202,6 +1236,8 @@ export function createStewardCoreExtension(options: {
         ok: boolean;
         projectId: string;
         projectTitle: string;
+        pageId?: string;
+        pageTitle?: string;
         action: string;
         summary: string;
         blockCount: number;
@@ -1213,6 +1249,8 @@ export function createStewardCoreExtension(options: {
         notebookEdit: {
           projectId: res.projectId,
           projectTitle: res.projectTitle,
+          pageId: res.pageId,
+          pageTitle: res.pageTitle,
           action: res.action,
           blockCount: res.blockCount,
           affectedIds: res.affectedIds,
@@ -1256,7 +1294,7 @@ export function createStewardCoreExtension(options: {
           `严禁触碰的应用：${s.preferences.blockedApps.join(", ")}`,
           "通用核心工具（所有插件共享这套原语）：",
           "- 只读探测工具：`system_overview`、`read_file`、`notebook_read`、`ask_user`、`memory_remember`、`plugin_draft_create`、`bash`（纯只读命令与插件 `scripts/poll-*`/`import-*`/`read-*`/`inspect-*`/`scan-*`/`sample-*` 脚本直接放行）。",
-          "- 工具使用优先顺序：查看文件内容请优先用 `read_file`；查看或修改当前项目 Notebook 笔记/待办时优先使用 `notebook_read`（获取最新内容与 blockId）和 `notebook_edit`（追加、插入、勾选待办、替换或删除内容块）；查看目录结构、系统探测或执行变更命令时使用 `bash`。",
+          "- 工具使用优先顺序：查看文件内容请优先用 `read_file`；查看或修改当前项目 Notebook 及子页面笔记/待办时优先使用 `notebook_read`（获取页面目录、最新内容与 blockId，支持传 `pageId` 或 `'root'`）和 `notebook_edit`（追加、插入、勾选待办、替换、删除，或通过 `create_page` / `rename_page` 创建与重命名子页面，也可用 `[[page:<pageId>]]` 建立页面互引）；查看目录结构、系统探测或执行变更命令时使用 `bash`。",
           "- 变更执行工具：`trash_files`（移入废纸篓，7 天可还原）、`write_file`、`kill_process`、`bash`（修改系统/配置命令）、`item_resolve`（仅限前台对话中按用户明确指示批准、忽略、部分勾选执行或还原被引用的收件箱/时间线事项）。",
           "双模安全审批机制：在 `auto_review` 模式下，非纯只读调用会先由 Auto Review 模型评估风险，低风险自动放行，高风险或未配置时升级为人工确认（前台对话实时弹窗、后台任务推送收件箱）；在 `always_ask` 下每次变更都会确认；在 `full_access` 下除受保护目录/应用与安全护栏外的操作均自动放行。严禁访问 `~/.ssh`、`~/.gnupg`、`~/.aws`、Keychain 或使用 `sudo`。",
         ].join("\n");

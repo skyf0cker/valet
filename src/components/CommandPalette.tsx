@@ -44,6 +44,7 @@ export const CommandPalette: React.FC = () => {
     openPluginDetail,
     openSettingsSection,
     selectProject,
+    openProjectPage,
     selectChatThread,
     createNewChat,
     togglePauseValet,
@@ -224,6 +225,18 @@ export const CommandPalette: React.FC = () => {
         onSelect: () => selectProject(proj.id, "notebook"),
       }));
 
+    const pageItems: PaletteItem[] = state.projects
+      .filter((p) => !p.archived)
+      .flatMap((proj) =>
+        (proj.pages ?? []).map((pg) => ({
+          id: `page-${proj.id}-${pg.id}`,
+          group: "项目页面",
+          title: pg.title || "未命名页面",
+          subtitle: `${proj.title} · ${pg.blocks.length} 个内容块 · ${pg.updatedAt}`,
+          onSelect: () => openProjectPage(proj.id, pg.id),
+        }))
+      );
+
     const projectById = new Map(state.projects.map((p) => [p.id, p]));
     const chats: PaletteItem[] = state.chatThreads
       .filter((ch) => !ch.archived)
@@ -241,6 +254,7 @@ export const CommandPalette: React.FC = () => {
     return [
       ...actions,
       ...projectItems,
+      ...pageItems,
       ...inboxPalette,
       ...events,
       ...plugins,
@@ -251,6 +265,7 @@ export const CommandPalette: React.FC = () => {
     approveAllReversibleInboxItems,
     createNewChat,
     openPluginDetail,
+    openProjectPage,
     openSettingsSection,
     pendingInboxItems,
     resetOnboarding,

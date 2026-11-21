@@ -199,6 +199,7 @@ export interface ChatThread {
   updatedAt: string;
   archived?: boolean;
   archivedAt?: string;
+  originPageId?: string;
   originBlockId?: string;
   originSection?: string;
   notebookContextInjected?: boolean;
@@ -226,6 +227,7 @@ export interface CreateProjectChatParams {
   projectId: string;
   title?: string;
   model?: string;
+  originPageId?: string;
   originBlockId?: string;
   originSection?: string;
   notebookContextInjected?: boolean;
@@ -235,6 +237,20 @@ export interface CreateProjectChatParams {
 export interface CreateProjectChatResult {
   snapshot: ValetSnapshot;
   thread: ChatThread;
+}
+
+export interface CreateProjectPageParams {
+  projectId: string;
+  parentPageId?: string;
+  title?: string;
+  icon?: string;
+  blocks?: NotebookBlock[];
+  switchToPage?: boolean;
+}
+
+export interface CreateProjectPageResult {
+  snapshot: ValetSnapshot;
+  page: ProjectPage;
 }
 
 export interface CreateProjectParams {
@@ -365,6 +381,7 @@ export interface NotebookBlock {
   checked?: boolean;
   language?: string;
   sessionId?: string;
+  pageId?: string;
   summary?: string;
 }
 
@@ -515,6 +532,17 @@ export interface Project {
   workingDir?: string;
   isDefault?: boolean;
   archived?: boolean;
+  updatedAt: string;
+  createdAt: string;
+  blocks: NotebookBlock[];
+  pages?: ProjectPage[];
+}
+
+export interface ProjectPage {
+  id: string;
+  parentPageId?: string;
+  title: string;
+  icon?: string;
   updatedAt: string;
   createdAt: string;
   blocks: NotebookBlock[];
@@ -688,6 +716,15 @@ export interface TraceStep {
   status: string;
 }
 
+export interface UpdateProjectPageParams {
+  projectId: string;
+  pageId: string;
+  title?: string;
+  icon?: string;
+  parentPageId?: string;
+  blocks?: NotebookBlock[];
+}
+
 export interface UpdateProjectParams {
   projectId: string;
   title?: string;
@@ -766,6 +803,7 @@ export interface ValetSnapshot {
   activePluginDetailId: string | null;
   activeProjectId: string;
   activeProjectTab?: string;
+  activePageId?: string;
   activeChatId: string;
   selectedTimelineEventId: string | null;
   selectedInboxItemId: string | null;
@@ -971,6 +1009,10 @@ export const Valet = {
   createProjectChatThread(params: CreateProjectChatParams): Promise<CreateProjectChatResult> {
     return call("Valet.CreateProjectChatThread", params);
   },
+  /** CreateProjectPage creates a nested sub-page under an existing Project (sibling to ChatThreads). */
+  createProjectPage(params: CreateProjectPageParams): Promise<CreateProjectPageResult> {
+    return call("Valet.CreateProjectPage", params);
+  },
   /** DeleteAutomationRule removes an automation rule and reloads the Engine scheduler. */
   deleteAutomationRule(id: string): Promise<ValetSnapshot> {
     return call("Valet.DeleteAutomationRule", id);
@@ -986,6 +1028,10 @@ export const Valet = {
   /** DeleteProject removes a custom project and reassigns its sessions back to the default project. */
   deleteProject(projectID: string): Promise<ValetSnapshot> {
     return call("Valet.DeleteProject", projectID);
+  },
+  /** DeleteProjectPage deletes a page from a Project and promotes any direct child pages up to its parent. */
+  deleteProjectPage(projectID: string, pageID: string): Promise<ValetSnapshot> {
+    return call("Valet.DeleteProjectPage", projectID, pageID);
   },
   /** DismissInboxItem rejects an Inbox item without touching files or processes. */
   dismissInboxItem(itemID: string): Promise<ValetSnapshot> {
@@ -1239,6 +1285,10 @@ export const Valet = {
   /** UpdateProject persists metadata or Notebook block edits on an existing Project. */
   updateProject(params: UpdateProjectParams): Promise<ValetSnapshot> {
     return call("Valet.UpdateProject", params);
+  },
+  /** UpdateProjectPage updates title, icon, parent relationship, or blocks of a ProjectPage. */
+  updateProjectPage(params: UpdateProjectPageParams): Promise<ValetSnapshot> {
+    return call("Valet.UpdateProjectPage", params);
   },
   /** UpdateProvider updates API keys (stored in isolated 0600 secrets.json), base URLs, and connection status for a provider. */
   updateProvider(providerID: string, patch: AgentProviderConfig): Promise<ValetSnapshot> {

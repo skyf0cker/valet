@@ -199,6 +199,32 @@ function extractErrorMessage(errVal: unknown): string | undefined {
   return String(errVal);
 }
 
+export function buildWorkflowScriptPath(dataDir: string): string {
+  const home = homedir();
+  const candidates = [
+    dataDir ? join(dataDir, "bin") : "",
+    process.execPath ? dirname(process.execPath) : "",
+    home ? join(home, ".bun", "bin") : "",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    home ? join(home, ".local", "bin") : "",
+    ...(process.env.PATH || "")
+      .split(":")
+      .map((p) => p.trim()),
+  ];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of candidates) {
+    if (p && !seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out.join(":");
+}
+
 function edgeMatchesOutcomeForDisplay(
   edge: WorkflowEdgeDef,
   sourceNode: WorkflowNodeDef,
@@ -432,7 +458,8 @@ export class ValetWorkflowManager {
     const stateDir = plugin ? join(this.dataDir, "plugin-state", plugin.id) : "";
     const cfgValues = plugin?.config?.values ?? {};
 
-    const cwd = req.cwd?.trim() || pluginDir || homedir();
+    const home = homedir();
+    const cwd = req.cwd?.trim() || pluginDir || home;
     const timeoutMs = Math.min(
       Math.max(req.timeoutMs ?? DEFAULT_SCRIPT_TIMEOUT_MS, 500),
       MAX_SCRIPT_TIMEOUT_MS,
@@ -441,10 +468,13 @@ export class ValetWorkflowManager {
     const env: Record<string, string> = {
       ...(process.env as Record<string, string>),
       VALET_PLUGIN_ID: req.__valetPluginId,
+      ...(this.dataDir ? { VALET_DATA_DIR: this.dataDir } : {}),
+      ...(home ? { VALET_HOME_DIR: home } : {}),
       ...(pluginDir ? { VALET_PLUGIN_DIR: pluginDir } : {}),
       ...(stateDir ? { VALET_PLUGIN_STATE_DIR: stateDir } : {}),
       VALET_PLUGIN_CONFIG_JSON: JSON.stringify(cfgValues),
       ...(req.env ?? {}),
+      PATH: req.env?.PATH || buildWorkflowScriptPath(this.dataDir),
     };
 
     const cmdBin =
@@ -452,7 +482,7 @@ export class ValetWorkflowManager {
     const cmdArgs =
       Array.isArray(req.args) && req.args.length > 0
         ? req.args
-        : ["-lc", req.command];
+        : ["-c", req.command];
 
     const startedAt = Date.now();
     const { stdout, stderr, exitCode, timedOut } = await new Promise<{

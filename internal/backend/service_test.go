@@ -2252,5 +2252,344 @@ func TestServiceSidecarRespawnsAndReinitializes(t *testing.T) {
 	}
 }
 
+func TestWorkflowNotifyDedupAndParentTimelineSync(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(dataDir, homeDir)
+	if err != nil {
+		t.Fatalf("store.Open failed: %v", err)
+	}
+	st.Update(func(snap *types.ValetSnapshot) {
+		snap.TimelineEvents = nil
+		snap.Preferences.NotifyOnComplete = true
+		snap.Preferences.NotifyOnFailure = true
+	})
+
+	type notifyCall struct {
+		kind, title, subtitle, body string
+	}
+	var notifyCalls []notifyCall
+	var workflowUpdates []types.WorkflowUpdatedPayload
+	svc := NewService()
+	svc.store = st
+	svc.opts = StartOptions{
+		OnNotify: func(kind, title, subtitle, body string) {
+			notifyCalls = append(notifyCalls, notifyCall{kind: kind, title: title, subtitle: subtitle, body: body})
+		},
+		OnWorkflowUpdated: func(p types.WorkflowUpdatedPayload) {
+			workflowUpdates = append(workflowUpdates, p)
+		},
+	}
+
+	// 1. Outbox notify with SkipTimeline=true delivers OS alert using pluginName subtitle without duplicating Timeline.
+	svc.handleAlwaysOnOutboxNotify(sidecar.AlwaysOnOutboxNotifyPayload{
+		Level:         "info",
+		SkipTimeline:  true,
+		PluginID:      "x-monitor",
+		PluginName:    "X 推文巡检",
+		WorkflowRunID: "wrun_test_1",
+		Message: types.AlwaysOnOutboxMessage{
+			ID:    "outbox-wf-1",
+			Kind:  "message",
+			Title: "X 巡检：5 条新推文",
+			Body:  "## 今日新推文\n\n- **@karpathy** 发布了新文章",
+		},
+	})
+	if len(notifyCalls) != 1 || notifyCalls[0].subtitle != "X 推文巡检" {
+		t.Fatalf("expected desktop notification with plugin subtitle, got %+v", notifyCalls)
+	}
+	if len(st.Snapshot().TimelineEvents) != 0 {
+		t.Fatalf("expected SkipTimeline=true not to insert duplicate TimelineEvent, got %d", len(st.Snapshot().TimelineEvents))
+	}
+
+	// 2. Outbox notify with SkipTimeline=false and PluginID/PluginName attributes the Timeline event to that plugin.
+	svc.handleAlwaysOnOutboxNotify(sidecar.AlwaysOnOutboxNotifyPayload{
+		Level:         "info",
+		PluginID:      "x-monitor",
+		PluginName:    "X 推文巡检",
+		WorkflowRunID: "wrun_test_1",
+		Message: types.AlwaysOnOutboxMessage{
+			ID:    "outbox-wf-2",
+			Kind:  "message",
+			Title: "单独 Outbox 汇报",
+			Body:  "**重点摘要** 正文内容",
+		},
+	})
+	evtsAfterOutbox := st.Snapshot().TimelineEvents
+	if len(evtsAfterOutbox) != 1 {
+		t.Fatalf("expected 1 timeline event after SkipTimeline=false, got %d", len(evtsAfterOutbox))
+	}
+	if evtsAfterOutbox[0].PluginID != "x-monitor" || evtsAfterOutbox[0].PluginName != "X 推文巡检" {
+		t.Fatalf("expected plugin attribution on outbox timeline event, got %+v", evtsAfterOutbox[0])
+	}
+	if evtsAfterOutbox[0].WorkflowRunID != "wrun_test_1" {
+		t.Fatalf("expected workflowRunId preserved, got %q", evtsAfterOutbox[0].WorkflowRunID)
+	}
+
+	// 3. host.workflowUpdate updates parent workflow event but leaves workflow.notify child event alone.
+	parentRec := svc.recordTimelineFromAgent(sidecar.RecordTimelineRequest{
+		PluginID:      "x-monitor",
+		PluginName:    "X 推文巡检",
+		EventCode:     "x.timeline_tick",
+		Title:         "X 推文巡检 工作流 (x.timeline_tick)",
+		Summary:       "工作流运行状态：running (wrun_test_2)",
+		Status:        "running",
+		Reasoning:     "通过 Workflow 模式本地执行 DAG (wrun_test_2)",
+		WorkflowRunID: "wrun_test_2",
+		Payload:       map[string]any{"workflowRunId": "wrun_test_2", "status": "running"},
+	})
+	parentID := parentRec["timelineEventId"]
+
+	notifyRec := svc.recordTimelineFromAgent(sidecar.RecordTimelineRequest{
+		PluginID:      "x-monitor",
+		PluginName:    "X 推文巡检",
+		EventCode:     "workflow.notify",
+		Title:         "X 巡检：5 条新推文",
+		Summary:       "共发现 5 条新推文",
+		Status:        "completed",
+		Reasoning:     "详细推文报告正文",
+		WorkflowRunID: "wrun_test_2",
+		Payload:       map[string]any{"workflowRunId": "wrun_test_2", "nodeId": "notify_report"},
+	})
+	notifyID := notifyRec["timelineEventId"]
+
+	waitPayload, _ := json.Marshal(types.WorkflowUpdatedPayload{
+		PluginID: "x-monitor",
+		RunID:    "wrun_test_2",
+		Status:   "waiting_approval",
+	})
+	svc.handleSidecarNotify("host.workflowUpdate", waitPayload)
+
+	var parentEvt, childEvt types.TimelineEvent
+	for _, ev := range st.Snapshot().TimelineEvents {
+		if ev.ID == parentID {
+			parentEvt = ev
+		} else if ev.ID == notifyID {
+			childEvt = ev
+		}
+	}
+	if parentEvt.Status != "pending_confirm" {
+		t.Fatalf("expected parent workflow event pending_confirm, got %q", parentEvt.Status)
+	}
+	if childEvt.Status != "completed" || childEvt.Title != "X 巡检：5 条新推文" {
+		t.Fatalf("expected child workflow.notify event untouched, got %+v", childEvt)
+	}
+
+	donePayload, _ := json.Marshal(types.WorkflowUpdatedPayload{
+		PluginID:           "x-monitor",
+		RunID:              "wrun_test_2",
+		Status:             "completed",
+		CompletedNodeCount: 4,
+	})
+	svc.handleSidecarNotify("host.workflowUpdate", donePayload)
+
+	// Late/stale running tick must NOT revert a completed workflow back to running.
+	staleRunningPayload, _ := json.Marshal(types.WorkflowUpdatedPayload{
+		PluginID: "x-monitor",
+		RunID:    "wrun_test_2",
+		Status:   "running",
+	})
+	svc.handleSidecarNotify("host.workflowUpdate", staleRunningPayload)
+
+	for _, ev := range st.Snapshot().TimelineEvents {
+		if ev.ID == parentID {
+			parentEvt = ev
+		}
+	}
+	if parentEvt.Status != "completed" || !strings.Contains(parentEvt.Summary, "4 个节点") {
+		t.Fatalf("expected parent workflow event completed with node count, got status=%q summary=%q", parentEvt.Status, parentEvt.Summary)
+	}
+	if len(workflowUpdates) != 3 {
+		t.Fatalf("expected 3 workflowUpdate callbacks forwarded, got %d", len(workflowUpdates))
+	}
+
+	// 4. Out-of-order completion before recordTimelineFromAgent reconciles immediately.
+	failPayload, _ := json.Marshal(types.WorkflowUpdatedPayload{
+		PluginID: "x-monitor",
+		RunID:    "wrun_test_3",
+		Status:   "failed",
+		Error:    "script timeout",
+	})
+	svc.handleSidecarNotify("host.workflowUpdate", failPayload)
+	rec3 := svc.recordTimelineFromAgent(sidecar.RecordTimelineRequest{
+		PluginID:      "x-monitor",
+		PluginName:    "X 推文巡检",
+		EventCode:     "x.timeline_tick",
+		Title:         "X 推文巡检 工作流",
+		Summary:       "工作流运行状态：running (wrun_test_3)",
+		Status:        "running",
+		WorkflowRunID: "wrun_test_3",
+	})
+	var evt3 types.TimelineEvent
+	for _, ev := range st.Snapshot().TimelineEvents {
+		if ev.ID == rec3["timelineEventId"] {
+			evt3 = ev
+		}
+	}
+	if evt3.Status != "failed" || evt3.Summary != "script timeout" {
+		t.Fatalf("expected out-of-order failed status reconciled immediately, got status=%q summary=%q", evt3.Status, evt3.Summary)
+	}
+
+	// 5. Duplicate assistant message merge keeps richer trace details.
+	merged := mergeDuplicateAssistantMessage(
+		types.ChatMessage{
+			ID:              "msg-unanswered-t1",
+			Role:            "assistant",
+			Content:         "partial response",
+			WorkDurationMs:  9400,
+			ThinkingSummary: "detailed thinking",
+			Steps:           []types.ChatStreamStep{{ID: "s1", Name: "bash", Label: "Step 1", Status: "done"}, {ID: "s2", Name: "bash", Label: "Step 2", Status: "done"}},
+			PluginDraft:     &types.PluginDraftSpec{ID: "x-monitor", Name: "X 巡检"},
+		},
+		types.ChatMessage{
+			ID:             "msg-unanswered-t1",
+			Role:           "assistant",
+			Content:        "final turn_limit summary",
+			WorkDurationMs: 3200,
+			Steps:          []types.ChatStreamStep{{ID: "s1", Name: "bash", Label: "Step 1", Status: "done"}},
+		},
+	)
+	if len(merged.Steps) != 2 || merged.WorkDurationMs != 9400 || merged.ThinkingSummary != "detailed thinking" || merged.PluginDraft == nil || merged.Content != "final turn_limit summary" {
+		t.Fatalf("unexpected merged ChatMessage: %+v", merged)
+	}
+}
+
+func TestProjectPageCRUDAndHierarchy(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService()
+	if err := svc.start(StartOptions{
+		DataDir:      dataDir,
+		HomeDir:      homeDir,
+		DesktopReady: false,
+		UseVaultOnly: true,
+	}); err != nil {
+		t.Fatalf("svc.start failed: %v", err)
+	}
+	defer func() { _ = svc.close() }()
+
+	snap, err := svc.CreateProject(types.CreateProjectParams{
+		Title: "页面树测试项目",
+		Icon:  "folder",
+	})
+	if err != nil {
+		t.Fatalf("CreateProject failed: %v", err)
+	}
+	projID := snap.Projects[1].ID
+
+	// 1. Create root page and switch to it
+	res1, err := svc.CreateProjectPage(types.CreateProjectPageParams{
+		ProjectID:    projID,
+		Title:        "架构设计",
+		SwitchToPage: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateProjectPage 1 failed: %v", err)
+	}
+	if res1.Snapshot.ActiveProjectTab != "page" || res1.Snapshot.ActivePageID != res1.Page.ID {
+		t.Fatalf("expected active page %q, got tab=%q page=%q",
+			res1.Page.ID, res1.Snapshot.ActiveProjectTab, res1.Snapshot.ActivePageID)
+	}
+
+	// 2. Create child & grandchild pages
+	res2, err := svc.CreateProjectPage(types.CreateProjectPageParams{
+		ProjectID:    projID,
+		ParentPageID: res1.Page.ID,
+		Title:        "前端组件",
+		SwitchToPage: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateProjectPage 2 failed: %v", err)
+	}
+	if res2.Snapshot.ActivePageID != res1.Page.ID {
+		t.Fatalf("expected active page to remain %q when SwitchToPage=false, got %q",
+			res1.Page.ID, res2.Snapshot.ActivePageID)
+	}
+
+	res3, err := svc.CreateProjectPage(types.CreateProjectPageParams{
+		ProjectID:    projID,
+		ParentPageID: res2.Page.ID,
+		Title:        "引用卡片",
+		SwitchToPage: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateProjectPage 3 failed: %v", err)
+	}
+	if res3.Snapshot.ActivePageID != res3.Page.ID {
+		t.Fatalf("expected active page switched to %q, got %q", res3.Page.ID, res3.Snapshot.ActivePageID)
+	}
+
+	// 3. Update title & reject parent cycle
+	renamed := "前端视图层"
+	updSnap, err := svc.UpdateProjectPage(types.UpdateProjectPageParams{
+		ProjectID: projID,
+		PageID:    res2.Page.ID,
+		Title:     &renamed,
+	})
+	if err != nil {
+		t.Fatalf("UpdateProjectPage rename failed: %v", err)
+	}
+	if updSnap.Projects[1].Pages[1].Title != renamed {
+		t.Fatalf("expected renamed page title %q, got %q", renamed, updSnap.Projects[1].Pages[1].Title)
+	}
+
+	if _, err := svc.UpdateProjectPage(types.UpdateProjectPageParams{
+		ProjectID:    projID,
+		PageID:       res1.Page.ID,
+		ParentPageID: &res3.Page.ID,
+	}); err == nil {
+		t.Fatalf("expected cycle rejection error when setting ancestor parent to descendant")
+	}
+
+	// 4. Deleting middle page promotes direct child to deleted page's parent
+	afterDelMid, err := svc.DeleteProjectPage(projID, res2.Page.ID)
+	if err != nil {
+		t.Fatalf("DeleteProjectPage middle failed: %v", err)
+	}
+	pages := afterDelMid.Projects[1].Pages
+	if len(pages) != 2 {
+		t.Fatalf("expected 2 remaining pages, got %d", len(pages))
+	}
+	var promoted *types.ProjectPage
+	for i := range pages {
+		if pages[i].ID == res3.Page.ID {
+			p := pages[i]
+			promoted = &p
+			break
+		}
+	}
+	if promoted == nil || promoted.ParentPageID != res1.Page.ID {
+		t.Fatalf("expected child page %q promoted to parent %q, got %+v", res3.Page.ID, res1.Page.ID, promoted)
+	}
+
+	// 5. Deleting active child page navigates up to its parent; deleting active top-level page falls back to project notebook
+	afterDelChild, err := svc.DeleteProjectPage(projID, res3.Page.ID)
+	if err != nil {
+		t.Fatalf("DeleteProjectPage child failed: %v", err)
+	}
+	if afterDelChild.ActiveProjectTab != "page" || afterDelChild.ActivePageID != res1.Page.ID {
+		t.Fatalf("expected active navigation to move up to parent %q, got tab=%q page=%q",
+			res1.Page.ID, afterDelChild.ActiveProjectTab, afterDelChild.ActivePageID)
+	}
+
+	afterDelRootPage, err := svc.DeleteProjectPage(projID, res1.Page.ID)
+	if err != nil {
+		t.Fatalf("DeleteProjectPage root page failed: %v", err)
+	}
+	if afterDelRootPage.ActiveProjectTab != "notebook" || afterDelRootPage.ActivePageID != "" {
+		t.Fatalf("expected active navigation fallback to notebook after deleting active top-level page, got tab=%q page=%q",
+			afterDelRootPage.ActiveProjectTab, afterDelRootPage.ActivePageID)
+	}
+}
+
 
 

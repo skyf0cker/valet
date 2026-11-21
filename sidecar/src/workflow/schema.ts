@@ -140,8 +140,18 @@ function validateNodeConfig(
       break;
     }
     case "notify": {
-      if (typeof cfg.message !== "string" || !cfg.message.trim()) {
+      const msgText =
+        typeof cfg.message === "string" && cfg.message.trim()
+          ? cfg.message
+          : typeof cfg.body === "string" && cfg.body.trim()
+            ? cfg.body
+            : typeof cfg.content === "string" && cfg.content.trim()
+              ? cfg.content
+              : "";
+      if (!msgText) {
         errors.push(`节点 "${node.id}" (notify) 缺少非空 config.message`);
+      } else if (typeof cfg.message !== "string" || !cfg.message.trim()) {
+        return { ...cfg, message: msgText };
       }
       break;
     }

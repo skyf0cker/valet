@@ -203,8 +203,12 @@ type AlwaysOnIngestResponse struct {
 
 // AlwaysOnOutboxNotifyPayload is sent by Sidecar when notify() or dead-letter writes an Outbox message.
 type AlwaysOnOutboxNotifyPayload struct {
-	Message types.AlwaysOnOutboxMessage `json:"message"`
-	Level   string                      `json:"level"` // "info" | "warn" | "urgent"
+	Message       types.AlwaysOnOutboxMessage `json:"message"`
+	Level         string                      `json:"level"` // "info" | "warn" | "urgent"
+	SkipTimeline  bool                        `json:"skipTimeline,omitempty"`
+	PluginID      string                      `json:"pluginId,omitempty"`
+	PluginName    string                      `json:"pluginName,omitempty"`
+	WorkflowRunID string                      `json:"workflowRunId,omitempty"`
 }
 
 type rpcEnvelope struct {

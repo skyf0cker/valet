@@ -257,3 +257,173 @@ func TestHostNotebookReadAndEditLifecycle(t *testing.T) {
 		t.Fatalf("unexpected reopened project blocks: %+v", persisted)
 	}
 }
+
+func TestHostNotebookSubPagesAndPageRefs(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+
+	st, err := store.Open(dataDir, homeDir)
+	if err != nil {
+		t.Fatalf("store.Open failed: %v", err)
+	}
+
+	svc := NewService()
+	svc.store = st
+	svc.opts.HomeDir = homeDir
+	svc.opts.DataDir = dataDir
+
+	st.Update(func(snap *types.ValetSnapshot) {
+		snap.Projects = append(snap.Projects, types.Project{
+			ID:        "proj-subpages",
+			Title:     "子页面工具项目",
+			Tags:      []string{},
+			Blocks:    []types.NotebookBlock{{ID: "root-blk-1", Type: "h1", Content: "根目录大纲"}},
+			UpdatedAt: "刚刚",
+			CreatedAt: "2026-11-21",
+		})
+		snap.ChatThreads = append(snap.ChatThreads, types.ChatThread{
+			ID:             "chat-root-origin",
+			ProjectID:      "proj-subpages",
+			Title:          "根目录对话",
+			Model:          "claude-opus-4",
+			LinkedEventIDs: []string{},
+			Messages:       []types.ChatMessage{},
+			UpdatedAt:      "刚刚",
+		})
+	})
+
+	ctx := context.Background()
+
+	// 1. Agent creates a top-level sub-page with initial Markdown
+	createAny, err := svc.handleSidecarHostRequest(ctx, "host.notebook.edit", json.RawMessage(`{
+		"chatId": "chat-root-origin",
+		"action": "create_page",
+		"title": "API 规范",
+		"markdown": "# 接口列表\n- GET /v1/pages"
+	}`))
+	if err != nil {
+		t.Fatalf("create_page failed: %v", err)
+	}
+	createRes := createAny.(map[string]any)
+	page1ID := createRes["pageId"].(string)
+	if page1ID == "" || createRes["pageTitle"] != "API 规范" || createRes["blockCount"] != 2 {
+		t.Fatalf("unexpected create_page result: %+v", createRes)
+	}
+
+	// 2. Rename the sub-page and read it back via pageId
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.notebook.edit", json.RawMessage(`{
+		"chatId": "chat-root-origin",
+		"action": "rename_page",
+		"pageId": "`+page1ID+`",
+		"title": "HTTP API 规范"
+	}`)); err != nil {
+		t.Fatalf("rename_page failed: %v", err)
+	}
+
+	// Manually embed a page_ref card into the sub-page & add a thread rooted inside that sub-page
+	st.Update(func(snap *types.ValetSnapshot) {
+		for i := range snap.Projects {
+			if snap.Projects[i].ID == "proj-subpages" {
+				for j := range snap.Projects[i].Pages {
+					if snap.Projects[i].Pages[j].ID == page1ID {
+						snap.Projects[i].Pages[j].Blocks = append(
+							snap.Projects[i].Pages[j].Blocks,
+							types.NotebookBlock{ID: "blk-pageref", Type: "page_ref", PageID: "root", Content: "根目录大纲"},
+						)
+					}
+				}
+			}
+		}
+		snap.ChatThreads = append(snap.ChatThreads, types.ChatThread{
+			ID:             "chat-page-origin",
+			ProjectID:      "proj-subpages",
+			OriginPageID:   page1ID,
+			OriginBlockID:  "blk-pageref",
+			Title:          "子页面内对话",
+			Model:          "claude-opus-4",
+			LinkedEventIDs: []string{},
+			Messages:       []types.ChatMessage{},
+			UpdatedAt:      "刚刚",
+		})
+	})
+
+	// 3. Reading without pageId from chat-page-origin defaults to OriginPageID
+	readPageAny, err := svc.handleSidecarHostRequest(ctx, "host.notebook.read", json.RawMessage(`{"chatId":"chat-page-origin"}`))
+	if err != nil {
+		t.Fatalf("read subpage failed: %v", err)
+	}
+	readPageRes := readPageAny.(map[string]any)
+	formatted := readPageRes["formatted"].(string)
+	if readPageRes["pageId"] != page1ID || readPageRes["pageTitle"] != "HTTP API 规范" {
+		t.Fatalf("expected default target OriginPageID=%q, got %+v", page1ID, readPageRes)
+	}
+	if !strings.Contains(formatted, "HTTP API 规范") || !strings.Contains(formatted, "page_ref") {
+		t.Fatalf("expected sub-page directory and page_ref in formatted view, got:\n%s", formatted)
+	}
+
+	// 4. Passing pageId="root" reads root Notebook even from a sub-page chat
+	readRootAny, err := svc.handleSidecarHostRequest(ctx, "host.notebook.read", json.RawMessage(`{"chatId":"chat-page-origin","pageId":"root"}`))
+	if err != nil {
+		t.Fatalf("read root via pageId=root failed: %v", err)
+	}
+	readRootRes := readRootAny.(map[string]any)
+	rootBlocks := readRootRes["blocks"].([]types.NotebookBlock)
+	if len(rootBlocks) != 1 || rootBlocks[0].Content != "根目录大纲" {
+		t.Fatalf("unexpected root blocks when reading root from subpage chat: %+v", rootBlocks)
+	}
+
+	// 5. page_ref block must be protected from update_block & preserved in replace_all
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.notebook.edit", json.RawMessage(`{
+		"chatId": "chat-page-origin",
+		"action": "update_block",
+		"blockId": "blk-pageref",
+		"markdown": "尝试覆盖引用卡片"
+	}`)); err == nil {
+		t.Fatalf("expected error trying to overwrite page_ref block directly")
+	}
+
+	replaceAny, err := svc.handleSidecarHostRequest(ctx, "host.notebook.edit", json.RawMessage(`{
+		"chatId": "chat-page-origin",
+		"action": "replace_all",
+		"markdown": "# 重写页面\n- 保留引用卡"
+	}`))
+	if err != nil {
+		t.Fatalf("replace_all on sub-page failed: %v", err)
+	}
+	replaceRes := replaceAny.(map[string]any)
+	if replaceRes["blockCount"] != 3 {
+		t.Fatalf("expected 2 replaced blocks + 1 preserved page_ref = 3, got %+v", replaceRes)
+	}
+}
+
+func TestParseNotebookMarkdownTablesAndReadView(t *testing.T) {
+	md := strings.Join([]string{
+		"# 调研对比",
+		"",
+		"| 维度 | Always-On Agent | Super Agent |",
+		"| :--- | :---: | ---: |",
+		"| 核心动作 | 错峰执行 | 单一会话 |",
+		"| 省下什么 | 等待时间 | 上下文切换 |",
+		"",
+		"结论段落",
+	}, "\n")
+
+	blocks := parseNotebookMarkdownToBlocks(md)
+	if len(blocks) != 3 {
+		t.Fatalf("expected [h1, table, paragraph] (3 blocks), got %d: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "h1" || blocks[1].Type != "table" || blocks[2].Type != "paragraph" {
+		t.Fatalf("unexpected parsed block types: %+v", blocks)
+	}
+
+	proj := types.Project{
+		ID:     "proj-table-read",
+		Title:  "表格测试",
+		Blocks: blocks,
+	}
+	view := formatNotebookReadView(proj, -1, "", "")
+	if !strings.Contains(view, "| table]") || !strings.Contains(view, "| 维度 | Always-On Agent | Super Agent |") {
+		t.Fatalf("expected formatted view to include table block metadata and rows, got:\n%s", view)
+	}
+}

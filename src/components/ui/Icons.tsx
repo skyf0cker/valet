@@ -818,6 +818,13 @@ export const DividerIcon: React.FC<IconProps> = ({ size = 14, className = "" }) 
   </svg>
 );
 
+export const TableIcon: React.FC<IconProps> = ({ size = 14, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
+    <rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" strokeWidth="1.8" />
+    <path d="M3 9.5h18M9.5 9.5V20M15.5 9.5V20" stroke="currentColor" strokeWidth="1.7" />
+  </svg>
+);
+
 export const ProjectGlyph: React.FC<{ icon?: string; size?: number; className?: string }> = ({
   icon = "book",
   size = 14,

@@ -333,25 +333,38 @@ type ChatThread struct {
 	UpdatedAt               string        `json:"updatedAt"`
 	Archived                bool          `json:"archived,omitempty"`
 	ArchivedAt              string        `json:"archivedAt,omitempty"`
+	OriginPageID            string        `json:"originPageId,omitempty"`
 	OriginBlockID           string        `json:"originBlockId,omitempty"`
 	OriginSection           string        `json:"originSection,omitempty"`
 	NotebookContextInjected bool          `json:"notebookContextInjected,omitempty"`
 	Messages                []ChatMessage `json:"messages"`
 }
 
-// NotebookBlock stores one Notion-style Markdown or embedded session reference block in a project Notebook.
+// NotebookBlock stores one Notion-style Markdown or embedded session/page reference block in a project Notebook or sub-page.
 type NotebookBlock struct {
 	ID        string `json:"id"`
-	Type      string `json:"type"` // "paragraph" | "h1" | "h2" | "h3" | "bullet" | "numbered" | "todo" | "callout" | "quote" | "code" | "divider" | "session_ref"
+	Type      string `json:"type"` // "paragraph" | "h1" | "h2" | "h3" | "bullet" | "numbered" | "todo" | "callout" | "quote" | "code" | "table" | "divider" | "session_ref" | "page_ref"
 	Content   string `json:"content"`
 	Indent    int    `json:"indent,omitempty"`
 	Checked   bool   `json:"checked,omitempty"`
 	Language  string `json:"language,omitempty"`
 	SessionID string `json:"sessionId,omitempty"`
+	PageID    string `json:"pageId,omitempty"`
 	Summary   string `json:"summary,omitempty"`
 }
 
-// Project represents an upper-level container managing sessions alongside a Markdown Notebook.
+// ProjectPage stores a Notion-style page (or nested sub-page) inside a Project, sibling to ChatThreads.
+type ProjectPage struct {
+	ID           string          `json:"id"`
+	ParentPageID string          `json:"parentPageId,omitempty"`
+	Title        string          `json:"title"`
+	Icon         string          `json:"icon,omitempty"`
+	UpdatedAt    string          `json:"updatedAt"`
+	CreatedAt    string          `json:"createdAt"`
+	Blocks       []NotebookBlock `json:"blocks"`
+}
+
+// Project represents an upper-level container managing sessions alongside a Markdown Notebook and sub-pages.
 type Project struct {
 	ID          string          `json:"id"`
 	Title       string          `json:"title"`
@@ -364,6 +377,7 @@ type Project struct {
 	UpdatedAt   string          `json:"updatedAt"`
 	CreatedAt   string          `json:"createdAt"`
 	Blocks      []NotebookBlock `json:"blocks"`
+	Pages       []ProjectPage   `json:"pages,omitempty"`
 }
 
 // CreateProjectParams defines parameters for creating a new Project container.
@@ -387,11 +401,38 @@ type UpdateProjectParams struct {
 	Archived    *bool            `json:"archived,omitempty"`
 }
 
+// CreateProjectPageParams defines parameters for creating a page (or nested sub-page) under a Project.
+type CreateProjectPageParams struct {
+	ProjectID    string          `json:"projectId"`
+	ParentPageID string          `json:"parentPageId,omitempty"`
+	Title        string          `json:"title,omitempty"`
+	Icon         string          `json:"icon,omitempty"`
+	Blocks       []NotebookBlock `json:"blocks,omitempty"`
+	SwitchToPage bool            `json:"switchToPage,omitempty"`
+}
+
+// CreateProjectPageResult returns both the updated snapshot and the newly created ProjectPage.
+type CreateProjectPageResult struct {
+	Snapshot ValetSnapshot `json:"snapshot"`
+	Page     ProjectPage   `json:"page"`
+}
+
+// UpdateProjectPageParams updates metadata, parent, or block contents of an existing ProjectPage.
+type UpdateProjectPageParams struct {
+	ProjectID    string           `json:"projectId"`
+	PageID       string           `json:"pageId"`
+	Title        *string          `json:"title,omitempty"`
+	Icon         *string          `json:"icon,omitempty"`
+	ParentPageID *string          `json:"parentPageId,omitempty"`
+	Blocks       *[]NotebookBlock `json:"blocks,omitempty"`
+}
+
 // CreateProjectChatParams creates a new session inside a target Project (optionally spawned from @valet in Notebook).
 type CreateProjectChatParams struct {
 	ProjectID               string `json:"projectId"`
 	Title                   string `json:"title,omitempty"`
 	Model                   string `json:"model,omitempty"`
+	OriginPageID            string `json:"originPageId,omitempty"`
 	OriginBlockID           string `json:"originBlockId,omitempty"`
 	OriginSection           string `json:"originSection,omitempty"`
 	NotebookContextInjected bool   `json:"notebookContextInjected,omitempty"`
@@ -608,7 +649,8 @@ type ValetSnapshot struct {
 	IsPaused                   bool                  `json:"isPaused"`
 	ActivePluginDetailID       *string               `json:"activePluginDetailId"`
 	ActiveProjectID            string                `json:"activeProjectId"`
-	ActiveProjectTab           string                `json:"activeProjectTab,omitempty"` // "notebook" | "sessions" | "session"
+	ActiveProjectTab           string                `json:"activeProjectTab,omitempty"` // "notebook" | "sessions" | "session" | "page"
+	ActivePageID               string                `json:"activePageId,omitempty"`
 	ActiveChatID               string                `json:"activeChatId"`
 	SelectedTimelineEventID    *string               `json:"selectedTimelineEventId"`
 	SelectedInboxItemID        *string               `json:"selectedInboxItemId"`

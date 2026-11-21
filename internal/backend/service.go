@@ -71,13 +71,15 @@ type Service struct {
 	elevatedTrashMover sys.ElevatedTrashMover
 	createdInbox       map[string]types.InboxApprovalItem
 	createdEvent       map[string]types.TimelineEvent
+	workflowRunUpdates map[string]types.WorkflowUpdatedPayload
 }
 
 // NewService constructs a zero-I/O Service safe to pass to mygo.Bind before App.Run / MYGO_GENERATE.
 func NewService() *Service {
 	return &Service{
-		createdInbox: make(map[string]types.InboxApprovalItem),
-		createdEvent: make(map[string]types.TimelineEvent),
+		createdInbox:       make(map[string]types.InboxApprovalItem),
+		createdEvent:       make(map[string]types.TimelineEvent),
+		workflowRunUpdates: make(map[string]types.WorkflowUpdatedPayload),
 	}
 }
 
@@ -697,6 +699,7 @@ func (s *Service) handleSidecarNotify(method string, params json.RawMessage) {
 			fmt.Fprintf(os.Stderr, "[valet] workflowUpdate unmarshal error: %v\n", err)
 			return
 		}
+		s.applyWorkflowUpdateToTimeline(payload)
 		s.mu.Lock()
 		onWorkflowUpdated := s.opts.OnWorkflowUpdated
 		s.mu.Unlock()
@@ -706,9 +709,202 @@ func (s *Service) handleSidecarNotify(method string, params json.RawMessage) {
 	}
 }
 
+func firstNonEmptyString(vals ...string) string {
+	for _, v := range vals {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func detailString(detail map[string]any, key string) string {
+	if detail == nil {
+		return ""
+	}
+	if s, ok := detail[key].(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
+func mapWorkflowRunStatusToTimeline(wfStatus string) string {
+	switch strings.TrimSpace(wfStatus) {
+	case "completed":
+		return "completed"
+	case "failed", "cancelled":
+		return "failed"
+	case "waiting_approval":
+		return "pending_confirm"
+	default:
+		return "running"
+	}
+}
+
+func workflowTriggerLatencyLabel(nowHHMM, tlStatus string) string {
+	switch tlStatus {
+	case "completed":
+		return nowHHMM + " · 工作流已完成"
+	case "failed":
+		return nowHHMM + " · 工作流失败"
+	case "pending_confirm":
+		return nowHHMM + " · 等待审批"
+	default:
+		return nowHHMM + " · 工作流运行中"
+	}
+}
+
+func formatWorkflowUpdateSummary(payload types.WorkflowUpdatedPayload) string {
+	switch strings.TrimSpace(payload.Status) {
+	case "failed":
+		if msg := strings.TrimSpace(payload.Error); msg != "" {
+			return msg
+		}
+		return "工作流执行失败"
+	case "cancelled":
+		return "工作流已取消"
+	case "waiting_approval":
+		return "工作流等待人工审批后继续"
+	case "completed":
+		if payload.CompletedNodeCount > 0 {
+			return fmt.Sprintf("工作流已完成（共执行 %d 个节点）", payload.CompletedNodeCount)
+		}
+		return "工作流已执行完成"
+	default:
+		return fmt.Sprintf("工作流运行状态：%s (%s)", payload.Status, payload.RunID)
+	}
+}
+
+func isTerminalTimelineStatus(status string) bool {
+	return status == "completed" || status == "failed"
+}
+
+func (s *Service) applyWorkflowUpdateToTimeline(payload types.WorkflowUpdatedPayload) {
+	runID := strings.TrimSpace(payload.RunID)
+	timelineEventID := strings.TrimSpace(payload.TimelineEventID)
+	if runID == "" && timelineEventID == "" {
+		return
+	}
+
+	wfStatus := strings.TrimSpace(payload.Status)
+	if runID != "" && wfStatus != "" && wfStatus != "running" && wfStatus != "pending" {
+		s.mu.Lock()
+		if s.workflowRunUpdates == nil {
+			s.workflowRunUpdates = make(map[string]types.WorkflowUpdatedPayload)
+		} else if len(s.workflowRunUpdates) > 200 {
+			s.workflowRunUpdates = make(map[string]types.WorkflowUpdatedPayload)
+		}
+		s.workflowRunUpdates[runID] = payload
+		s.mu.Unlock()
+	}
+
+	if s.store == nil {
+		return
+	}
+
+	nextStatus := mapWorkflowRunStatusToTimeline(wfStatus)
+	nextSummary := formatWorkflowUpdateSummary(payload)
+	now := time.Now()
+	nowHHMM := now.Format("15:04")
+	var updatedEvents []types.TimelineEvent
+
+	s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.TimelineEvents {
+			evt := &st.TimelineEvents[i]
+			matched := (timelineEventID != "" && evt.ID == timelineEventID) ||
+				(runID != "" && evt.WorkflowRunID == runID && evt.EventCode != "workflow.notify")
+			if !matched {
+				continue
+			}
+
+			prevStatus := evt.Status
+			// Ignore late/stale running ticks once the parent event has reached a terminal state.
+			if isTerminalTimelineStatus(prevStatus) && !isTerminalTimelineStatus(nextStatus) {
+				continue
+			}
+			// Do not churn repeatedly on running ticks when already running with the same status.
+			if prevStatus == nextStatus && !isTerminalTimelineStatus(nextStatus) && nextStatus != "pending_confirm" {
+				continue
+			}
+
+			evt.Status = nextStatus
+			evt.Summary = nextSummary
+			evt.TriggerLatencyLabel = workflowTriggerLatencyLabel(nowHHMM, nextStatus)
+			if evt.Payload == nil {
+				evt.Payload = make(map[string]any)
+			}
+			evt.Payload["status"] = wfStatus
+			if errMsg := strings.TrimSpace(payload.Error); errMsg != "" {
+				evt.Payload["error"] = errMsg
+			}
+
+			if prevStatus != nextStatus {
+				stage := "状态更新"
+				traceStatus := "done"
+				level := "EXEC"
+				switch nextStatus {
+				case "completed":
+					stage = "执行完成"
+					traceStatus = "done"
+				case "failed":
+					stage = "执行失败"
+					traceStatus = "blocked"
+					level = "WARN"
+				case "pending_confirm":
+					stage = "等待审批"
+					traceStatus = "pending"
+				}
+				evt.TraceSteps = append(evt.TraceSteps, types.TraceStep{
+					ID:     fmt.Sprintf("tr-wf-%d", now.UnixNano()),
+					Time:   nowHHMM,
+					Stage:  stage,
+					Detail: nextSummary,
+					Status: traceStatus,
+				})
+				evt.Logs = append(evt.Logs, types.LogLine{
+					ID:      fmt.Sprintf("lg-wf-%d", now.UnixNano()),
+					TS:      now.Format("15:04:05"),
+					Level:   level,
+					Message: fmt.Sprintf("Workflow %s -> %s: %s", runID, wfStatus, nextSummary),
+				})
+			}
+
+			updatedEvents = append(updatedEvents, *evt)
+		}
+	})
+
+	if len(updatedEvents) > 0 {
+		s.mu.Lock()
+		if s.createdEvent == nil {
+			s.createdEvent = make(map[string]types.TimelineEvent)
+		}
+		for _, evt := range updatedEvents {
+			s.createdEvent[evt.ID] = evt
+		}
+		s.mu.Unlock()
+		s.emitStateChange("timeline")
+	}
+}
+
 func (s *Service) handleAlwaysOnOutboxNotify(payload sidecar.AlwaysOnOutboxNotifyPayload) {
 	msg := payload.Message
-	prefs := s.store.Snapshot().Preferences
+	msgRunID := ""
+	if msg.RunID != nil {
+		msgRunID = *msg.RunID
+	}
+	pluginID := firstNonEmptyString(payload.PluginID, detailString(msg.Detail, "pluginId"), "valet-core")
+	pluginName := firstNonEmptyString(payload.PluginName, detailString(msg.Detail, "pluginName"), "Valet 管家")
+	workflowRunID := firstNonEmptyString(payload.WorkflowRunID, detailString(msg.Detail, "workflowRunId"), msgRunID)
+
+	subtitle := "Valet 管家通知"
+	if pluginName != "" && pluginName != "Valet 管家" {
+		subtitle = pluginName
+	}
+
+	var prefs types.ValetPreferences
+	if s.store != nil {
+		prefs = s.store.Snapshot().Preferences
+	}
 	s.mu.Lock()
 	onNotify := s.opts.OnNotify
 	s.mu.Unlock()
@@ -723,31 +919,38 @@ func (s *Service) handleAlwaysOnOutboxNotify(payload sidecar.AlwaysOnOutboxNotif
 			shouldNotify = prefs.NotifyOnFailure || prefs.NotifyOnConfirm
 		}
 		if shouldNotify {
-			onNotify(kind, msg.Title, "Valet 管家通知", msg.Body)
+			onNotify(kind, msg.Title, subtitle, msg.Body)
 		}
 	}
 
-	status := "completed"
-	eventCode := "outbox.message"
-	if msg.Kind == "dead_letter" {
-		status = "failed"
-		eventCode = "inbox.dead_letter"
+	if !payload.SkipTimeline && s.store != nil {
+		status := "completed"
+		eventCode := "outbox.message"
+		if msg.Kind == "dead_letter" {
+			status = "failed"
+			eventCode = "inbox.dead_letter"
+		}
+		summary := summarizeMarkdownReply(msg.Body)
+		if summary == "" {
+			summary = strings.TrimSpace(msg.Body)
+		}
+		s.recordTimelineFromAgent(sidecar.RecordTimelineRequest{
+			PluginID:      pluginID,
+			PluginName:    pluginName,
+			EventCode:     eventCode,
+			Title:         msg.Title,
+			Summary:       summary,
+			Status:        status,
+			Reasoning:     msg.Body,
+			WorkflowRunID: workflowRunID,
+			Payload: map[string]any{
+				"outbox_id": msg.ID,
+				"kind":      msg.Kind,
+				"run_id":    msg.RunID,
+				"detail":    msg.Detail,
+			},
+		})
 	}
-	s.recordTimelineFromAgent(sidecar.RecordTimelineRequest{
-		PluginID:   "valet-core",
-		PluginName: "Valet 管家",
-		EventCode:  eventCode,
-		Title:      msg.Title,
-		Summary:    summarizeMarkdownReply(msg.Body),
-		Status:     status,
-		Reasoning:  msg.Body,
-		Payload: map[string]any{
-			"outbox_id": msg.ID,
-			"kind":      msg.Kind,
-			"run_id":    msg.RunID,
-			"detail":    msg.Detail,
-		},
-	})
 	s.emitStateChange("always_on")
 }
 
@@ -1684,6 +1887,16 @@ func (s *Service) recordTimelineFromAgent(req sidecar.RecordTimelineRequest) map
 		status = "completed"
 	}
 
+	triggerLabel := nowHHMM + " · 自动处理完成"
+	switch status {
+	case "running":
+		triggerLabel = nowHHMM + " · 工作流运行中"
+	case "failed":
+		triggerLabel = nowHHMM + " · 执行失败"
+	case "pending_confirm":
+		triggerLabel = nowHHMM + " · 等待确认"
+	}
+
 	evt := types.TimelineEvent{
 		ID:                  evtID,
 		Timestamp:           now.Format(time.RFC3339),
@@ -1696,7 +1909,7 @@ func (s *Service) recordTimelineFromAgent(req sidecar.RecordTimelineRequest) map
 		PluginBadge:         req.PluginName,
 		EventCode:           req.EventCode,
 		Status:              status,
-		TriggerLatencyLabel: nowHHMM + " · 自动处理完成",
+		TriggerLatencyLabel: triggerLabel,
 		Payload:             req.Payload,
 		Reasoning:           req.Reasoning,
 		ActionItems:         req.ActionItems,
@@ -1713,6 +1926,34 @@ func (s *Service) recordTimelineFromAgent(req sidecar.RecordTimelineRequest) map
 	}
 
 	s.mu.Lock()
+	if evt.WorkflowRunID != "" && evt.EventCode != "workflow.notify" && s.workflowRunUpdates != nil {
+		if cached, ok := s.workflowRunUpdates[evt.WorkflowRunID]; ok && evt.Status == "running" {
+			cachedStatus := mapWorkflowRunStatusToTimeline(cached.Status)
+			if cachedStatus != "running" {
+				evt.Status = cachedStatus
+				evt.Summary = formatWorkflowUpdateSummary(cached)
+				evt.TriggerLatencyLabel = workflowTriggerLatencyLabel(nowHHMM, cachedStatus)
+				if evt.Payload == nil {
+					evt.Payload = make(map[string]any)
+				}
+				evt.Payload["status"] = cached.Status
+				if errMsg := strings.TrimSpace(cached.Error); errMsg != "" {
+					evt.Payload["error"] = errMsg
+				}
+				traceStatus := "done"
+				if cachedStatus == "failed" {
+					traceStatus = "blocked"
+				} else if cachedStatus == "pending_confirm" {
+					traceStatus = "pending"
+				}
+				evt.TraceSteps[0].Detail = evt.Summary
+				evt.TraceSteps[0].Status = traceStatus
+			}
+		}
+	}
+	if s.createdEvent == nil {
+		s.createdEvent = make(map[string]types.TimelineEvent)
+	}
 	s.createdEvent[evtID] = evt
 	s.mu.Unlock()
 
@@ -2142,7 +2383,9 @@ func (s *Service) SendChatMessage(ctx context.Context, params types.SendChatPara
 				if resp.ReplyMessage.ID != "" {
 					for mIdx := range st.ChatThreads[i].Messages {
 						if st.ChatThreads[i].Messages[mIdx].ID == resp.ReplyMessage.ID {
-							st.ChatThreads[i].Messages[mIdx] = resp.ReplyMessage
+							merged := mergeDuplicateAssistantMessage(st.ChatThreads[i].Messages[mIdx], resp.ReplyMessage)
+							st.ChatThreads[i].Messages[mIdx] = merged
+							resp.ReplyMessage = merged
 							replaced = true
 							break
 						}
@@ -2166,6 +2409,29 @@ func (s *Service) SendChatMessage(ctx context.Context, params types.SendChatPara
 		ProviderUsed:   resp.ProviderUsed,
 		UsageCostDelta: resp.UsageCostDelta,
 	}, nil
+}
+
+func mergeDuplicateAssistantMessage(existing, incoming types.ChatMessage) types.ChatMessage {
+	merged := incoming
+	if len(existing.Steps) > len(merged.Steps) {
+		merged.Steps = existing.Steps
+	}
+	if existing.WorkDurationMs > merged.WorkDurationMs {
+		merged.WorkDurationMs = existing.WorkDurationMs
+	}
+	if merged.ThinkingSummary == "" && existing.ThinkingSummary != "" {
+		merged.ThinkingSummary = existing.ThinkingSummary
+	}
+	if merged.ProcessTable == nil && existing.ProcessTable != nil {
+		merged.ProcessTable = existing.ProcessTable
+	}
+	if merged.PluginDraft == nil && existing.PluginDraft != nil {
+		merged.PluginDraft = existing.PluginDraft
+	}
+	if strings.TrimSpace(merged.Content) == "" && strings.TrimSpace(existing.Content) != "" {
+		merged.Content = existing.Content
+	}
+	return merged
 }
 
 var (
@@ -6093,6 +6359,7 @@ func (s *Service) CreateProject(params types.CreateProjectParams) (types.ValetSn
 				Content: "",
 			},
 		},
+		Pages: []types.ProjectPage{},
 	}
 
 	next := s.store.Update(func(st *types.ValetSnapshot) {
@@ -6100,6 +6367,7 @@ func (s *Service) CreateProject(params types.CreateProjectParams) (types.ValetSn
 		st.ActiveView = string(types.ViewProjects)
 		st.ActiveProjectID = proj.ID
 		st.ActiveProjectTab = "notebook"
+		st.ActivePageID = ""
 	})
 	return next, nil
 }
@@ -6208,6 +6476,235 @@ func (s *Service) DeleteProject(projectID string) (types.ValetSnapshot, error) {
 	return next, nil
 }
 
+// CreateProjectPage creates a nested sub-page under an existing Project (sibling to ChatThreads).
+func (s *Service) CreateProjectPage(params types.CreateProjectPageParams) (types.CreateProjectPageResult, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.CreateProjectPageResult{}, err
+	}
+	pid := strings.TrimSpace(params.ProjectID)
+	if pid == "" {
+		return types.CreateProjectPageResult{}, errors.New("projectId is required")
+	}
+
+	title := strings.TrimSpace(params.Title)
+	if title == "" {
+		title = "未命名页面"
+	}
+	icon := strings.TrimSpace(params.Icon)
+	if icon == "" {
+		icon = "file"
+	}
+
+	now := time.Now()
+	pageID := fmt.Sprintf("page-%d", now.UnixNano())
+	var blocks []types.NotebookBlock
+	if len(params.Blocks) > 0 {
+		blocks = make([]types.NotebookBlock, len(params.Blocks))
+		copy(blocks, params.Blocks)
+		for j := range blocks {
+			if strings.TrimSpace(blocks[j].ID) == "" {
+				blocks[j].ID = makeNotebookBlockID()
+			}
+			blocks[j].Indent = store.ClampNotebookBlockIndent(blocks[j].Type, blocks[j].Indent)
+		}
+	} else {
+		blocks = []types.NotebookBlock{{
+			ID:      fmt.Sprintf("blk-%d", now.UnixNano()+1),
+			Type:    "paragraph",
+			Content: "",
+		}}
+	}
+
+	var projFound bool
+	var created types.ProjectPage
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Projects {
+			if st.Projects[i].ID != pid {
+				continue
+			}
+			projFound = true
+			parentID := strings.TrimSpace(params.ParentPageID)
+			if parentID != "" {
+				parentExists := false
+				for _, pg := range st.Projects[i].Pages {
+					if pg.ID == parentID {
+						parentExists = true
+						break
+					}
+				}
+				if !parentExists {
+					parentID = ""
+				}
+			}
+			created = types.ProjectPage{
+				ID:           pageID,
+				ParentPageID: parentID,
+				Title:        title,
+				Icon:         icon,
+				UpdatedAt:    "刚刚",
+				CreatedAt:    now.Format("2006-01-02"),
+				Blocks:       blocks,
+			}
+			st.Projects[i].Pages = append(st.Projects[i].Pages, created)
+			st.Projects[i].UpdatedAt = "刚刚"
+			if params.SwitchToPage {
+				st.ActiveView = string(types.ViewProjects)
+				st.ActiveProjectID = pid
+				st.ActiveProjectTab = "page"
+				st.ActivePageID = created.ID
+			}
+			break
+		}
+	})
+	if !projFound {
+		return types.CreateProjectPageResult{}, fmt.Errorf("project %q not found", pid)
+	}
+	return types.CreateProjectPageResult{
+		Snapshot: next,
+		Page:     created,
+	}, nil
+}
+
+// UpdateProjectPage updates title, icon, parent relationship, or blocks of a ProjectPage.
+func (s *Service) UpdateProjectPage(params types.UpdateProjectPageParams) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	pid := strings.TrimSpace(params.ProjectID)
+	pageID := strings.TrimSpace(params.PageID)
+	if pid == "" || pageID == "" {
+		return types.ValetSnapshot{}, errors.New("projectId and pageId are required")
+	}
+
+	var found bool
+	var parentErr error
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Projects {
+			if st.Projects[i].ID != pid {
+				continue
+			}
+			parentMap := make(map[string]string, len(st.Projects[i].Pages))
+			for _, pg := range st.Projects[i].Pages {
+				parentMap[pg.ID] = pg.ParentPageID
+			}
+			for j := range st.Projects[i].Pages {
+				if st.Projects[i].Pages[j].ID != pageID {
+					continue
+				}
+				found = true
+				if params.Title != nil {
+					if t := strings.TrimSpace(*params.Title); t != "" {
+						st.Projects[i].Pages[j].Title = t
+					}
+				}
+				if params.Icon != nil && strings.TrimSpace(*params.Icon) != "" {
+					st.Projects[i].Pages[j].Icon = strings.TrimSpace(*params.Icon)
+				}
+				if params.ParentPageID != nil {
+					nextParent := strings.TrimSpace(*params.ParentPageID)
+					if nextParent == pageID {
+						parentErr = errors.New("cannot set a page as its own parent")
+						return
+					}
+					if nextParent != "" {
+						if _, ok := parentMap[nextParent]; !ok {
+							parentErr = fmt.Errorf("parent page %q not found", nextParent)
+							return
+						}
+						// Cycle check: ensure candidate parent is not a descendant of pageID
+						cur := nextParent
+						for cur != "" {
+							if cur == pageID {
+								parentErr = errors.New("cannot move a page inside its own descendant")
+								return
+							}
+							cur = parentMap[cur]
+						}
+					}
+					st.Projects[i].Pages[j].ParentPageID = nextParent
+				}
+				if params.Blocks != nil {
+					blocks := make([]types.NotebookBlock, len(*params.Blocks))
+					copy(blocks, *params.Blocks)
+					for k := range blocks {
+						blocks[k].Indent = store.ClampNotebookBlockIndent(blocks[k].Type, blocks[k].Indent)
+					}
+					st.Projects[i].Pages[j].Blocks = blocks
+				}
+				st.Projects[i].Pages[j].UpdatedAt = "刚刚"
+				st.Projects[i].UpdatedAt = "刚刚"
+				break
+			}
+			break
+		}
+	})
+	if parentErr != nil {
+		return types.ValetSnapshot{}, parentErr
+	}
+	if !found {
+		return types.ValetSnapshot{}, fmt.Errorf("page %q not found in project %q", pageID, pid)
+	}
+	return next, nil
+}
+
+// DeleteProjectPage deletes a page from a Project and promotes any direct child pages up to its parent.
+func (s *Service) DeleteProjectPage(projectID, pageID string) (types.ValetSnapshot, error) {
+	if err := s.ensureStarted(); err != nil {
+		return types.ValetSnapshot{}, err
+	}
+	pid := strings.TrimSpace(projectID)
+	pgID := strings.TrimSpace(pageID)
+	if pid == "" || pgID == "" {
+		return types.ValetSnapshot{}, errors.New("projectId and pageId are required")
+	}
+
+	var found bool
+	next := s.store.Update(func(st *types.ValetSnapshot) {
+		for i := range st.Projects {
+			if st.Projects[i].ID != pid {
+				continue
+			}
+			var removedParentID string
+			kept := make([]types.ProjectPage, 0, len(st.Projects[i].Pages))
+			for _, pg := range st.Projects[i].Pages {
+				if pg.ID == pgID {
+					found = true
+					removedParentID = pg.ParentPageID
+					continue
+				}
+				kept = append(kept, pg)
+			}
+			if !found {
+				return
+			}
+			for k := range kept {
+				if kept[k].ParentPageID == pgID {
+					kept[k].ParentPageID = removedParentID
+				}
+			}
+			st.Projects[i].Pages = kept
+			st.Projects[i].UpdatedAt = "刚刚"
+			if st.ActiveProjectID == pid && st.ActiveProjectTab == "page" && st.ActivePageID == pgID {
+				if removedParentID != "" {
+					st.ActivePageID = removedParentID
+				} else {
+					st.ActivePageID = ""
+					if pid == types.DefaultProjectID {
+						st.ActiveProjectTab = "sessions"
+					} else {
+						st.ActiveProjectTab = "notebook"
+					}
+				}
+			}
+			break
+		}
+	})
+	if !found {
+		return types.ValetSnapshot{}, fmt.Errorf("page %q not found in project %q", pgID, pid)
+	}
+	return next, nil
+}
+
 // CreateProjectChatThread creates a session inside a target Project (e.g. triggered via @valet in a Notebook).
 func (s *Service) CreateProjectChatThread(params types.CreateProjectChatParams) (types.CreateProjectChatResult, error) {
 	if err := s.ensureStarted(); err != nil {
@@ -6239,6 +6736,7 @@ func (s *Service) CreateProjectChatThread(params types.CreateProjectChatParams) 
 		}
 		withWelcome := strings.TrimSpace(params.OriginBlockID) == ""
 		created = makeProjectChatThread(pid, title, model, st.Preferences.UserNickname, withWelcome)
+		created.OriginPageID = strings.TrimSpace(params.OriginPageID)
 		created.OriginBlockID = strings.TrimSpace(params.OriginBlockID)
 		created.OriginSection = strings.TrimSpace(params.OriginSection)
 		created.NotebookContextInjected = params.NotebookContextInjected
@@ -6247,6 +6745,7 @@ func (s *Service) CreateProjectChatThread(params types.CreateProjectChatParams) 
 			st.ActiveView = string(types.ViewProjects)
 			st.ActiveProjectID = pid
 			st.ActiveProjectTab = "session"
+			st.ActivePageID = ""
 			st.ActiveChatID = created.ID
 		}
 	})

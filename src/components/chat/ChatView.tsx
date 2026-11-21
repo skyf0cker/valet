@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useValet } from "../../store/ValetContext";
 import { DEFAULT_PROJECT_ID } from "../../types/valet";
 import { getCopyableMessageText } from "../../utils/chatClipboard";
@@ -123,6 +123,22 @@ export const ChatView: React.FC = () => {
     activeStream?.pendingPermission?.requestId,
   ]);
 
+  const originPage = useMemo(() => {
+    if (!parentProject || !thread) return null;
+    const pages = parentProject.pages ?? [];
+    if (thread.originPageId) {
+      const direct = pages.find((p) => p.id === thread.originPageId);
+      if (direct) return direct;
+    }
+    return (
+      pages.find((p) =>
+        p.blocks.some(
+          (b) => b.sessionId === thread.id || b.content.includes(`[[session:${thread.id}]]`)
+        )
+      ) ?? null
+    );
+  }, [parentProject, thread]);
+
   if (!thread) return null;
 
   const switcherThreads = projectThreads.some((t) => t.id === thread.id)
@@ -136,6 +152,7 @@ export const ChatView: React.FC = () => {
   const hasNotebookBacklink =
     Boolean(parentProject) &&
     (Boolean(thread.originBlockId) ||
+      Boolean(originPage) ||
       Boolean(thread.notebookContextInjected) ||
       Boolean(
         parentProject?.blocks.some(
@@ -171,6 +188,25 @@ export const ChatView: React.FC = () => {
             >
               {parentProject.title}
             </button>
+            {originPage && (
+              <>
+                <span className="text-[var(--ink-subtle)]">/</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    returnToProjectNotebook(
+                      thread.originBlockId || undefined,
+                      parentProject.id,
+                      originPage.id
+                    )
+                  }
+                  className="max-w-[130px] cursor-pointer truncate rounded-[5px] px-1 py-0.5 font-medium hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                  title={`返回页面「${originPage.title || "未命名页面"}」`}
+                >
+                  {originPage.title || "未命名页面"}
+                </button>
+              </>
+            )}
             <span className="text-[var(--ink-subtle)]">/</span>
           </div>
         )}
@@ -206,12 +242,21 @@ export const ChatView: React.FC = () => {
           <button
             type="button"
             onClick={() =>
-              returnToProjectNotebook(thread.originBlockId || undefined, parentProject.id)
+              returnToProjectNotebook(
+                thread.originBlockId || undefined,
+                parentProject.id,
+                originPage?.id
+              )
+            }
+            title={
+              originPage
+                ? `返回「${originPage.title || "未命名页面"}」`
+                : `返回 ${parentProject.title} Notebook`
             }
             className="app-no-drag inline-flex h-[28px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2.5 text-[11.5px] font-medium text-[var(--ink-strong)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)]"
           >
             <ArrowLeftIcon size={12} />
-            <span>返回 Notebook</span>
+            <span>{originPage ? `返回「${originPage.title || "未命名页面"}」` : "返回 Notebook"}</span>
           </button>
         )}
 

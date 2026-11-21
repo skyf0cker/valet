@@ -26,17 +26,45 @@ var (
 	nbBulletLineRE   = regexp.MustCompile(`^([ \t]*)[-*+][ \t]+(.*)$`)
 	nbNumberedLineRE = regexp.MustCompile(`^([ \t]*)\d+[.)][ \t]+(.*)$`)
 	nbLeadingWSRE    = regexp.MustCompile(`^([ \t]*)(.*)$`)
+	nbTableDelimRE1  = regexp.MustCompile(`^\|?(?:\s*:?-{1,}:?\s*\|)+\s*(?::?-{1,}:?\s*\|?)?$`)
+	nbTableDelimRE2  = regexp.MustCompile(`^\|(?:\s*:?-{1,}:?\s*\|)+$`)
+	nbTableFenceRE   = regexp.MustCompile(`^\s{0,3}(?:\x60{3}|~~~)`)
 )
+
+func isNotebookTableDelimiterLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.Contains(trimmed, "|") || !strings.Contains(trimmed, "-") {
+		return false
+	}
+	return nbTableDelimRE1.MatchString(trimmed) || nbTableDelimRE2.MatchString(trimmed)
+}
+
+func isNotebookTableRowCandidate(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || !strings.Contains(trimmed, "|") {
+		return false
+	}
+	if nbTableFenceRE.MatchString(line) ||
+		nbDividerRE.MatchString(line) ||
+		nbHeadingRE.MatchString(strings.TrimLeft(line, " \t")) ||
+		nbQuoteLineRE.MatchString(line) ||
+		nbTodoLineRE.MatchString(line) ||
+		nbBulletLineRE.MatchString(line) ||
+		nbNumberedLineRE.MatchString(line) {
+		return false
+	}
+	return true
+}
 
 func makeNotebookBlockID() string {
 	seq := notebookBlockSeq.Add(1)
 	return fmt.Sprintf("blk-%d-%d", time.Now().UnixNano(), seq)
 }
 
-func resolveProjectForChat(snap types.ValetSnapshot, chatID string) (int, types.Project, string, error) {
+func resolveProjectForChat(snap types.ValetSnapshot, chatID string) (int, types.Project, string, string, error) {
 	cid := strings.TrimSpace(chatID)
 	if cid == "" {
-		return -1, types.Project{}, "", errors.New("缺少当前会话 chatId，无法定位所属项目 Notebook")
+		return -1, types.Project{}, "", "", errors.New("缺少当前会话 chatId，无法定位所属项目 Notebook")
 	}
 
 	var matchedThread *types.ChatThread
@@ -48,7 +76,7 @@ func resolveProjectForChat(snap types.ValetSnapshot, chatID string) (int, types.
 		}
 	}
 	if matchedThread == nil {
-		return -1, types.Project{}, "", fmt.Errorf("当前会话 %q 未关联到项目，无法读写 Notebook", cid)
+		return -1, types.Project{}, "", "", fmt.Errorf("当前会话 %q 未关联到项目，无法读写 Notebook", cid)
 	}
 
 	pid := strings.TrimSpace(matchedThread.ProjectID)
@@ -58,11 +86,35 @@ func resolveProjectForChat(snap types.ValetSnapshot, chatID string) (int, types.
 
 	for i := range snap.Projects {
 		if snap.Projects[i].ID == pid {
-			return i, snap.Projects[i], matchedThread.OriginBlockID, nil
+			return i, snap.Projects[i], strings.TrimSpace(matchedThread.OriginPageID), matchedThread.OriginBlockID, nil
 		}
 	}
 
-	return -1, types.Project{}, "", fmt.Errorf("未找到会话所属项目 %q", pid)
+	return -1, types.Project{}, "", "", fmt.Errorf("未找到会话所属项目 %q", pid)
+}
+
+func resolveNotebookTarget(proj types.Project, requestedPageID string, originPageID string) (int, string, []types.NotebookBlock, error) {
+	reqID := strings.TrimSpace(requestedPageID)
+	if reqID == "root" {
+		return -1, proj.Title, proj.Blocks, nil
+	}
+	effectiveID := reqID
+	if effectiveID == "" {
+		effectiveID = strings.TrimSpace(originPageID)
+	}
+	if effectiveID == "" {
+		return -1, proj.Title, proj.Blocks, nil
+	}
+	for i, pg := range proj.Pages {
+		if pg.ID == effectiveID {
+			return i, pg.Title, pg.Blocks, nil
+		}
+	}
+	if reqID != "" {
+		return -1, "", nil, fmt.Errorf("未找到 ID 为 %q 的项目子页面", reqID)
+	}
+	// Stale originPageId on thread: fall back gracefully to root Notebook
+	return -1, proj.Title, proj.Blocks, nil
 }
 
 func leadingWhitespaceToNotebookIndent(ws string) int {
@@ -166,6 +218,28 @@ func parseNotebookMarkdownToBlocks(rawMarkdown string) []types.NotebookBlock {
 			continue
 		}
 
+		if strings.Contains(line, "|") && i+1 < len(lines) && isNotebookTableDelimiterLine(lines[i+1]) {
+			requireLeadingPipe := strings.HasPrefix(strings.TrimSpace(line), "|") ||
+				strings.HasPrefix(strings.TrimSpace(lines[i+1]), "|")
+			tableLines := []string{strings.TrimSpace(line), strings.TrimSpace(lines[i+1])}
+			endIdx := i + 1
+			for endIdx+1 < len(lines) && isNotebookTableRowCandidate(lines[endIdx+1]) {
+				trimmedRow := strings.TrimSpace(lines[endIdx+1])
+				if requireLeadingPipe && !strings.HasPrefix(trimmedRow, "|") {
+					break
+				}
+				endIdx++
+				tableLines = append(tableLines, trimmedRow)
+			}
+			i = endIdx
+			out = append(out, types.NotebookBlock{
+				ID:      makeNotebookBlockID(),
+				Type:    "table",
+				Content: strings.Join(tableLines, "\n"),
+			})
+			continue
+		}
+
 		if m := nbCalloutStartRE.FindStringSubmatch(line); m != nil {
 			var parts []string
 			if first := strings.TrimSpace(m[1]); first != "" {
@@ -256,19 +330,74 @@ func parseNotebookMarkdownToBlocks(rawMarkdown string) []types.NotebookBlock {
 	return normalizeNotebookBlockIndents(out)
 }
 
-func formatNotebookReadView(proj types.Project, originBlockID string) string {
+func buildNotebookPagesSummary(proj types.Project) []map[string]any {
+	out := make([]map[string]any, 0, len(proj.Pages))
+	for _, pg := range proj.Pages {
+		out = append(out, map[string]any{
+			"pageId":       pg.ID,
+			"title":        pg.Title,
+			"parentPageId": pg.ParentPageID,
+			"blockCount":   len(pg.Blocks),
+		})
+	}
+	return out
+}
+
+func resolvePageRefTitle(proj types.Project, refID string) string {
+	trimmed := strings.TrimSpace(refID)
+	if trimmed == "" {
+		return "关联页面"
+	}
+	if trimmed == "root:"+proj.ID {
+		return proj.Title
+	}
+	for _, pg := range proj.Pages {
+		if pg.ID == trimmed {
+			return pg.Title
+		}
+	}
+	return trimmed
+}
+
+func formatNotebookReadView(proj types.Project, pageIdx int, originPageID, originBlockID string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "项目 Notebook：%s (projectId=%s)\n", proj.Title, proj.ID)
+	activePageID := ""
+	targetBlocks := proj.Blocks
+	if pageIdx >= 0 && pageIdx < len(proj.Pages) {
+		pg := proj.Pages[pageIdx]
+		activePageID = pg.ID
+		targetBlocks = pg.Blocks
+		fmt.Fprintf(&b, "项目子页面：%s / %s (projectId=%s, pageId=%s)\n", proj.Title, pg.Title, proj.ID, pg.ID)
+		if pg.ParentPageID != "" {
+			fmt.Fprintf(&b, "上级页面：%s (parentPageId=%s)\n", resolvePageRefTitle(proj, pg.ParentPageID), pg.ParentPageID)
+		}
+	} else {
+		fmt.Fprintf(&b, "项目 Notebook：%s (projectId=%s)\n", proj.Title, proj.ID)
+	}
 	if strings.TrimSpace(proj.WorkingDir) != "" {
 		fmt.Fprintf(&b, "工作目录：%s\n", proj.WorkingDir)
 	}
 	if len(proj.Tags) > 0 {
 		fmt.Fprintf(&b, "标签：%s\n", strings.Join(proj.Tags, ", "))
 	}
-	fmt.Fprintf(&b, "共 %d 个内容块：\n", len(proj.Blocks))
+	if len(proj.Pages) > 0 {
+		fmt.Fprintf(&b, "项目子页面目录（共 %d 个）：\n", len(proj.Pages))
+		for _, pg := range proj.Pages {
+			parentNote := ""
+			if pg.ParentPageID != "" {
+				parentNote = fmt.Sprintf(", parent=%s", pg.ParentPageID)
+			}
+			activeMark := ""
+			if pg.ID == activePageID {
+				activeMark = " *当前*"
+			}
+			fmt.Fprintf(&b, "  - [%s] %s (%d 块%s)%s\n", pg.ID, pg.Title, len(pg.Blocks), parentNote, activeMark)
+		}
+	}
+	fmt.Fprintf(&b, "共 %d 个内容块：\n", len(targetBlocks))
 
 	counters := make([]int, 0, store.MaxNotebookBlockIndent+1)
-	for idx, blk := range proj.Blocks {
+	for idx, blk := range targetBlocks {
 		level := store.ClampNotebookBlockIndent(blk.Type, blk.Indent)
 		orderedNum := 1
 		if blk.Type == "numbered" {
@@ -305,6 +434,10 @@ func formatNotebookReadView(proj types.Project, originBlockID string) string {
 			if blk.SessionID != "" {
 				typeLabel = "session_ref:" + blk.SessionID
 			}
+		case "page_ref":
+			if blk.PageID != "" {
+				typeLabel = "page_ref:" + blk.PageID
+			}
 		}
 		metaParts = append(metaParts, typeLabel)
 		if level > 0 {
@@ -340,10 +473,26 @@ func formatNotebookReadView(proj types.Project, originBlockID string) string {
 				lang = "bash"
 			}
 			preview = fmt.Sprintf("```%s\n%s\n```", lang, blk.Content)
+		case "table":
+			trimmedTbl := strings.TrimSpace(blk.Content)
+			if trimmedTbl == "" {
+				preview = "（空表格）"
+			} else {
+				preview = "\n  " + strings.ReplaceAll(trimmedTbl, "\n", "\n  ")
+			}
 		case "divider":
 			preview = "---"
 		case "session_ref":
 			preview = fmt.Sprintf("[@valet 会话卡片: %s]", blk.Content)
+		case "page_ref":
+			refTitle := blk.Content
+			if resolved := resolvePageRefTitle(proj, blk.PageID); resolved != "" && resolved != blk.PageID {
+				refTitle = resolved
+			}
+			if refTitle == "" {
+				refTitle = "关联页面"
+			}
+			preview = fmt.Sprintf("[页面链接: %s (pageId=%s)]", refTitle, blk.PageID)
 		default:
 			if blk.Content == "" {
 				preview = "（空行）"
@@ -353,7 +502,7 @@ func formatNotebookReadView(proj types.Project, originBlockID string) string {
 		}
 
 		originMarker := ""
-		if originBlockID != "" && blk.ID == originBlockID {
+		if originBlockID != "" && blk.ID == originBlockID && activePageID == originPageID {
 			originMarker = "  <<< [当前会话发起行]"
 		}
 		fmt.Fprintf(&b, "%d. [%s] %s%s\n", idx+1, strings.Join(metaParts, " | "), preview, originMarker)
@@ -418,33 +567,49 @@ func isAllowedNotebookEditType(t string) bool {
 func (s *Service) execHostNotebookRead(raw json.RawMessage) (any, error) {
 	var req struct {
 		ChatID string `json:"chatId"`
+		PageID string `json:"pageId"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
 
 	snap := s.store.Snapshot()
-	_, proj, originBlockID, err := resolveProjectForChat(snap, req.ChatID)
+	_, proj, originPageID, originBlockID, err := resolveProjectForChat(snap, req.ChatID)
 	if err != nil {
 		return nil, err
+	}
+
+	pageIdx, targetTitle, targetBlocks, targetErr := resolveNotebookTarget(proj, req.PageID, originPageID)
+	if targetErr != nil {
+		return nil, targetErr
+	}
+	resolvedPageID := ""
+	if pageIdx >= 0 && pageIdx < len(proj.Pages) {
+		resolvedPageID = proj.Pages[pageIdx].ID
 	}
 
 	return map[string]any{
 		"ok":            true,
 		"projectId":     proj.ID,
 		"projectTitle":  proj.Title,
+		"pageId":        resolvedPageID,
+		"pageTitle":     targetTitle,
 		"workingDir":    proj.WorkingDir,
 		"originBlockId": originBlockID,
-		"blockCount":    len(proj.Blocks),
-		"blocks":        proj.Blocks,
-		"formatted":     formatNotebookReadView(proj, originBlockID),
+		"pages":         buildNotebookPagesSummary(proj),
+		"blockCount":    len(targetBlocks),
+		"blocks":        targetBlocks,
+		"formatted":     formatNotebookReadView(proj, pageIdx, originPageID, originBlockID),
 	}, nil
 }
 
 func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 	var req struct {
 		ChatID              string   `json:"chatId"`
+		PageID              string   `json:"pageId"`
 		Action              string   `json:"action"`
+		Title               string   `json:"title"`
+		ParentPageID        string   `json:"parentPageId"`
 		Markdown            string   `json:"markdown"`
 		TargetBlockID       string   `json:"targetBlockId"`
 		EndBlockID          string   `json:"endBlockId"`
@@ -467,13 +632,141 @@ func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 	}
 
 	snap := s.store.Snapshot()
-	_, proj, originBlockID, err := resolveProjectForChat(snap, req.ChatID)
+	_, proj, originPageID, originBlockID, err := resolveProjectForChat(snap, req.ChatID)
 	if err != nil {
 		return nil, err
 	}
 
-	blocks := make([]types.NotebookBlock, len(proj.Blocks))
-	copy(blocks, proj.Blocks)
+	if action == "create_page" {
+		newTitle := strings.TrimSpace(req.Title)
+		if newTitle == "" {
+			newTitle = "未命名页面"
+		}
+		var newBlocks []types.NotebookBlock
+		if strings.TrimSpace(req.Markdown) != "" {
+			newBlocks = parseNotebookMarkdownToBlocks(req.Markdown)
+		}
+		if len(newBlocks) == 0 {
+			newBlocks = []types.NotebookBlock{{ID: makeNotebookBlockID(), Type: "paragraph", Content: ""}}
+		}
+		newBlocks = normalizeNotebookBlockIndents(newBlocks)
+
+		newPageID := fmt.Sprintf("page-%d", time.Now().UnixNano())
+		parentID := strings.TrimSpace(req.ParentPageID)
+		if parentID == "root" {
+			parentID = ""
+		} else if parentID != "" {
+			foundParent := false
+			for _, pg := range proj.Pages {
+				if pg.ID == parentID {
+					foundParent = true
+					break
+				}
+			}
+			if !foundParent {
+				return nil, fmt.Errorf("未找到 parentPageId=%q 对应的上级页面", parentID)
+			}
+		}
+
+		newPage := types.ProjectPage{
+			ID:           newPageID,
+			ParentPageID: parentID,
+			Title:        newTitle,
+			Icon:         "file",
+			UpdatedAt:    "刚刚",
+			CreatedAt:    time.Now().Format("2006-01-02"),
+			Blocks:       newBlocks,
+		}
+
+		var updatedProj types.Project
+		var saved bool
+		s.store.Update(func(st *types.ValetSnapshot) {
+			for i := range st.Projects {
+				if st.Projects[i].ID == proj.ID {
+					st.Projects[i].Pages = append(st.Projects[i].Pages, newPage)
+					st.Projects[i].UpdatedAt = "刚刚"
+					updatedProj = st.Projects[i]
+					saved = true
+					break
+				}
+			}
+		})
+		if !saved {
+			return nil, fmt.Errorf("保存失败：未找到项目 %q", proj.ID)
+		}
+		s.emitStateChange("projects")
+		newPageIdx := len(updatedProj.Pages) - 1
+		affectedIDs := make([]string, 0, len(newPage.Blocks))
+		for _, b := range newPage.Blocks {
+			affectedIDs = append(affectedIDs, b.ID)
+		}
+		return map[string]any{
+			"ok":           true,
+			"projectId":    updatedProj.ID,
+			"projectTitle": updatedProj.Title,
+			"pageId":       newPage.ID,
+			"pageTitle":    newPage.Title,
+			"action":       action,
+			"summary":      fmt.Sprintf("已在项目「%s」下创建子页面「%s」(%s)", updatedProj.Title, newPage.Title, newPage.ID),
+			"blockCount":   len(newPage.Blocks),
+			"affectedIds":  affectedIDs,
+			"formatted":    formatNotebookReadView(updatedProj, newPageIdx, originPageID, originBlockID),
+		}, nil
+	}
+
+	pageIdx, targetTitle, currentBlocks, targetErr := resolveNotebookTarget(proj, req.PageID, originPageID)
+	if targetErr != nil {
+		return nil, targetErr
+	}
+
+	if action == "rename_page" {
+		if pageIdx < 0 || pageIdx >= len(proj.Pages) {
+			return nil, errors.New("rename_page 需要指定有效的子页面 pageId（根目录标题请通过项目设置修改）")
+		}
+		nextTitle := strings.TrimSpace(req.Title)
+		if nextTitle == "" {
+			return nil, errors.New("rename_page 需要提供非空的 title 参数")
+		}
+		targetPageID := proj.Pages[pageIdx].ID
+		var updatedProj types.Project
+		var saved bool
+		s.store.Update(func(st *types.ValetSnapshot) {
+			for i := range st.Projects {
+				if st.Projects[i].ID == proj.ID && pageIdx < len(st.Projects[i].Pages) && st.Projects[i].Pages[pageIdx].ID == targetPageID {
+					st.Projects[i].Pages[pageIdx].Title = nextTitle
+					st.Projects[i].Pages[pageIdx].UpdatedAt = "刚刚"
+					st.Projects[i].UpdatedAt = "刚刚"
+					updatedProj = st.Projects[i]
+					saved = true
+					break
+				}
+			}
+		})
+		if !saved {
+			return nil, fmt.Errorf("重命名失败：未找到页面 %q", targetPageID)
+		}
+		s.emitStateChange("projects")
+		return map[string]any{
+			"ok":           true,
+			"projectId":    updatedProj.ID,
+			"projectTitle": updatedProj.Title,
+			"pageId":       targetPageID,
+			"pageTitle":    nextTitle,
+			"action":       action,
+			"summary":      fmt.Sprintf("已将页面重命名为「%s」", nextTitle),
+			"blockCount":   len(updatedProj.Pages[pageIdx].Blocks),
+			"affectedIds":  []string{},
+			"formatted":    formatNotebookReadView(updatedProj, pageIdx, originPageID, originBlockID),
+		}, nil
+	}
+
+	targetScopeLabel := fmt.Sprintf("项目「%s」Notebook", proj.Title)
+	if pageIdx >= 0 {
+		targetScopeLabel = fmt.Sprintf("页面「%s」", targetTitle)
+	}
+
+	blocks := make([]types.NotebookBlock, len(currentBlocks))
+	copy(blocks, currentBlocks)
 	var affectedIDs []string
 	var summary string
 
@@ -491,7 +784,7 @@ func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 		} else {
 			blocks = append(blocks, parsed...)
 		}
-		summary = fmt.Sprintf("已向项目「%s」Notebook 末尾追加 %d 个内容块", proj.Title, len(parsed))
+		summary = fmt.Sprintf("已向%s末尾追加 %d 个内容块", targetScopeLabel, len(parsed))
 
 	case "insert_after", "insert_before":
 		idx, idxErr := resolveNotebookBlockIndex(blocks, req.TargetBlockID, req.LineNumber)
@@ -514,15 +807,15 @@ func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 		next = append(next, parsed...)
 		next = append(next, blocks[insertAt:]...)
 		blocks = next
-		summary = fmt.Sprintf("已在项目「%s」Notebook 中插入 %d 个内容块", proj.Title, len(parsed))
+		summary = fmt.Sprintf("已在%s中插入 %d 个内容块", targetScopeLabel, len(parsed))
 
 	case "update_block":
 		idx, idxErr := resolveNotebookBlockIndex(blocks, req.TargetBlockID, req.LineNumber)
 		if idxErr != nil {
 			return nil, idxErr
 		}
-		if blocks[idx].Type == "session_ref" {
-			return nil, errors.New("安全边界拒绝：不允许直接修改嵌入的关联会话卡片 (session_ref)")
+		if blocks[idx].Type == "session_ref" || blocks[idx].Type == "page_ref" {
+			return nil, errors.New("安全边界拒绝：不允许直接修改嵌入的会话或子页面引用卡片 (session_ref / page_ref)")
 		}
 		if req.Content == nil && req.Type == nil && req.Checked == nil && req.Indent == nil && req.Language == nil {
 			return nil, errors.New("update_block 至少需要提供 content、type、checked、indent 或 language 中的一项")
@@ -564,7 +857,7 @@ func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 		}
 		blocks[idx] = blk
 		affectedIDs = []string{blk.ID}
-		summary = fmt.Sprintf("已更新项目「%s」Notebook 内容块 %s", proj.Title, blk.ID)
+		summary = fmt.Sprintf("已更新%s内容块 %s", targetScopeLabel, blk.ID)
 
 	case "replace_blocks":
 		startIdx, endIdx, rangeErr := resolveNotebookBlockRange(blocks, req.TargetBlockID, req.EndBlockID, req.LineNumber)
@@ -583,7 +876,7 @@ func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 		next = append(next, parsed...)
 		next = append(next, blocks[endIdx+1:]...)
 		blocks = next
-		summary = fmt.Sprintf("已将项目「%s」Notebook 第 %d..%d 块替换为 %d 个新块", proj.Title, startIdx+1, endIdx+1, len(parsed))
+		summary = fmt.Sprintf("已将%s第 %d..%d 块替换为 %d 个新块", targetScopeLabel, startIdx+1, endIdx+1, len(parsed))
 
 	case "delete_blocks":
 		toDelete := make(map[string]bool)
@@ -619,7 +912,7 @@ func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 			kept = []types.NotebookBlock{{ID: makeNotebookBlockID(), Type: "paragraph", Content: ""}}
 		}
 		blocks = kept
-		summary = fmt.Sprintf("已从项目「%s」Notebook 删除 %d 个内容块", proj.Title, len(affectedIDs))
+		summary = fmt.Sprintf("已从%s删除 %d 个内容块", targetScopeLabel, len(affectedIDs))
 
 	case "replace_all":
 		parsed := parseNotebookMarkdownToBlocks(req.Markdown)
@@ -627,7 +920,7 @@ func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 		if preserveRefs {
 			var preserved []types.NotebookBlock
 			for _, blk := range blocks {
-				if blk.Type == "session_ref" {
+				if blk.Type == "session_ref" || blk.Type == "page_ref" {
 					preserved = append(preserved, blk)
 				}
 			}
@@ -640,7 +933,7 @@ func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 			affectedIDs = append(affectedIDs, b.ID)
 		}
 		blocks = parsed
-		summary = fmt.Sprintf("已重写项目「%s」Notebook（共 %d 个内容块）", proj.Title, len(blocks))
+		summary = fmt.Sprintf("已重写%s（共 %d 个内容块）", targetScopeLabel, len(blocks))
 
 	default:
 		return nil, fmt.Errorf("不支持的 notebook_edit action: %q", action)
@@ -649,15 +942,25 @@ func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 	normalizedBlocks := normalizeNotebookBlockIndents(blocks)
 	var updatedProj types.Project
 	var saved bool
+	resolvedPageID := ""
+	targetPageTitle := proj.Title
 	s.store.Update(func(st *types.ValetSnapshot) {
 		for i := range st.Projects {
-			if st.Projects[i].ID == proj.ID {
-				st.Projects[i].Blocks = normalizedBlocks
-				st.Projects[i].UpdatedAt = "刚刚"
-				updatedProj = st.Projects[i]
-				saved = true
-				break
+			if st.Projects[i].ID != proj.ID {
+				continue
 			}
+			if pageIdx >= 0 && pageIdx < len(st.Projects[i].Pages) {
+				st.Projects[i].Pages[pageIdx].Blocks = normalizedBlocks
+				st.Projects[i].Pages[pageIdx].UpdatedAt = "刚刚"
+				resolvedPageID = st.Projects[i].Pages[pageIdx].ID
+				targetPageTitle = st.Projects[i].Pages[pageIdx].Title
+			} else {
+				st.Projects[i].Blocks = normalizedBlocks
+			}
+			st.Projects[i].UpdatedAt = "刚刚"
+			updatedProj = st.Projects[i]
+			saved = true
+			break
 		}
 	})
 	if !saved {
@@ -670,10 +973,12 @@ func (s *Service) execHostNotebookEdit(raw json.RawMessage) (any, error) {
 		"ok":           true,
 		"projectId":    updatedProj.ID,
 		"projectTitle": updatedProj.Title,
+		"pageId":       resolvedPageID,
+		"pageTitle":    targetPageTitle,
 		"action":       action,
 		"summary":      summary,
-		"blockCount":   len(updatedProj.Blocks),
+		"blockCount":   len(normalizedBlocks),
 		"affectedIds":  affectedIDs,
-		"formatted":    formatNotebookReadView(updatedProj, originBlockID),
+		"formatted":    formatNotebookReadView(updatedProj, pageIdx, originPageID, originBlockID),
 	}, nil
 }

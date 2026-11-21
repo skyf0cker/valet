@@ -26,6 +26,7 @@ export const TimelineDetailDrawer: React.FC = () => {
   const {
     state,
     setActiveView,
+    openPluginDetail,
     selectInboxItem,
     selectTimelineEvent,
     toggleTimelineActionItem,
@@ -73,6 +74,9 @@ export const TimelineDetailDrawer: React.FC = () => {
     return [];
   }, [event, linkedInboxItem]);
   const isFileCleanup = Boolean(event && isFileCleanupTimelineEvent(event));
+  const hasPluginForWorkflow = Boolean(
+    event?.workflowRunId && state.plugins.some((p) => p.id === event.pluginId)
+  );
 
   const visibleItems = useMemo(() => {
     if (!event) return [];
@@ -156,6 +160,20 @@ export const TimelineDetailDrawer: React.FC = () => {
                     <ArrowUpRightIcon size={10} className="shrink-0 text-[var(--ink-muted)]" />
                   </button>
                 )}
+                {hasPluginForWorkflow && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      selectTimelineEvent(null);
+                      openPluginDetail(event.pluginId);
+                    }}
+                    title={`在插件详情中查看工作流：${event.workflowRunId}`}
+                    className="inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-[5px] border border-[var(--border-control)] bg-[var(--bg-surface)] px-2 text-[10.5px] font-medium text-[var(--ink-secondary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                  >
+                    <span>查看工作流</span>
+                    <ArrowUpRightIcon size={10} className="shrink-0 text-[var(--ink-muted)]" />
+                  </button>
+                )}
               </div>
               <h3 className="font-[family-name:var(--font-serif-zh)] text-[26px] font-normal leading-[36px] tracking-[-0.01em] text-[var(--ink-strong)]">
                 {event.title}
@@ -174,16 +192,32 @@ export const TimelineDetailDrawer: React.FC = () => {
                   </pre>
                 </section>
 
-                {/* 02 Reasoning */}
-                <section className="flex flex-col gap-2">
-                  <div className="font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--ink-subtle)]">
-                    02 · 判断
-                  </div>
-                  <MarkdownRenderer
-                    text={event.reasoning}
-                    className="text-[13px] leading-[21px] text-[var(--ink-body)]"
-                  />
-                </section>
+                {/* 02 Reasoning / Notify body */}
+                {(() => {
+                  const sectionLabel =
+                    event.eventCode === "workflow.notify" ||
+                    event.eventCode === "outbox.message"
+                      ? "02 · 通知内容"
+                      : "02 · 判断";
+                  const detailContent = (event.reasoning || event.summary || "").trim();
+                  return (
+                    <section className="flex flex-col gap-2">
+                      <div className="font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--ink-subtle)]">
+                        {sectionLabel}
+                      </div>
+                      {detailContent ? (
+                        <MarkdownRenderer
+                          text={detailContent}
+                          className="text-[13px] leading-[21px] text-[var(--ink-body)]"
+                        />
+                      ) : (
+                        <div className="rounded-[8px] border border-dashed border-[var(--border-base)] bg-[var(--bg-subtle)]/50 px-3.5 py-3 text-[12.5px] leading-[20px] text-[var(--ink-muted)]">
+                          该事件未附带正文内容，可切换「事件链」或「日志」查看执行细节。
+                        </div>
+                      )}
+                    </section>
+                  );
+                })()}
 
                 {/* 03 Action checklist */}
                 {event.actionItems.length > 0 && (

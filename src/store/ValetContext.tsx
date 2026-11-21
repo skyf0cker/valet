@@ -49,6 +49,7 @@ import {
   makeBlockId,
   normalizeProjectsState,
 } from "../utils/notebook";
+import { normalizeProjectPages } from "../utils/notebookPages";
 import { findLinkedTimelineEvent } from "../utils/timelineLinks";
 import {
   getInboxQuestionOptions,
@@ -70,6 +71,7 @@ import {
   type InboxApprovalItem,
   type McpServerItem,
   type ModelSelection,
+  type NotebookBlock,
   type OnboardingStepId,
   type PermissionId,
   type PluginConfig,
@@ -78,6 +80,7 @@ import {
   type PluginState,
   type Project,
   type ProjectIconKind,
+  type ProjectPage,
   type ProjectTab,
   type ProviderId,
   type QueuedChatMessage,
@@ -325,7 +328,8 @@ function reconcileProviderModelSelection(
 function mergeBackendSnapshot(
   prev: ValetSnapshot,
   remoteRaw: MyGoSnapshot,
-  pendingProjectIds?: Set<string>
+  pendingProjectIds?: Set<string>,
+  pendingPageKeys?: Set<string>
 ): ValetSnapshot {
   const remote = normalizeProjectsState(remoteRaw as unknown as ValetSnapshot);
   const hasActiveChat = remote.chatThreads.some(
@@ -336,21 +340,54 @@ function mergeBackendSnapshot(
   );
   const prevProjectsById = new Map(prev.projects.map((p) => [p.id, p]));
   const mergedProjects =
-    pendingProjectIds && pendingProjectIds.size > 0
+    (pendingProjectIds && pendingProjectIds.size > 0) || (pendingPageKeys && pendingPageKeys.size > 0)
       ? remote.projects.map((rp) => {
-          if (!pendingProjectIds.has(rp.id)) return rp;
           const local = prevProjectsById.get(rp.id);
-          return local ? { ...rp, blocks: local.blocks, updatedAt: local.updatedAt } : rp;
+          if (!local) return rp;
+          let nextProj = rp;
+          if (pendingProjectIds?.has(rp.id)) {
+            nextProj = { ...nextProj, blocks: local.blocks, updatedAt: local.updatedAt };
+          }
+          if (pendingPageKeys && pendingPageKeys.size > 0 && rp.pages) {
+            const localPagesById = new Map((local.pages ?? []).map((pg) => [pg.id, pg]));
+            nextProj = {
+              ...nextProj,
+              pages: rp.pages.map((rpg) => {
+                if (!pendingPageKeys.has(`${rp.id}:${rpg.id}`)) return rpg;
+                const localPg = localPagesById.get(rpg.id);
+                return localPg ? { ...rpg, blocks: localPg.blocks, updatedAt: localPg.updatedAt } : rpg;
+              }),
+            };
+          }
+          return nextProj;
         })
       : remote.projects;
+
+  const targetActiveProjectId = hasActiveProject ? prev.activeProjectId : remote.activeProjectId;
+  const targetActiveTab = prev.activeProjectTab ?? remote.activeProjectTab;
+  const targetActiveProjObj = mergedProjects.find((p) => p.id === targetActiveProjectId);
+  let resolvedActiveTab = targetActiveTab;
+  let resolvedActivePageId = prev.activePageId;
+  if (resolvedActiveTab === "page") {
+    const hasPage = Boolean(
+      resolvedActivePageId && targetActiveProjObj?.pages?.some((pg) => pg.id === resolvedActivePageId)
+    );
+    if (!hasPage) {
+      resolvedActivePageId = undefined;
+      resolvedActiveTab = targetActiveProjectId === DEFAULT_PROJECT_ID ? "sessions" : "notebook";
+    }
+  } else {
+    resolvedActivePageId = undefined;
+  }
 
   return {
     ...prev,
     ...remote,
     projects: mergedProjects,
     activeView: prev.activeView === "chat" ? "projects" : prev.activeView,
-    activeProjectId: hasActiveProject ? prev.activeProjectId : remote.activeProjectId,
-    activeProjectTab: prev.activeProjectTab ?? remote.activeProjectTab,
+    activeProjectId: targetActiveProjectId,
+    activeProjectTab: resolvedActiveTab,
+    activePageId: resolvedActivePageId,
     activeSettingsSection: prev.activeSettingsSection,
     activePluginDetailId: prev.activePluginDetailId,
     selectedInboxItemId: prev.selectedInboxItemId,
@@ -462,11 +499,17 @@ export interface ValetContextValue {
   restoreTimelineEvent: (eventId: string) => void;
 
   // Projects & Notebook
-  focusedNotebookBlock: { tick: number; projectId: string; blockId: string } | null;
+  focusedNotebookBlock: {
+    tick: number;
+    projectId: string;
+    pageId?: string | null;
+    blockId: string;
+  } | null;
   selectProject: (projectId: string, tab?: "notebook" | "sessions") => void;
   setProjectTab: (tab: ProjectTab) => void;
   openProjectSession: (chatId: string) => void;
-  returnToProjectNotebook: (highlightBlockId?: string, projectId?: string) => void;
+  openProjectPage: (projectId: string, pageId: string, highlightBlockId?: string) => void;
+  returnToProjectNotebook: (highlightBlockId?: string, projectId?: string, pageId?: string) => void;
   createProject: (params: {
     title: string;
     description?: string;
@@ -479,10 +522,25 @@ export interface ValetContextValue {
     patch: Partial<Pick<Project, "title" | "description" | "icon" | "tags" | "workingDir" | "blocks" | "archived">>
   ) => void;
   deleteProject: (projectId: string) => void;
+  createProjectPage: (params: {
+    projectId: string;
+    parentPageId?: string;
+    title?: string;
+    icon?: ProjectIconKind;
+    blocks?: NotebookBlock[];
+    switchToPage?: boolean;
+  }) => Promise<ProjectPage | null>;
+  updateProjectPage: (
+    projectId: string,
+    pageId: string,
+    patch: Partial<Pick<ProjectPage, "title" | "icon" | "parentPageId" | "blocks">>
+  ) => void;
+  deleteProjectPage: (projectId: string, pageId: string) => void;
   moveChatThreadToProject: (chatId: string, targetProjectId: string) => void;
   syncSessionSummaryToNotebook: (chatId: string) => void;
   spawnSessionFromNotebook: (params: {
     projectId: string;
+    originPageId?: string;
     prompt: string;
     model?: string;
     includeNotebookContext: boolean;
@@ -591,9 +649,11 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [focusedNotebookBlock, setFocusedNotebookBlock] = useState<{
     tick: number;
     projectId: string;
+    pageId?: string | null;
     blockId: string;
   } | null>(null);
   const pendingProjectSaveTimersRef = useRef<Record<string, number>>({});
+  const pendingPageSaveTimersRef = useRef<Record<string, number>>({});
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [nodTick, setNodTick] = useState(0);
   const [lastWorkflowUpdate, setLastWorkflowUpdate] = useState<{
@@ -744,7 +804,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         .then((snap) => {
           if (!active) return;
           const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
-          setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds));
+          const pendingPageKeys = new Set(Object.keys(pendingPageSaveTimersRef.current));
+          setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds, pendingPageKeys));
         })
         .catch(() => {
           // Ignore refresh error
@@ -812,6 +873,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       void promise
         .then((snap) => {
           const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
+          const pendingPageKeys = new Set(Object.keys(pendingPageSaveTimersRef.current));
           if (replaceNav) {
             const normalized = normalizeProjectsState(snap as unknown as ValetSnapshot);
             seenAssistantIdsRef.current = collectAssistantMessageIds(normalized.chatThreads);
@@ -826,7 +888,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setState(normalized);
             return;
           }
-          setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds));
+          setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds, pendingPageKeys));
         })
         .catch((err: unknown) => {
           pushToast(err instanceof Error ? err.message : String(err), "danger");
@@ -2691,6 +2753,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           activeView: "projects",
           activeProjectId: nextProjectId,
           activeProjectTab: "session",
+          activePageId: undefined,
           activeChatId: chatId,
           selectedInboxItemId: null,
           selectedTimelineEventId: null,
@@ -2718,6 +2781,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         activeView: "projects",
         activeProjectId: nextId,
         activeProjectTab: nextTab,
+        activePageId: undefined,
         selectedInboxItemId: null,
         selectedTimelineEventId: null,
         activePluginDetailId: null,
@@ -2730,28 +2794,67 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       ...prev,
       activeView: "projects",
       activeProjectTab: tab,
+      ...(tab !== "page" ? { activePageId: undefined } : {}),
     }));
   }, []);
 
-  const returnToProjectNotebook = useCallback(
-    (highlightBlockId?: string, projectId?: string) => {
-      const cur = stateRef.current;
-      const targetProjectId = projectId || cur.activeProjectId || DEFAULT_PROJECT_ID;
-      setState((prev) => ({
-        ...prev,
-        activeView: "projects",
-        activeProjectId: targetProjectId,
-        activeProjectTab: "notebook",
-      }));
+  const openProjectPage = useCallback(
+    (projectId: string, pageId: string, highlightBlockId?: string) => {
+      setState((prev) => {
+        const proj = prev.projects.find((p) => p.id === projectId && !p.archived);
+        const pg = proj?.pages?.find((item) => item.id === pageId);
+        if (!proj || !pg) return prev;
+        return {
+          ...prev,
+          activeView: "projects",
+          activeProjectId: proj.id,
+          activeProjectTab: "page",
+          activePageId: pg.id,
+          selectedInboxItemId: null,
+          selectedTimelineEventId: null,
+          activePluginDetailId: null,
+        };
+      });
       if (highlightBlockId) {
         setFocusedNotebookBlock({
           tick: Date.now(),
-          projectId: targetProjectId,
+          projectId,
+          pageId,
           blockId: highlightBlockId,
         });
       }
     },
     []
+  );
+
+  const returnToProjectNotebook = useCallback(
+    (highlightBlockId?: string, projectId?: string, pageId?: string) => {
+      const cur = stateRef.current;
+      const targetProjectId = projectId || cur.activeProjectId || DEFAULT_PROJECT_ID;
+      if (pageId) {
+        const proj = cur.projects.find((p) => p.id === targetProjectId);
+        if (proj?.pages?.some((pg) => pg.id === pageId)) {
+          openProjectPage(targetProjectId, pageId, highlightBlockId);
+          return;
+        }
+      }
+      setState((prev) => ({
+        ...prev,
+        activeView: "projects",
+        activeProjectId: targetProjectId,
+        activeProjectTab: "notebook",
+        activePageId: undefined,
+      }));
+      if (highlightBlockId) {
+        setFocusedNotebookBlock({
+          tick: Date.now(),
+          projectId: targetProjectId,
+          pageId: null,
+          blockId: highlightBlockId,
+        });
+      }
+    },
+    [openProjectPage]
   );
 
   const createProject = useCallback(
@@ -2794,12 +2897,14 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         updatedAt: "刚刚",
         createdAt: new Date().toISOString().slice(0, 10),
         blocks: [{ id: makeBlockId("blk"), type: "paragraph", content: "" }],
+        pages: [],
       };
       setState((prev) => ({
         ...prev,
         activeView: "projects",
         activeProjectId: proj.id,
         activeProjectTab: "notebook",
+        activePageId: undefined,
         projects: [...prev.projects, proj],
       }));
       pushToast(`已创建项目「${title}」`, "success");
@@ -2853,7 +2958,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         void Valet.updateProject(payload)
           .then((snap) => {
             const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
-            setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds));
+            const pendingPageKeys = new Set(Object.keys(pendingPageSaveTimersRef.current));
+            setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds, pendingPageKeys));
           })
           .catch((err: unknown) => {
             pushToast(err instanceof Error ? err.message : String(err), "danger");
@@ -2880,6 +2986,12 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         window.clearTimeout(prevTimer);
         delete pendingProjectSaveTimersRef.current[projectId];
       }
+      for (const key of Object.keys(pendingPageSaveTimersRef.current)) {
+        if (key.startsWith(`${projectId}:`)) {
+          window.clearTimeout(pendingPageSaveTimersRef.current[key]);
+          delete pendingPageSaveTimersRef.current[key];
+        }
+      }
       if (isMyGo()) {
         syncFromBackend(Valet.deleteProject(projectId), true);
         pushToast("已删除项目，所属会话已移入默认项目", "success");
@@ -2895,8 +3007,204 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           prev.activeProjectId === projectId ? DEFAULT_PROJECT_ID : prev.activeProjectId,
         activeProjectTab:
           prev.activeProjectId === projectId ? "sessions" : prev.activeProjectTab,
+        activePageId: prev.activeProjectId === projectId ? undefined : prev.activePageId,
       }));
       pushToast("已删除项目，所属会话已移入默认项目", "success");
+    },
+    [pushToast, syncFromBackend]
+  );
+
+  const createProjectPage = useCallback(
+    async (params: {
+      projectId: string;
+      parentPageId?: string;
+      title?: string;
+      icon?: ProjectIconKind;
+      blocks?: NotebookBlock[];
+      switchToPage?: boolean;
+    }): Promise<ProjectPage | null> => {
+      const title = params.title?.trim() || "未命名页面";
+      const icon = params.icon || "file";
+      const switchToPage = Boolean(params.switchToPage);
+      if (isMyGo()) {
+        try {
+          const res = await Valet.createProjectPage({
+            projectId: params.projectId,
+            parentPageId: params.parentPageId?.trim() || undefined,
+            title,
+            icon,
+            blocks: params.blocks,
+            switchToPage,
+          });
+          const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
+          const pendingPageKeys = new Set(Object.keys(pendingPageSaveTimersRef.current));
+          setState((prev) => {
+            const merged = mergeBackendSnapshot(prev, res.snapshot, pendingIds, pendingPageKeys);
+            if (!switchToPage) return merged;
+            return {
+              ...merged,
+              activeView: "projects",
+              activeProjectId: params.projectId,
+              activeProjectTab: "page",
+              activePageId: res.page.id,
+            };
+          });
+          return res.page as unknown as ProjectPage;
+        } catch (err: unknown) {
+          pushToast(err instanceof Error ? err.message : String(err), "danger");
+          return null;
+        }
+      }
+
+      const pageId = `page-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+      const blocks: NotebookBlock[] =
+        params.blocks && params.blocks.length > 0
+          ? params.blocks.map((b) => ({ ...b, id: b.id || makeBlockId("blk") }))
+          : [{ id: makeBlockId("blk"), type: "paragraph", content: "" }];
+      const created: ProjectPage = {
+        id: pageId,
+        parentPageId: params.parentPageId?.trim() || undefined,
+        title,
+        icon,
+        updatedAt: "刚刚",
+        createdAt: new Date().toISOString().slice(0, 10),
+        blocks,
+      };
+      setState((prev) => ({
+        ...prev,
+        projects: prev.projects.map((p) => {
+          if (p.id !== params.projectId) return p;
+          const nextPages = normalizeProjectPages([...(p.pages ?? []), created]);
+          return { ...p, updatedAt: "刚刚", pages: nextPages };
+        }),
+        ...(switchToPage
+          ? {
+              activeView: "projects",
+              activeProjectId: params.projectId,
+              activeProjectTab: "page",
+              activePageId: created.id,
+            }
+          : {}),
+      }));
+      return created;
+    },
+    [pushToast]
+  );
+
+  const updateProjectPage = useCallback(
+    (
+      projectId: string,
+      pageId: string,
+      patch: Partial<Pick<ProjectPage, "title" | "icon" | "parentPageId" | "blocks">>
+    ) => {
+      setState((prev) => ({
+        ...prev,
+        projects: prev.projects.map((p) => {
+          if (p.id !== projectId) return p;
+          const nextPages = normalizeProjectPages(
+            (p.pages ?? []).map((pg) =>
+              pg.id === pageId
+                ? {
+                    ...pg,
+                    ...patch,
+                    updatedAt: "刚刚",
+                  }
+                : pg
+            )
+          );
+          return {
+            ...p,
+            updatedAt: "刚刚",
+            pages: nextPages,
+          };
+        }),
+      }));
+
+      if (!isMyGo()) return;
+
+      const timerKey = `${projectId}:${pageId}`;
+      const payload = {
+        projectId,
+        pageId,
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        ...(patch.icon !== undefined ? { icon: patch.icon } : {}),
+        ...(patch.parentPageId !== undefined ? { parentPageId: patch.parentPageId } : {}),
+        ...(patch.blocks !== undefined ? { blocks: patch.blocks } : {}),
+      };
+
+      const prevTimer = pendingPageSaveTimersRef.current[timerKey];
+      if (prevTimer !== undefined) {
+        window.clearTimeout(prevTimer);
+        delete pendingPageSaveTimersRef.current[timerKey];
+      }
+
+      const flush = () => {
+        delete pendingPageSaveTimersRef.current[timerKey];
+        void Valet.updateProjectPage(payload)
+          .then((snap) => {
+            const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
+            const pendingPageKeys = new Set(Object.keys(pendingPageSaveTimersRef.current));
+            setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds, pendingPageKeys));
+          })
+          .catch((err: unknown) => {
+            pushToast(err instanceof Error ? err.message : String(err), "danger");
+          });
+      };
+
+      if (patch.blocks !== undefined && Object.keys(patch).length === 1) {
+        pendingPageSaveTimersRef.current[timerKey] = window.setTimeout(flush, 420);
+      } else {
+        flush();
+      }
+    },
+    [pushToast]
+  );
+
+  const deleteProjectPage = useCallback(
+    (projectId: string, pageId: string) => {
+      const timerKey = `${projectId}:${pageId}`;
+      const prevTimer = pendingPageSaveTimersRef.current[timerKey];
+      if (prevTimer !== undefined) {
+        window.clearTimeout(prevTimer);
+        delete pendingPageSaveTimersRef.current[timerKey];
+      }
+      if (isMyGo()) {
+        syncFromBackend(Valet.deleteProjectPage(projectId, pageId), true);
+        pushToast("已删除子页面（下级页面已保留并上移）", "success");
+        return;
+      }
+      setState((prev) => {
+        let removedParentId: string | undefined;
+        const projects = prev.projects.map((p) => {
+          if (p.id !== projectId) return p;
+          const target = (p.pages ?? []).find((pg) => pg.id === pageId);
+          removedParentId = target?.parentPageId;
+          const nextPages = (p.pages ?? [])
+            .filter((pg) => pg.id !== pageId)
+            .map((pg) =>
+              pg.parentPageId === pageId ? { ...pg, parentPageId: removedParentId } : pg
+            );
+          return { ...p, updatedAt: "刚刚", pages: nextPages };
+        });
+        const viewingDeleted =
+          prev.activeProjectId === projectId &&
+          prev.activeProjectTab === "page" &&
+          prev.activePageId === pageId;
+        const nextTab: ProjectTab = viewingDeleted
+          ? removedParentId
+            ? "page"
+            : projectId === DEFAULT_PROJECT_ID
+              ? "sessions"
+              : "notebook"
+          : (prev.activeProjectTab ?? "notebook");
+        return {
+          ...prev,
+          projects,
+          activeProjectTab: nextTab,
+          activePageId: viewingDeleted ? removedParentId : prev.activePageId,
+        };
+      });
+      pushToast("已删除子页面（下级页面已保留并上移）", "success");
     },
     [pushToast, syncFromBackend]
   );
@@ -2989,13 +3297,15 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         })
           .then((res) => {
             const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
+            const pendingPageKeys = new Set(Object.keys(pendingPageSaveTimersRef.current));
             setState((prev) => {
-              const merged = mergeBackendSnapshot(prev, res.snapshot, pendingIds);
+              const merged = mergeBackendSnapshot(prev, res.snapshot, pendingIds, pendingPageKeys);
               return {
                 ...merged,
                 activeView: "projects",
                 activeProjectId: targetProjectId,
                 activeProjectTab: "session",
+                activePageId: undefined,
                 activeChatId: res.thread.id,
               };
             });
@@ -3193,7 +3503,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         if (isMyGo()) {
           const snap = await Valet.getSnapshot();
           const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
-          setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds));
+          const pendingPageKeys = new Set(Object.keys(pendingPageSaveTimersRef.current));
+          setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds, pendingPageKeys));
         } else {
           setState((prev) => {
             let nextInbox = outcome.createdInboxItem
@@ -3343,9 +3654,29 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     ? [outcome.createdEvent.id, ...t.linkedEventIds]
                     : t.linkedEventIds,
                   messages: exists
-                    ? t.messages.map((m) =>
-                        m.id === outcome.replyMessage.id ? outcome.replyMessage : m
-                      )
+                    ? t.messages.map((m) => {
+                        if (m.id !== outcome.replyMessage.id) return m;
+                        const merged = { ...outcome.replyMessage };
+                        if ((m.steps?.length ?? 0) > (merged.steps?.length ?? 0)) {
+                          merged.steps = m.steps;
+                        }
+                        if ((m.workDurationMs ?? 0) > (merged.workDurationMs ?? 0)) {
+                          merged.workDurationMs = m.workDurationMs;
+                        }
+                        if (!merged.thinkingSummary && m.thinkingSummary) {
+                          merged.thinkingSummary = m.thinkingSummary;
+                        }
+                        if (!merged.processTable && m.processTable) {
+                          merged.processTable = m.processTable;
+                        }
+                        if (!merged.pluginDraft && m.pluginDraft) {
+                          merged.pluginDraft = m.pluginDraft;
+                        }
+                        if (!merged.content.trim() && m.content.trim()) {
+                          merged.content = m.content;
+                        }
+                        return merged;
+                      })
                     : [...t.messages, outcome.replyMessage],
                 };
               }),
@@ -3439,6 +3770,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const spawnSessionFromNotebook = useCallback(
     async (params: {
       projectId: string;
+      originPageId?: string;
       prompt: string;
       model?: string;
       includeNotebookContext: boolean;
@@ -3455,6 +3787,10 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       const cur = stateRef.current;
       const proj = cur.projects.find((p) => p.id === params.projectId) ?? cur.projects[0];
       const projectId = proj?.id ?? DEFAULT_PROJECT_ID;
+      const originPage =
+        params.originPageId && proj
+          ? proj.pages?.find((pg) => pg.id === params.originPageId)
+          : undefined;
       const model = params.model || cur.preferences.models.primary || "claude-opus-4";
 
       const attachments: ChatAttachment[] = [];
@@ -3468,6 +3804,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
               originSection: params.originSection,
               originBeforeText: params.originBeforeText,
               originAfterText: params.originAfterText,
+              page: originPage,
+              allProjects: cur.projects,
             }
           )
         );
@@ -3481,6 +3819,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             projectId,
             title: titlePreview,
             model,
+            originPageId: originPage?.id,
             originBlockId: params.originBlockId,
             originSection: params.originSection,
             notebookContextInjected: params.includeNotebookContext,
@@ -3488,7 +3827,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           });
           createdThread = res.thread as unknown as ChatThread;
           const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
-          setState((prev) => mergeBackendSnapshot(prev, res.snapshot, pendingIds));
+          const pendingPageKeys = new Set(Object.keys(pendingPageSaveTimersRef.current));
+          setState((prev) => mergeBackendSnapshot(prev, res.snapshot, pendingIds, pendingPageKeys));
         } catch (err: unknown) {
           pushToast(err instanceof Error ? err.message : String(err), "danger");
           return null;
@@ -3503,6 +3843,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           timelineActionCount: 0,
           linkedEventIds: [],
           updatedAt: "刚刚",
+          originPageId: originPage?.id,
           originBlockId: params.originBlockId,
           originSection: params.originSection,
           notebookContextInjected: params.includeNotebookContext,
@@ -3516,6 +3857,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 activeView: "projects",
                 activeProjectId: projectId,
                 activeProjectTab: "session",
+                activePageId: undefined,
                 activeChatId: createdThread.id,
               }
             : {}),
@@ -4027,6 +4369,10 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         window.clearTimeout(t);
       }
       pendingProjectSaveTimersRef.current = {};
+      for (const t of Object.values(pendingPageSaveTimersRef.current)) {
+        window.clearTimeout(t);
+      }
+      pendingPageSaveTimersRef.current = {};
     };
   }, []);
 
@@ -4035,6 +4381,10 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       window.clearTimeout(t);
     }
     pendingProjectSaveTimersRef.current = {};
+    for (const t of Object.values(pendingPageSaveTimersRef.current)) {
+      window.clearTimeout(t);
+    }
+    pendingPageSaveTimersRef.current = {};
     composerDraftsRef.current = {};
     setComposerQuoteSignal(null);
     setTimelineFocusSignal(null);
@@ -4129,10 +4479,14 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       selectProject,
       setProjectTab,
       openProjectSession,
+      openProjectPage,
       returnToProjectNotebook,
       createProject,
       updateProject,
       deleteProject,
+      createProjectPage,
+      updateProjectPage,
+      deleteProjectPage,
       moveChatThreadToProject,
       syncSessionSummaryToNotebook,
       spawnSessionFromNotebook,
@@ -4197,10 +4551,12 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       composerQuoteSignal,
       createNewChat,
       createProject,
+      createProjectPage,
       deleteAutomationRule,
       deleteMcpServer,
       deleteMemory,
       deleteProject,
+      deleteProjectPage,
       dismissInboxItem,
       dismissToast,
       executeTimelineEventActions,
@@ -4223,6 +4579,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       nodTick,
       openInboxItemInTimeline,
       openPluginDetail,
+      openProjectPage,
       openProjectSession,
       openSettingsSection,
       performProcessAction,
@@ -4289,6 +4646,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       updatePluginWorkflow,
       updatePreferences,
       updateProject,
+      updateProjectPage,
       updateProvider,
     ]
   );

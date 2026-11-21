@@ -3,6 +3,11 @@ import { useValet } from "../store/ValetContext";
 import { getDarkThemeMeta, getLightThemeMeta } from "../constants/themes";
 import { DEFAULT_PROJECT_ID, type AppView } from "../types/valet";
 import { countUnreadThreads } from "../utils/chatUnread";
+import {
+  buildPageTree,
+  getPageBreadcrumbs,
+  type ProjectPageTreeNode,
+} from "../utils/notebookPages";
 import { CreateProjectModal } from "./projects/CreateProjectModal";
 import { DutyPulse } from "./ui/DutyPulse";
 import {
@@ -11,6 +16,7 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   ClockIcon,
+  FileTextIcon,
   InboxIcon,
   MoonIcon,
   PauseIcon,
@@ -61,6 +67,8 @@ export const Sidebar: React.FC = () => {
     setActiveView,
     openSettingsSection,
     selectProject,
+    openProjectPage,
+    createProjectPage,
     openProjectSession,
     createNewChat,
     selectChatThread,
@@ -76,6 +84,7 @@ export const Sidebar: React.FC = () => {
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>(() => ({
     [DEFAULT_PROJECT_ID]: true,
   }));
+  const [expandedPages, setExpandedPages] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     if (!state.activeProjectId) return;
@@ -83,6 +92,24 @@ export const Sidebar: React.FC = () => {
       prev[state.activeProjectId] === false ? prev : { ...prev, [state.activeProjectId]: true }
     );
   }, [state.activeProjectId]);
+
+  useEffect(() => {
+    if (!state.activeProjectId || !state.activePageId) return;
+    const activeProj = state.projects.find((p) => p.id === state.activeProjectId);
+    if (!activeProj) return;
+    const crumbs = getPageBreadcrumbs(activeProj, state.activePageId);
+    if (crumbs.length <= 1) return;
+    setExpandedPages((prev) => {
+      let next: Record<string, boolean> | null = null;
+      for (const crumb of crumbs.slice(0, -1)) {
+        if (prev[crumb.id] === undefined) {
+          if (!next) next = { ...prev };
+          next[crumb.id] = true;
+        }
+      }
+      return next ?? prev;
+    });
+  }, [state.activePageId, state.activeProjectId, state.projects]);
 
   const [isSystemDark, setIsSystemDark] = useState<boolean>(() =>
     typeof window !== "undefined"
@@ -557,13 +584,106 @@ export const Sidebar: React.FC = () => {
               unreadChatCounts,
               projectThreads
             );
+            const pageTree = buildPageTree(project.pages);
+            const projectPageCount = project.pages?.length ?? 0;
+            const totalChildrenCount = projectPageCount + projectThreads.length;
             const isExpanded = expandedProjects[project.id] ?? project.id === state.activeProjectId;
             const inProjectsView =
               state.activeView === "projects" || state.activeView === "chat";
             const isProjectSelected =
               inProjectsView &&
               state.activeProjectId === project.id &&
-              state.activeProjectTab !== "session";
+              state.activeProjectTab !== "session" &&
+              state.activeProjectTab !== "page";
+
+            const renderPageTreeNodes = (
+              nodes: ProjectPageTreeNode[],
+              depth = 0
+            ): React.ReactNode =>
+              nodes.map((node) => {
+                const { page, children } = node;
+                const hasChildren = children.length > 0;
+                const isPageExpanded = expandedPages[page.id] ?? true;
+                const isPageActive =
+                  inProjectsView &&
+                  state.activeProjectId === project.id &&
+                  state.activeProjectTab === "page" &&
+                  state.activePageId === page.id;
+
+                return (
+                  <React.Fragment key={page.id}>
+                    <div
+                      style={depth > 0 ? { paddingLeft: `${Math.min(depth, 4) * 10}px` } : undefined}
+                      className={`group flex h-[28px] w-full shrink-0 items-center rounded-[6px] transition-colors ${
+                        isPageActive
+                          ? "bg-[var(--bg-hover)] font-semibold text-[var(--ink-strong)]"
+                          : "text-[var(--ink-secondary)] hover:bg-[var(--bg-hover)]/50 hover:text-[var(--ink-strong)]"
+                      }`}
+                    >
+                      {hasChildren ? (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setExpandedPages((prev) => ({
+                              ...prev,
+                              [page.id]: !isPageExpanded,
+                            }));
+                          }}
+                          aria-label={isPageExpanded ? "收起子页面" : "展开子页面"}
+                          className="ml-1 flex h-4 w-3 shrink-0 cursor-pointer items-center justify-center text-[var(--ink-subtle)] hover:text-[var(--ink-strong)]"
+                        >
+                          {isPageExpanded ? (
+                            <ChevronDownIcon size={10} />
+                          ) : (
+                            <ChevronRightIcon size={10} />
+                          )}
+                        </button>
+                      ) : (
+                        <span className="ml-1 w-3 shrink-0" />
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => openProjectPage(project.id, page.id)}
+                        className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 pr-1 pl-1 text-left text-[12px] leading-[16px]"
+                      >
+                        <FileTextIcon
+                          size={12}
+                          className={`shrink-0 ${
+                            isPageActive ? "text-[var(--ink-primary)]" : "text-[var(--ink-muted)]"
+                          }`}
+                        />
+                        <span className="min-w-0 flex-1 truncate">
+                          {page.title || "未命名页面"}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setExpandedProjects((prev) => ({ ...prev, [project.id]: true }));
+                          setExpandedPages((prev) => ({ ...prev, [page.id]: true }));
+                          void createProjectPage({
+                            projectId: project.id,
+                            parentPageId: page.id,
+                            switchToPage: true,
+                          });
+                        }}
+                        title={`在「${page.title || "未命名页面"}」下新建子页面`}
+                        aria-label={`在「${page.title || "未命名页面"}」下新建子页面`}
+                        className="mr-1 hidden h-[20px] w-[20px] shrink-0 cursor-pointer items-center justify-center rounded-[5px] text-[var(--ink-muted)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] group-hover:flex"
+                      >
+                        <PlusIcon size={10.5} />
+                      </button>
+                    </div>
+                    {hasChildren &&
+                      isPageExpanded &&
+                      renderPageTreeNodes(children, depth + 1)}
+                  </React.Fragment>
+                );
+              });
 
             return (
               <div key={project.id} className="flex flex-col gap-[1px]">
@@ -621,29 +741,51 @@ export const Sidebar: React.FC = () => {
                       {projectUnreadCount > 99 ? "99+" : projectUnreadCount}
                     </span>
                   ) : (
-                    <span className="w-4 shrink-0 text-right font-mono text-[10px] text-[var(--ink-subtle)] group-hover:hidden">
-                      {projectThreads.length}
+                    <span
+                      className="w-4 shrink-0 text-right font-mono text-[10px] text-[var(--ink-subtle)] group-hover:hidden"
+                      title={`${projectPageCount} 个页面 · ${projectThreads.length} 个对话`}
+                    >
+                      {totalChildrenCount}
                     </span>
                   )}
 
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setExpandedProjects((prev) => ({ ...prev, [project.id]: true }));
-                      createNewChat(project.id);
-                    }}
-                    title={`在「${project.title}」中新建对话`}
-                    aria-label={`在「${project.title}」中新建对话`}
-                    className="hidden h-[20px] w-[20px] shrink-0 cursor-pointer items-center justify-center rounded-[5px] text-[var(--ink-muted)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] group-hover:flex"
-                  >
-                    <PlusIcon size={11} />
-                  </button>
+                  <div className="hidden shrink-0 items-center gap-0.5 group-hover:flex">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setExpandedProjects((prev) => ({ ...prev, [project.id]: true }));
+                        void createProjectPage({
+                          projectId: project.id,
+                          switchToPage: true,
+                        });
+                      }}
+                      title={`在「${project.title}」中新建页面`}
+                      aria-label={`在「${project.title}」中新建页面`}
+                      className="flex h-[20px] w-[20px] cursor-pointer items-center justify-center rounded-[5px] text-[var(--ink-muted)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                    >
+                      <FileTextIcon size={11} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setExpandedProjects((prev) => ({ ...prev, [project.id]: true }));
+                        createNewChat(project.id);
+                      }}
+                      title={`在「${project.title}」中新建对话`}
+                      aria-label={`在「${project.title}」中新建对话`}
+                      className="flex h-[20px] w-[20px] cursor-pointer items-center justify-center rounded-[5px] text-[var(--ink-muted)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                    >
+                      <PlusIcon size={11} />
+                    </button>
+                  </div>
                 </div>
 
-                {isExpanded && projectThreads.length > 0 && (
+                {isExpanded && (pageTree.length > 0 || projectThreads.length > 0) && (
                   <div className="pl-[13px]">
                     <div className="flex flex-col gap-[1px] border-l border-[var(--border-control)] pl-2">
+                      {renderPageTreeNodes(pageTree)}
                       {projectThreads.map((thread) => {
                         const isSessionActive =
                           inProjectsView &&

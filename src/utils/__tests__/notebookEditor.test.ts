@@ -12,6 +12,7 @@ import {
   getBlockRangeIds,
   indentBlockSubtree,
   indentSelectedBlocks,
+  isNonTextNotebookBlockType,
   mapRenderedOffsetToRawOffset,
   MAX_NOTEBOOK_INDENT,
   moveBlockSubtree,
@@ -431,5 +432,80 @@ describe("notebookEditor multi-block selection operations", () => {
       ["todo", "Three", 0],
     ]);
     expect(replaced!.focusCursorPos).toBe("Sub item".length);
+  });
+
+  it("treats page_ref blocks as non-text cards across conversion, deletion, and movement", () => {
+    expect(isNonTextNotebookBlockType("page_ref")).toBe(true);
+    expect(isNonTextNotebookBlockType("session_ref")).toBe(true);
+    expect(isNonTextNotebookBlockType("divider")).toBe(true);
+    expect(isNonTextNotebookBlockType("paragraph")).toBe(false);
+
+    const blocks: NotebookBlock[] = [
+      { id: "p1", type: "paragraph", content: "Intro" },
+      { id: "ref1", type: "page_ref", pageId: "pg-1", content: "Sub Page" },
+      { id: "p2", type: "paragraph", content: "Outro" },
+    ];
+
+    const converted = convertSelectedBlocks(blocks, new Set(["p1", "ref1"]), "h2");
+    expect(converted).not.toBe(null);
+    expect(converted![0]!.type).toBe("h2");
+    expect(converted![1]!.type).toBe("page_ref");
+    expect(converted![1]!.pageId).toBe("pg-1");
+
+    const moved = moveSelectedBlocks(blocks, new Set(["ref1"]), 1);
+    expect(moved).not.toBe(null);
+    expect(moved!.map((b) => b.id)).toEqual(["p1", "p2", "ref1"]);
+
+    const deleted = deleteSelectedBlocks(blocks, new Set(["ref1"]));
+    expect(deleted).not.toBe(null);
+    expect(deleted!.blocks.map((b) => b.id)).toEqual(["p1", "p2"]);
+  });
+
+  it("parses, pastes, preserves, and maps offsets for GFM tables, [[page:...]] tokens, and __bold__", () => {
+    const doc = parseMarkdownToBlocks(
+      [
+        "# 架构对比",
+        "",
+        "前置说明",
+        "",
+        "| 维度 | AOA | Super Agent |",
+        "| :--- | --- | ---: |",
+        "| **定位** | 后台守护 | 单一入口 |",
+        "",
+        "后置总结",
+      ].join("\n")
+    );
+    expect(doc.map((b) => b.type)).toEqual(["h1", "paragraph", "table", "paragraph"]);
+    expect(doc[2]!.content).toBe(
+      "| 维度 | AOA | Super Agent |\n| :--- | --- | ---: |\n| **定位** | 后台守护 | 单一入口 |"
+    );
+
+    // Pasting a GFM table in the middle of a paragraph splits cleanly
+    const base: NotebookBlock[] = [
+      { id: "p1", type: "paragraph", content: "开头结尾" },
+    ];
+    const pasted = applyMarkdownPasteToBlocks({
+      blocks: base,
+      blockIndex: 0,
+      selStart: 2,
+      selEnd: 2,
+      pastedText: "| Col1 | Col2 |\n| --- | --- |\n| V1 | V2 |",
+    });
+    expect(pasted).not.toBe(null);
+    expect(pasted!.blocks.map((b) => [b.type, b.content])).toEqual([
+      ["paragraph", "开头"],
+      ["table", "| Col1 | Col2 |\n| --- | --- |\n| V1 | V2 |"],
+      ["paragraph", "结尾"],
+    ]);
+
+    // convertSelectedBlocks preserves table blocks untouched
+    const converted = convertSelectedBlocks(pasted!.blocks, new Set(pasted!.blocks.map((b) => b.id)), "h2");
+    expect(converted).not.toBe(null);
+    expect(converted!.map((b) => b.type)).toEqual(["h2", "table", "h2"]);
+
+    // mapRenderedOffsetToRawOffset skips [[page:...]] refs and maps __bold__ accurately
+    const rawBold = "__重点__ 内容 [[page:pg-1]]";
+    expect(mapRenderedOffsetToRawOffset(rawBold, 2)).toBe(4);
+    expect(mapRenderedOffsetToRawOffset(rawBold, 4)).toBe(8);
   });
 });

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -477,6 +478,217 @@ func ClampNotebookBlockIndent(blockType string, indent int) int {
 	}
 }
 
+var (
+	storeTableDelimRE1  = regexp.MustCompile(`^\|?(?:\s*:?-{1,}:?\s*\|)+\s*(?::?-{1,}:?\s*\|?)?$`)
+	storeTableDelimRE2  = regexp.MustCompile(`^\|(?:\s*:?-{1,}:?\s*\|)+$`)
+	storeTableFenceRE   = regexp.MustCompile(`^\s{0,3}(?:\x60{3}|~~~)`)
+	storeTableRuleRE    = regexp.MustCompile(`^\s{0,3}(?:[-*_]\s*){3,}$`)
+	storeTableHeadingRE = regexp.MustCompile(`^\s{0,3}#{1,6}\s`)
+	storeTableQuoteRE   = regexp.MustCompile(`^\s{0,3}>`)
+	storeTableListRE    = regexp.MustCompile(`^\s*(?:[-*+]|\d+[.)])\s`)
+	storeTableTodoRE    = regexp.MustCompile(`^\s*(?:[-*+]\s)?\[[xX\s]?\]\s`)
+)
+
+func isMarkdownTableDelimiterLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.Contains(trimmed, "|") || !strings.Contains(trimmed, "-") {
+		return false
+	}
+	return storeTableDelimRE1.MatchString(trimmed) || storeTableDelimRE2.MatchString(trimmed)
+}
+
+func isMarkdownTableRowCandidate(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || !strings.Contains(trimmed, "|") {
+		return false
+	}
+	if storeTableFenceRE.MatchString(line) ||
+		storeTableRuleRE.MatchString(line) ||
+		storeTableHeadingRE.MatchString(line) ||
+		storeTableQuoteRE.MatchString(line) ||
+		storeTableListRE.MatchString(line) ||
+		storeTableTodoRE.MatchString(line) {
+		return false
+	}
+	return true
+}
+
+func isValidMarkdownTableContent(content string) bool {
+	norm := strings.ReplaceAll(strings.ReplaceAll(content, "\r\n", "\n"), "\r", "\n")
+	rawLines := strings.Split(norm, "\n")
+	start := 0
+	end := len(rawLines)
+	for start < end && strings.TrimSpace(rawLines[start]) == "" {
+		start++
+	}
+	for end > start && strings.TrimSpace(rawLines[end-1]) == "" {
+		end--
+	}
+	lines := rawLines[start:end]
+	if len(lines) < 2 {
+		return false
+	}
+	if !strings.Contains(lines[0], "|") || !isMarkdownTableDelimiterLine(lines[1]) {
+		return false
+	}
+	for _, bodyLine := range lines[2:] {
+		if strings.TrimSpace(bodyLine) == "" {
+			continue
+		}
+		if !strings.Contains(bodyLine, "|") {
+			return false
+		}
+	}
+	return true
+}
+
+func coalesceTableParagraphBlocks(blocks []types.NotebookBlock) []types.NotebookBlock {
+	if len(blocks) == 0 {
+		return blocks
+	}
+	out := make([]types.NotebookBlock, 0, len(blocks))
+	for i := 0; i < len(blocks); i++ {
+		cur := blocks[i]
+		if cur.Type != "paragraph" {
+			out = append(out, cur)
+			continue
+		}
+
+		// Single multiline paragraph containing a GFM table
+		if strings.Contains(cur.Content, "\n") && isValidMarkdownTableContent(cur.Content) {
+			cur.Type = "table"
+			cur.Indent = 0
+			out = append(out, cur)
+			continue
+		}
+
+		// Legacy split consecutive paragraph blocks forming a GFM table
+		if !isMarkdownTableRowCandidate(cur.Content) {
+			out = append(out, cur)
+			continue
+		}
+
+		delimIdx := -1
+		if i+1 < len(blocks) && blocks[i+1].Type == "paragraph" && isMarkdownTableDelimiterLine(blocks[i+1].Content) {
+			delimIdx = i + 1
+		} else if i+2 < len(blocks) &&
+			blocks[i+1].Type == "paragraph" && strings.TrimSpace(blocks[i+1].Content) == "" &&
+			blocks[i+2].Type == "paragraph" && isMarkdownTableDelimiterLine(blocks[i+2].Content) {
+			delimIdx = i + 2
+		}
+
+		if delimIdx == -1 {
+			out = append(out, cur)
+			continue
+		}
+
+		requireLeadingPipe := strings.HasPrefix(strings.TrimSpace(cur.Content), "|") ||
+			strings.HasPrefix(strings.TrimSpace(blocks[delimIdx].Content), "|")
+		tableLines := []string{strings.TrimSpace(cur.Content), strings.TrimSpace(blocks[delimIdx].Content)}
+		cursor := delimIdx + 1
+		if cursor+1 < len(blocks) &&
+			blocks[cursor].Type == "paragraph" && strings.TrimSpace(blocks[cursor].Content) == "" &&
+			blocks[cursor+1].Type == "paragraph" && isMarkdownTableRowCandidate(blocks[cursor+1].Content) &&
+			(!requireLeadingPipe || strings.HasPrefix(strings.TrimSpace(blocks[cursor+1].Content), "|")) {
+			cursor++
+		}
+		for cursor < len(blocks) {
+			rowBlk := blocks[cursor]
+			if rowBlk.Type != "paragraph" || !isMarkdownTableRowCandidate(rowBlk.Content) {
+				break
+			}
+			trimmedRow := strings.TrimSpace(rowBlk.Content)
+			if requireLeadingPipe && !strings.HasPrefix(trimmedRow, "|") {
+				break
+			}
+			tableLines = append(tableLines, trimmedRow)
+			cursor++
+		}
+
+		joined := strings.Join(tableLines, "\n")
+		if !isValidMarkdownTableContent(joined) {
+			out = append(out, cur)
+			continue
+		}
+
+		cur.Type = "table"
+		cur.Content = joined
+		cur.Indent = 0
+		out = append(out, cur)
+		i = cursor - 1
+	}
+	return out
+}
+
+func normalizeNotebookBlocksSlice(blocks []types.NotebookBlock, fallbackPrefix string) []types.NotebookBlock {
+	if len(blocks) == 0 {
+		return []types.NotebookBlock{{ID: "blk-" + fallbackPrefix + "-1", Type: "paragraph", Content: ""}}
+	}
+	normBlocks := make([]types.NotebookBlock, len(blocks))
+	copy(normBlocks, blocks)
+	for j := range normBlocks {
+		normBlocks[j].Indent = ClampNotebookBlockIndent(normBlocks[j].Type, normBlocks[j].Indent)
+	}
+	return coalesceTableParagraphBlocks(normBlocks)
+}
+
+func normalizeProjectPagesSlice(pages []types.ProjectPage) []types.ProjectPage {
+	if len(pages) == 0 {
+		return []types.ProjectPage{}
+	}
+	seen := make(map[string]bool, len(pages))
+	out := make([]types.ProjectPage, 0, len(pages))
+	for _, rawPage := range pages {
+		pid := strings.TrimSpace(rawPage.ID)
+		if pid == "" || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		rawPage.ID = pid
+		rawPage.ParentPageID = strings.TrimSpace(rawPage.ParentPageID)
+		if strings.TrimSpace(rawPage.Title) == "" {
+			rawPage.Title = "未命名页面"
+		}
+		if strings.TrimSpace(rawPage.Icon) == "" {
+			rawPage.Icon = "file"
+		}
+		rawPage.Blocks = normalizeNotebookBlocksSlice(rawPage.Blocks, pid)
+		out = append(out, rawPage)
+	}
+	parentByID := make(map[string]string, len(out))
+	for _, pg := range out {
+		parentByID[pg.ID] = pg.ParentPageID
+	}
+	for i := range out {
+		parentID := out[i].ParentPageID
+		if parentID == "" || parentID == out[i].ID {
+			out[i].ParentPageID = ""
+			continue
+		}
+		// Walk ancestor chain to clear orphaned or cyclic parent pointers
+		visited := map[string]bool{out[i].ID: true}
+		cur := parentID
+		valid := true
+		for cur != "" {
+			if visited[cur] {
+				valid = false
+				break
+			}
+			visited[cur] = true
+			nextParent, ok := parentByID[cur]
+			if !ok {
+				valid = false
+				break
+			}
+			cur = nextParent
+		}
+		if !valid {
+			out[i].ParentPageID = ""
+		}
+	}
+	return out
+}
+
 func normalizeProjectsSnapshot(s *types.ValetSnapshot) {
 	var defaultProj *types.Project
 	others := make([]types.Project, 0, len(s.Projects))
@@ -488,16 +700,8 @@ func normalizeProjectsSnapshot(s *types.ValetSnapshot) {
 		if p.Tags == nil {
 			p.Tags = []string{}
 		}
-		if len(p.Blocks) == 0 {
-			p.Blocks = []types.NotebookBlock{{ID: "blk-" + p.ID + "-1", Type: "paragraph", Content: ""}}
-		} else {
-			normBlocks := make([]types.NotebookBlock, len(p.Blocks))
-			copy(normBlocks, p.Blocks)
-			for j := range normBlocks {
-				normBlocks[j].Indent = ClampNotebookBlockIndent(normBlocks[j].Type, normBlocks[j].Indent)
-			}
-			p.Blocks = normBlocks
-		}
+		p.Blocks = normalizeNotebookBlocksSlice(p.Blocks, p.ID)
+		p.Pages = normalizeProjectPagesSlice(p.Pages)
 		if p.ID == types.DefaultProjectID {
 			p.IsDefault = true
 			p.Archived = false
@@ -521,8 +725,14 @@ func normalizeProjectsSnapshot(s *types.ValetSnapshot) {
 	s.Projects = append([]types.Project{*defaultProj}, others...)
 
 	validProjectIDs := make(map[string]bool, len(s.Projects))
+	pagesByProjectID := make(map[string]map[string]bool, len(s.Projects))
 	for _, p := range s.Projects {
 		validProjectIDs[p.ID] = true
+		pgSet := make(map[string]bool, len(p.Pages))
+		for _, pg := range p.Pages {
+			pgSet[pg.ID] = true
+		}
+		pagesByProjectID[p.ID] = pgSet
 	}
 
 	for i := range s.ChatThreads {
@@ -543,13 +753,26 @@ func normalizeProjectsSnapshot(s *types.ValetSnapshot) {
 	}
 
 	switch s.ActiveProjectTab {
-	case "notebook", "sessions", "session":
+	case "notebook", "sessions", "session", "page":
 	default:
 		if s.ActiveProjectID == types.DefaultProjectID {
 			s.ActiveProjectTab = "sessions"
 		} else {
 			s.ActiveProjectTab = "notebook"
 		}
+	}
+
+	if s.ActiveProjectTab == "page" {
+		if !pagesByProjectID[s.ActiveProjectID][s.ActivePageID] {
+			s.ActivePageID = ""
+			if s.ActiveProjectID == types.DefaultProjectID {
+				s.ActiveProjectTab = "sessions"
+			} else {
+				s.ActiveProjectTab = "notebook"
+			}
+		}
+	} else {
+		s.ActivePageID = ""
 	}
 }
 

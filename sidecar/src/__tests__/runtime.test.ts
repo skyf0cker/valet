@@ -166,6 +166,8 @@ class FakeHostBridge implements HostBridge {
   readonly itemResolveCalls: Record<string, unknown>[] = [];
   readonly notebookReadCalls: Record<string, unknown>[] = [];
   readonly notebookEditCalls: Record<string, unknown>[] = [];
+  readonly outboxNotifications: Array<Record<string, unknown>> = [];
+  readonly workflowUpdates: Array<Record<string, unknown>> = [];
   readonly streamEvents: ChatStreamPayload[] = [];
   private streamListeners: Array<(payload: ChatStreamPayload) => void> = [];
 
@@ -321,6 +323,14 @@ class FakeHostBridge implements HostBridge {
       for (const listener of this.streamListeners) {
         listener(payload);
       }
+      return;
+    }
+    if (method === "host.outboxNotify" && params && typeof params === "object") {
+      this.outboxNotifications.push(params as Record<string, unknown>);
+      return;
+    }
+    if (method === "host.workflowUpdate" && params && typeof params === "object") {
+      this.workflowUpdates.push(params as Record<string, unknown>);
     }
   }
 }
@@ -1971,6 +1981,161 @@ triggers:
 
     expect(bridge.notebookEditCalls.length).toBe(2);
     expect(sawTaintError).toContain("安全边界拒绝");
+
+    await rt.close();
+  });
+
+  it("deduplicates workflow kind='both' notify into one timeline event with full body and avoids duplicate turn_limit bubbles under steer", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-wf-steer-dedup-"));
+    tempDirs.push(dir);
+    const bridge = new FakeHostBridge();
+    const state = makeBaseState(dir);
+    state.preferences.maxStepsPerTask = 2;
+
+    const wfPlugin: PluginState = {
+      id: "x-tweet-watch",
+      slug: "x-tweet-watch",
+      name: "X 推文巡检",
+      tagline: "定时巡检 X 推文",
+      description: "测试 workflow notify 去重",
+      version: "1.0.0",
+      bundleId: "local.valet.x-tweet-watch",
+      source: "local",
+      enabled: true,
+      installed: true,
+      events: [
+        { id: "x.timeline_tick", description: "tick", policy: "auto", count24h: 0 },
+      ],
+      config: { values: {} },
+      manifestYaml: `id: local.valet.x-tweet-watch
+name: X 推文巡检
+execution_mode: workflow
+triggers:
+  - id: x.timeline_tick
+    sensor: manual
+`,
+      executionMode: "workflow",
+      workflowYaml: `
+version: 1
+nodes:
+  - id: trig
+    type: trigger
+  - id: draft
+    type: transform
+    config:
+      output:
+        report: |
+          ## X 巡检结果
+          1. **@karpathy**: 发布了推理优化长文
+          2. **@simonw**: 更新了 SQLite CLI 工具
+  - id: notify_report
+    type: notify
+    config:
+      title: "X 巡检：2 条新推文"
+      message: "{{steps.draft.output.report}}"
+      level: info
+      kind: both
+edges:
+  - from: trig
+    to: draft
+  - from: draft
+    to: notify_report
+`,
+    };
+    state.plugins.push(wfPlugin);
+
+    const rt = new ValetDurableRuntime(bridge);
+    await rt.init({ state, dbPath: join(dir, "pi.sqlite") });
+
+    // 1. Workflow notify kind: "both" sends outboxNotify with skipTimeline=true and ONE workflow.notify timeline record
+    const wfRes = await rt.dispatchPluginEvent({
+      pluginId: "x-tweet-watch",
+      eventCode: "x.timeline_tick",
+      simulated: true,
+    });
+    expect(wfRes.workflowRunId).toBeDefined();
+
+    // Wait briefly until workflow completes
+    const wfDeadline = Date.now() + 10_000;
+    while (
+      Date.now() < wfDeadline &&
+      !bridge.recorded.some((r) => r.eventCode === "workflow.notify")
+    ) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+
+    const notifyRecs = bridge.recorded.filter((r) => r.eventCode === "workflow.notify");
+    expect(notifyRecs.length).toBe(1);
+    expect(notifyRecs[0]?.pluginId).toBe("x-tweet-watch");
+    expect(notifyRecs[0]?.pluginName).toBe("X 推文巡检");
+    expect(notifyRecs[0]?.title).toBe("X 巡检：2 条新推文");
+    expect(String(notifyRecs[0]?.summary ?? "")).toContain("X 巡检结果");
+    expect(String(notifyRecs[0]?.reasoning ?? "")).toContain("@karpathy");
+    expect(String(notifyRecs[0]?.reasoning ?? "")).toContain("@simonw");
+
+    expect(bridge.outboxNotifications.length).toBe(1);
+    expect(bridge.outboxNotifications[0]?.skipTimeline).toBe(true);
+    expect(bridge.outboxNotifications[0]?.pluginId).toBe("x-tweet-watch");
+    expect(bridge.outboxNotifications[0]?.pluginName).toBe("X 推文巡检");
+    expect(bridge.outboxNotifications[0]?.workflowRunId).toBe(wfRes.workflowRunId);
+
+    // 2. Concurrent whenBusy: "steer" hitting maxTurns=1 (turn_limit) yields matching deterministic reply ID & helpful message
+    const origCallHost = bridge.callHost.bind(bridge);
+    let markToolEntered!: () => void;
+    const toolEntered = new Promise<void>((resolve) => {
+      markToolEntered = resolve;
+    });
+    bridge.callHost = async <T = unknown>(
+      method: string,
+      params: Record<string, unknown> = {},
+    ): Promise<T> => {
+      if (method === "host.kernel.overview") {
+        markToolEntered();
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return origCallHost<T>(method, params);
+    };
+
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [fauxToolCall("system_overview", {})],
+          { stopReason: "toolUse" },
+        ),
+      () =>
+        fauxAssistantMessage(
+          [fauxToolCall("bash", { command: "pwd", reason: "查看当前目录" })],
+          { stopReason: "toolUse" },
+        ),
+    ]);
+
+    const p1 = rt.sendChat({
+      chatId: "chat-steer-turnlimit",
+      prompt: "创建一个 X 推文巡检插件",
+      model: "claude-opus-4",
+      requestId: "req-tl-1",
+      interactive: true,
+    });
+    await toolEntered;
+    const p2 = rt.sendChat({
+      chatId: "chat-steer-turnlimit",
+      prompt: "ego lite 浏览器",
+      model: "claude-opus-4",
+      requestId: "req-tl-2",
+      whenBusy: "steer",
+      interactive: true,
+    });
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1.replyMessage.id).toBe(r2.replyMessage.id);
+    expect(r1.replyMessage.id.startsWith("msg-unanswered-")).toBe(true);
+    expect(r1.replyMessage.content).toContain("最大步数上限");
+    expect(r1.replyMessage.content).toContain("继续");
+
+    const doneStreams = bridge.streamEvents.filter(
+      (ev) => ev.chatId === "chat-steer-turnlimit" && ev.phase === "done",
+    );
+    expect(doneStreams.length).toBe(1);
 
     await rt.close();
   });

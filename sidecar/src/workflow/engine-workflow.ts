@@ -416,6 +416,73 @@ function asUnknownRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+const WORKFLOW_DISPLAY_TEXT_KEYS = [
+  "text",
+  "report",
+  "markdown",
+  "content",
+  "message",
+  "summary",
+  "stdout",
+] as const;
+
+function extractWorkflowDisplayText(value: unknown, depth = 0): string {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const allPrimitive = value.every(
+      (item) =>
+        item === null ||
+        item === undefined ||
+        typeof item === "string" ||
+        typeof item === "number" ||
+        typeof item === "boolean" ||
+        typeof item === "bigint",
+    );
+    if (allPrimitive) {
+      return value
+        .map((item) => (item === null || item === undefined ? "" : String(item).trim()))
+        .filter(Boolean)
+        .join("\n");
+    }
+    try {
+      const json = JSON.stringify(value, null, 2);
+      return json === "[]" ? "" : json;
+    } catch {
+      return "";
+    }
+  }
+  if (typeof value === "object" && depth < 3) {
+    const rec = value as Record<string, unknown>;
+    for (const key of WORKFLOW_DISPLAY_TEXT_KEYS) {
+      const candidate = rec[key];
+      if (typeof candidate === "string" && candidate.trim()) {
+        return candidate.trim();
+      }
+    }
+    if (rec.json !== undefined) {
+      const fromJson = extractWorkflowDisplayText(rec.json, depth + 1);
+      if (fromJson) {
+        return fromJson;
+      }
+    }
+    try {
+      const json = JSON.stringify(rec, null, 2);
+      return json === "{}" ? "" : json;
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
 async function runSingleDagNode(
   node: WorkflowNodeDef,
   input: PluginWorkflowRunInput,
@@ -554,11 +621,37 @@ async function runSingleDagNode(
       });
     }
     case "notify": {
-      const title =
+      const rawTitle =
         typeof cfg.title === "string"
-          ? String(resolveTemplate(cfg.title, scope) ?? "")
-          : input.pluginName;
-      const message = String(resolveTemplate(cfg.message ?? "", scope) ?? "");
+          ? extractWorkflowDisplayText(resolveTemplate(cfg.title, scope))
+          : "";
+      const title = rawTitle || input.pluginName;
+      const rawMsgTpl = cfg.message ?? cfg.body ?? cfg.content ?? "";
+      let message = extractWorkflowDisplayText(resolveTemplate(rawMsgTpl, scope));
+      if (!message && typeof rawMsgTpl === "string") {
+        const refRegex = /\{\{\s*steps\.([a-zA-Z0-9_-]+)/g;
+        let refMatch: RegExpExecArray | null;
+        while ((refMatch = refRegex.exec(rawMsgTpl)) !== null) {
+          const stepId = refMatch[1];
+          if (stepId && stepsScope[stepId]?.output !== undefined) {
+            const candidate = extractWorkflowDisplayText(stepsScope[stepId]?.output);
+            if (candidate) {
+              message = candidate;
+              break;
+            }
+          }
+        }
+      }
+      if (!message) {
+        const predOutputs = Object.values(predecessors);
+        for (let idx = predOutputs.length - 1; idx >= 0; idx--) {
+          const candidate = extractWorkflowDisplayText(predOutputs[idx]);
+          if (candidate) {
+            message = candidate;
+            break;
+          }
+        }
+      }
       const level =
         cfg.level === "warn" || cfg.level === "error" ? cfg.level : "info";
       const kind =

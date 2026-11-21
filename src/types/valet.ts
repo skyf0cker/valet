@@ -1,6 +1,6 @@
 export type AppView = "inbox" | "timeline" | "projects" | "chat" | "plugins" | "settings";
 
-export type ProjectTab = "notebook" | "sessions" | "session";
+export type ProjectTab = "notebook" | "sessions" | "session" | "page";
 
 export type ProjectIconKind = "box" | "book" | "terminal" | "sparkles" | "folder";
 
@@ -15,8 +15,10 @@ export type NotebookBlockType =
   | "callout"
   | "quote"
   | "code"
+  | "table"
   | "divider"
-  | "session_ref";
+  | "session_ref"
+  | "page_ref";
 
 export const DEFAULT_PROJECT_ID = "proj-default";
 
@@ -28,7 +30,18 @@ export interface NotebookBlock {
   checked?: boolean;
   language?: string;
   sessionId?: string;
+  pageId?: string;
   summary?: string;
+}
+
+export interface ProjectPage {
+  id: string;
+  parentPageId?: string;
+  title: string;
+  icon?: ProjectIconKind | string;
+  updatedAt: string;
+  createdAt: string;
+  blocks: NotebookBlock[];
 }
 
 export interface Project {
@@ -43,6 +56,7 @@ export interface Project {
   updatedAt: string;
   createdAt: string;
   blocks: NotebookBlock[];
+  pages?: ProjectPage[];
 }
 
 export type BusyMessagePolicy = "queue" | "steer";
@@ -412,6 +426,7 @@ export interface ChatThread {
   updatedAt: string;
   archived?: boolean;
   archivedAt?: string;
+  originPageId?: string;
   originBlockId?: string;
   originSection?: string;
   notebookContextInjected?: boolean;
@@ -649,6 +664,7 @@ export interface ValetSnapshot {
   activePluginDetailId: string | null;
   activeProjectId: string;
   activeProjectTab?: ProjectTab;
+  activePageId?: string;
   activeChatId: string;
   selectedTimelineEventId: string | null;
   selectedInboxItemId: string | null;

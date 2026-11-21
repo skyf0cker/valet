@@ -7,6 +7,10 @@ import {
   parseInlineNotebookText,
   splitInlineRefs,
 } from "./notebook";
+import {
+  isMarkdownTableDelimiterLine,
+  isMarkdownTableRowCandidate,
+} from "./notebookTable";
 
 export const MAX_NOTEBOOK_INDENT = 6;
 
@@ -27,6 +31,10 @@ export function isIndentableBlockType(type: NotebookBlockType): boolean {
 
 export function isListBlockType(type: NotebookBlockType): boolean {
   return LIST_BLOCK_TYPES.has(type);
+}
+
+export function isNonTextNotebookBlockType(type: NotebookBlockType): boolean {
+  return type === "divider" || type === "session_ref" || type === "page_ref";
 }
 
 export function clampBlockIndent(type: NotebookBlockType, indent?: number): number {
@@ -323,6 +331,35 @@ export function parseMarkdownToBlocks(rawMarkdown: string): NotebookBlock[] {
       continue;
     }
 
+    if (
+      line.includes("|") &&
+      i + 1 < lines.length &&
+      isMarkdownTableDelimiterLine(lines[i + 1]!)
+    ) {
+      const requireLeadingPipe =
+        line.trim().startsWith("|") || lines[i + 1]!.trim().startsWith("|");
+      const tableLines: string[] = [line.trim(), lines[i + 1]!.trim()];
+      let endIdx = i + 1;
+      while (
+        endIdx + 1 < lines.length &&
+        isMarkdownTableRowCandidate(lines[endIdx + 1]!)
+      ) {
+        const trimmedRow = lines[endIdx + 1]!.trim();
+        if (requireLeadingPipe && !trimmedRow.startsWith("|")) {
+          break;
+        }
+        endIdx += 1;
+        tableLines.push(trimmedRow);
+      }
+      i = endIdx;
+      out.push({
+        id: makeBlockId("blk"),
+        type: "table",
+        content: tableLines.join("\n"),
+      });
+      continue;
+    }
+
     const calloutStart = CALLOUT_START_RE.exec(line);
     if (calloutStart) {
       const parts: string[] = [];
@@ -505,7 +542,7 @@ export function applyMarkdownPasteToBlocks(params: {
     });
     const last = inserted[inserted.length - 1]!;
     let focusBlock = last;
-    if (last.type === "divider" || last.type === "session_ref") {
+    if (isNonTextNotebookBlockType(last.type)) {
       const trailing: NotebookBlock = {
         id: makeBlockId("blk"),
         type: "paragraph",
@@ -550,7 +587,11 @@ export function applyMarkdownPasteToBlocks(params: {
 
   if (remaining.length === 0) {
     if (after) {
-      if (headBlock.type === "code" || headBlock.type === "divider" || headBlock.type === "session_ref") {
+      if (
+        headBlock.type === "code" ||
+        headBlock.type === "table" ||
+        isNonTextNotebookBlockType(headBlock.type)
+      ) {
         const trailing: NotebookBlock = {
           id: makeBlockId("blk"),
           type: "paragraph",
@@ -578,7 +619,7 @@ export function applyMarkdownPasteToBlocks(params: {
     }
 
     next[blockIndex] = headBlock;
-    if (headBlock.type === "divider" || headBlock.type === "session_ref") {
+    if (isNonTextNotebookBlockType(headBlock.type)) {
       const trailing: NotebookBlock = {
         id: makeBlockId("blk"),
         type: "paragraph",
@@ -596,7 +637,7 @@ export function applyMarkdownPasteToBlocks(params: {
       blocks: normalizeBlockIndents(next),
       focusBlockId: headBlock.id,
       focusCursorPos:
-        headBlock.type === "code"
+        headBlock.type === "code" || headBlock.type === "table"
           ? headBlock.content.length
           : splitInlineRefs(headBlock.content).editableText.length,
     };
@@ -605,10 +646,16 @@ export function applyMarkdownPasteToBlocks(params: {
   const tail = remaining[remaining.length - 1]!;
   let focusBlockId = tail.id;
   let focusCursorPos =
-    tail.type === "code" ? tail.content.length : splitInlineRefs(tail.content).editableText.length;
+    tail.type === "code" || tail.type === "table"
+      ? tail.content.length
+      : splitInlineRefs(tail.content).editableText.length;
 
   if (after) {
-    if (tail.type === "divider" || tail.type === "session_ref" || tail.type === "code") {
+    if (
+      isNonTextNotebookBlockType(tail.type) ||
+      tail.type === "code" ||
+      tail.type === "table"
+    ) {
       const trailing: NotebookBlock = {
         id: makeBlockId("blk"),
         type: "paragraph",
@@ -625,7 +672,7 @@ export function applyMarkdownPasteToBlocks(params: {
         content: joinTextWithInlineRefs(`${tailSplit.editableText}${after}`, tailSplit.refs),
       };
     }
-  } else if (tail.type === "divider" || tail.type === "session_ref") {
+  } else if (isNonTextNotebookBlockType(tail.type)) {
     const trailing: NotebookBlock = {
       id: makeBlockId("blk"),
       type: "paragraph",
@@ -879,7 +926,12 @@ export function mapRenderedOffsetToRawOffset(rawText: string, renderedOffset: nu
   let renderedCursor = 0;
 
   for (const seg of segments) {
-    if (seg.kind === "session" || seg.kind === "inbox" || seg.kind === "timeline") {
+    if (
+      seg.kind === "session" ||
+      seg.kind === "inbox" ||
+      seg.kind === "timeline" ||
+      seg.kind === "page"
+    ) {
       // Inline ref tokens are displayed separately when editing.
       continue;
     }
@@ -896,7 +948,9 @@ export function mapRenderedOffsetToRawOffset(rawText: string, renderedOffset: nu
       prefixLen = 2;
       suffixLen = 2;
       visibleText = seg.text;
-      rawSegmentText = `**${seg.text}**`;
+      rawSegmentText = rawText.startsWith("__", rawCursor)
+        ? `__${seg.text}__`
+        : `**${seg.text}**`;
     } else if (seg.kind === "italic") {
       prefixLen = 1;
       suffixLen = 1;
@@ -976,7 +1030,7 @@ export function deleteSelectedBlocks(
 
   const normalized = normalizeBlockIndents(remaining);
   const isEditable = (b: NotebookBlock | undefined): b is NotebookBlock =>
-    Boolean(b && b.type !== "divider" && b.type !== "session_ref");
+    Boolean(b && !isNonTextNotebookBlockType(b.type));
 
   for (let i = Math.min(firstIdx - 1, normalized.length - 1); i >= 0; i--) {
     const cand = normalized[i];
@@ -1114,7 +1168,7 @@ export function convertSelectedBlocks(
 ): NotebookBlock[] | null {
   let changed = false;
   const converted = blocks.map((b) => {
-    if (!selectedIds.has(b.id) || b.type === "divider" || b.type === "session_ref") {
+    if (!selectedIds.has(b.id) || isNonTextNotebookBlockType(b.type) || b.type === "table") {
       return b;
     }
     if (b.type === targetType) return b;
@@ -1166,7 +1220,7 @@ export function replaceSelectedBlocksWithMarkdown(
       : [{ id: makeBlockId("blk"), type: "paragraph", content: "" }];
 
   const lastInserted = replacement[replacement.length - 1]!;
-  if (lastInserted.type === "divider" || lastInserted.type === "session_ref") {
+  if (isNonTextNotebookBlockType(lastInserted.type)) {
     replacement.push({ id: makeBlockId("blk"), type: "paragraph", content: "" });
   }
 
@@ -1185,7 +1239,7 @@ export function replaceSelectedBlocksWithMarkdown(
   const combined = normalizeBlockIndents([...remainingBefore, ...replacement, ...remainingAfter]);
   const lastEditable = [...replacement]
     .reverse()
-    .find((b) => b.type !== "divider" && b.type !== "session_ref");
+    .find((b) => !isNonTextNotebookBlockType(b.type));
   const focusBlock = lastEditable ?? replacement[replacement.length - 1]!;
   const focusCursorPos =
     focusBlock.type === "code"
