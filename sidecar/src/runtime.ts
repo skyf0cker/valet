@@ -112,6 +112,8 @@ const TOOL_STATUS_LABELS: Record<string, string> = {
   cancel_wake: "正在取消定时器…",
   list_timers: "正在查询定时器列表…",
   notify: "正在发送 Outbox 通知…",
+  notebook_read: "正在读取项目 Notebook…",
+  notebook_edit: "正在编辑项目 Notebook…",
 };
 
 export function stripThinkTags(raw: string): {
@@ -262,6 +264,28 @@ export function humanizeToolStepLabel(
       return args?.title
         ? `发送通知 · ${String(args.title)}`
         : "发送 Outbox 通知";
+    case "notebook_read":
+      return "读取项目 Notebook";
+    case "notebook_edit": {
+      const action = typeof args?.action === "string" ? args.action : "";
+      switch (action) {
+        case "append":
+          return "向项目 Notebook 追加内容";
+        case "insert_after":
+        case "insert_before":
+          return "向项目 Notebook 插入内容";
+        case "update_block":
+          return "更新项目 Notebook 内容块";
+        case "replace_blocks":
+          return "替换项目 Notebook 内容片段";
+        case "delete_blocks":
+          return "删除项目 Notebook 内容块";
+        case "replace_all":
+          return "重写项目 Notebook 内容";
+        default:
+          return "编辑项目 Notebook";
+      }
+    }
     default: {
       if (name.startsWith("mcp_")) {
         const stripped = name.replace(/^mcp_(?:mcp_)?[a-z0-9]+_/i, "");

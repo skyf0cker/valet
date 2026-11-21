@@ -265,9 +265,30 @@ function formatSingleBlockMarkdown(
   return formatSingleBlockLines(blk, orderedNumber, threadsById, overrideText).lines.join("\n");
 }
 
-export function blocksToMarkdown(project: Project, threads: ChatThread[]): string {
+export function serializeBlocksToMarkdown(
+  blocks: NotebookBlock[],
+  threads: ChatThread[]
+): string {
+  if (blocks.length === 0) return "";
   const threadsById = new Map(threads.map((t) => [t.id, t]));
-  const markers = computeNumberedListMarkers(project.blocks);
+  const markers = computeNumberedListMarkers(blocks);
+  const lines: string[] = [];
+
+  for (const blk of blocks) {
+    const orderedNumber = markers[blk.id]?.index ?? 1;
+    const formatted = formatSingleBlockLines(blk, orderedNumber, threadsById);
+    if (formatted.lines.length > 0) {
+      lines.push(...formatted.lines);
+      if (formatted.trailingBlank) {
+        lines.push("");
+      }
+    }
+  }
+
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+export function blocksToMarkdown(project: Project, threads: ChatThread[]): string {
   const lines: string[] = [`# ${project.title}`];
 
   if (project.tags.length > 0 || project.workingDir) {
@@ -277,16 +298,9 @@ export function blocksToMarkdown(project: Project, threads: ChatThread[]): strin
     lines.push("", meta.join(" · "));
   }
 
-  lines.push("");
-  for (const blk of project.blocks) {
-    const orderedNumber = markers[blk.id]?.index ?? 1;
-    const formatted = formatSingleBlockLines(blk, orderedNumber, threadsById);
-    if (formatted.lines.length > 0) {
-      lines.push(...formatted.lines);
-      if (formatted.trailingBlank) {
-        lines.push("");
-      }
-    }
+  const body = serializeBlocksToMarkdown(project.blocks, threads);
+  if (body) {
+    lines.push("", body);
   }
 
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";

@@ -1,0 +1,259 @@
+package backend
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"valet/internal/store"
+	"valet/internal/types"
+)
+
+func TestParseNotebookMarkdownToBlocks(t *testing.T) {
+	md := strings.Join([]string{
+		"# 发布清单",
+		"",
+		"- 父级事项",
+		"  - [ ] 子待办事项",
+		"\t- [x] 已完成子项",
+		"1. 第一步",
+		"  1) 子步骤 A",
+		"> [!note] 提示第一行",
+		"> 提示第二行",
+		"",
+		"> 普通引用",
+		"---",
+		"```go",
+		`fmt.Println("hi")`,
+		"```",
+	}, "\n")
+
+	blocks := parseNotebookMarkdownToBlocks(md)
+	if len(blocks) != 10 {
+		t.Fatalf("expected 10 parsed blocks, got %d: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "h1" || blocks[0].Content != "发布清单" {
+		t.Fatalf("unexpected h1 block: %+v", blocks[0])
+	}
+	if blocks[1].Type != "bullet" || blocks[1].Indent != 0 {
+		t.Fatalf("unexpected root bullet block: %+v", blocks[1])
+	}
+	if blocks[2].Type != "todo" || blocks[2].Checked || blocks[2].Indent != 1 {
+		t.Fatalf("unexpected nested todo block: %+v", blocks[2])
+	}
+	if blocks[3].Type != "todo" || !blocks[3].Checked || blocks[3].Indent != 1 {
+		t.Fatalf("unexpected tab-indented done todo block: %+v", blocks[3])
+	}
+	if blocks[4].Type != "numbered" || blocks[4].Indent != 0 || blocks[5].Type != "numbered" || blocks[5].Indent != 1 {
+		t.Fatalf("unexpected numbered blocks: %+v / %+v", blocks[4], blocks[5])
+	}
+	if blocks[6].Type != "callout" || blocks[6].Content != "提示第一行\n提示第二行" {
+		t.Fatalf("unexpected callout block: %+v", blocks[6])
+	}
+	if blocks[7].Type != "quote" || blocks[7].Content != "普通引用" {
+		t.Fatalf("unexpected quote block: %+v", blocks[7])
+	}
+	if blocks[8].Type != "divider" {
+		t.Fatalf("expected divider block, got %+v", blocks[8])
+	}
+	if blocks[9].Type != "code" || blocks[9].Language != "go" || blocks[9].Content != `fmt.Println("hi")` {
+		t.Fatalf("unexpected code block: %+v", blocks[9])
+	}
+	// Trailing empty line / unmatched check: wait - lines 0..14 had 15 lines -> 10 blocks!
+}
+
+func TestParseNotebookMarkdownToBlocksCountsAndClamps(t *testing.T) {
+	md := "# Title\n        - Over-indented item\n  - Child under item\n"
+	blocks := parseNotebookMarkdownToBlocks(md)
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 blocks, got %d", len(blocks))
+	}
+	// Item right below h1 must clamp indent to 0
+	if blocks[1].Indent != 0 {
+		t.Fatalf("expected item under h1 to clamp to indent 0, got %d", blocks[1].Indent)
+	}
+	// Item right below indent-0 bullet gets indent 1
+	if blocks[2].Indent != 1 {
+		t.Fatalf("expected child indent 1, got %d", blocks[2].Indent)
+	}
+}
+
+func TestHostNotebookReadAndEditLifecycle(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	dataDir := filepath.Join(tmpRoot, "data")
+
+	st, err := store.Open(dataDir, homeDir)
+	if err != nil {
+		t.Fatalf("store.Open failed: %v", err)
+	}
+
+	var mu sync.Mutex
+	var stateScopes []string
+	svc := NewService()
+	svc.store = st
+	svc.opts.HomeDir = homeDir
+	svc.opts.DataDir = dataDir
+	svc.opts.OnState = func(notice types.StateChangeNotice) {
+		mu.Lock()
+		stateScopes = append(stateScopes, notice.Scope)
+		mu.Unlock()
+	}
+
+	// Set up a second custom project while ActiveProjectID remains on default project
+	// to prove scoping follows the chat thread's ProjectID rather than ActiveProjectID.
+	st.Update(func(snap *types.ValetSnapshot) {
+		snap.ActiveProjectID = types.DefaultProjectID
+		snap.Projects = append(snap.Projects, types.Project{
+			ID:         "proj-notes",
+			Title:      "调研笔记本",
+			WorkingDir: "~/Projects/demo",
+			Tags:       []string{"测试"},
+			Blocks: []types.NotebookBlock{
+				{ID: "blk-blank", Type: "paragraph", Content: ""},
+			},
+			UpdatedAt: "刚刚",
+			CreatedAt: "2026-11-21",
+		})
+		snap.ChatThreads = append(snap.ChatThreads, types.ChatThread{
+			ID:            "chat-proj-notes",
+			ProjectID:     "proj-notes",
+			Title:         "整理调研",
+			Model:         "claude-opus-4",
+			OriginBlockID: "blk-blank",
+			UpdatedAt:     "刚刚",
+		})
+	})
+
+	ctx := context.Background()
+
+	// 1. Unknown chatId must fail safely
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.notebook.read", json.RawMessage(`{"chatId":"nonexistent"}`)); err == nil {
+		t.Fatalf("expected error for unknown chatId")
+	}
+
+	// 2. Append replaces the sole blank placeholder paragraph cleanly
+	appendResAny, err := svc.handleSidecarHostRequest(ctx, "host.notebook.edit", json.RawMessage(`{
+		"chatId": "chat-proj-notes",
+		"action": "append",
+		"markdown": "# 目标规划\n- [ ] 拉取日志\n  - 检查 error.log\n- [ ] 输出总结"
+	}`))
+	if err != nil {
+		t.Fatalf("append failed: %v", err)
+	}
+	appendRes := appendResAny.(map[string]any)
+	if appendRes["projectId"] != "proj-notes" || appendRes["blockCount"] != 4 {
+		t.Fatalf("unexpected append result: %+v", appendRes)
+	}
+
+	// 3. Read returns project blocks & formatted IDs
+	readAny, err := svc.handleSidecarHostRequest(ctx, "host.notebook.read", json.RawMessage(`{"chatId":"chat-proj-notes"}`))
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	readRes := readAny.(map[string]any)
+	blocks := readRes["blocks"].([]types.NotebookBlock)
+	if len(blocks) != 4 || blocks[2].Indent != 1 {
+		t.Fatalf("unexpected read blocks: %+v", blocks)
+	}
+	todo1ID := blocks[1].ID
+	childID := blocks[2].ID
+	todo2ID := blocks[3].ID
+
+	// 4. update_block marks todo checked while preserving its content
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.notebook.edit", json.RawMessage(`{
+		"chatId": "chat-proj-notes",
+		"action": "update_block",
+		"targetBlockId": "`+todo1ID+`",
+		"checked": true
+	}`)); err != nil {
+		t.Fatalf("update_block failed: %v", err)
+	}
+
+	// 5. insert_after adds a code block after childID
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.notebook.edit", json.RawMessage(`{
+		"chatId": "chat-proj-notes",
+		"action": "insert_after",
+		"targetBlockId": "`+childID+`",
+		"markdown": "`+"```bash\\nls -la /tmp\\n```"+`"
+	}`)); err != nil {
+		t.Fatalf("insert_after failed: %v", err)
+	}
+
+	// 6. delete_blocks removes todo2ID via blockIds
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.notebook.edit", json.RawMessage(`{
+		"chatId": "chat-proj-notes",
+		"action": "delete_blocks",
+		"blockIds": ["`+todo2ID+`"]
+	}`)); err != nil {
+		t.Fatalf("delete_blocks failed: %v", err)
+	}
+
+	// 7. Re-insert a session_ref manually, then test update_block rejection + replace_all preservation
+	st.Update(func(snap *types.ValetSnapshot) {
+		for i := range snap.Projects {
+			if snap.Projects[i].ID == "proj-notes" {
+				snap.Projects[i].Blocks = append(snap.Projects[i].Blocks, types.NotebookBlock{
+					ID:        "blk-sess-ref",
+					Type:      "session_ref",
+					SessionID: "chat-proj-notes",
+					Content:   "整理调研",
+				})
+			}
+		}
+	})
+
+	if _, err := svc.handleSidecarHostRequest(ctx, "host.notebook.edit", json.RawMessage(`{
+		"chatId": "chat-proj-notes",
+		"action": "update_block",
+		"targetBlockId": "blk-sess-ref",
+		"content": "hacked"
+	}`)); err == nil {
+		t.Fatalf("expected error attempting to overwrite session_ref block")
+	}
+
+	replaceAllAny, err := svc.handleSidecarHostRequest(ctx, "host.notebook.edit", json.RawMessage(`{
+		"chatId": "chat-proj-notes",
+		"action": "replace_all",
+		"markdown": "# 最终结论\n1. 已完成清理"
+	}`))
+	if err != nil {
+		t.Fatalf("replace_all failed: %v", err)
+	}
+	replaceAllRes := replaceAllAny.(map[string]any)
+	if replaceAllRes["blockCount"] != 3 {
+		t.Fatalf("expected 2 parsed blocks + 1 preserved session_ref = 3, got %+v", replaceAllRes)
+	}
+
+	// Verify state change notifications fired with scope "projects"
+	mu.Lock()
+	scopesCopy := append([]string(nil), stateScopes...)
+	mu.Unlock()
+	if len(scopesCopy) == 0 || scopesCopy[len(scopesCopy)-1] != "projects" {
+		t.Fatalf("expected projects state change emissions, got %+v", scopesCopy)
+	}
+
+	// Verify durability across store reopen
+	reopened, err := store.Open(dataDir, homeDir)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	reSnap := reopened.Snapshot()
+	var persisted *types.Project
+	for i := range reSnap.Projects {
+		if reSnap.Projects[i].ID == "proj-notes" {
+			p := reSnap.Projects[i]
+			persisted = &p
+			break
+		}
+	}
+	if persisted == nil || len(persisted.Blocks) != 3 ||
+		persisted.Blocks[0].Content != "最终结论" ||
+		persisted.Blocks[1].Type != "numbered" ||
+		persisted.Blocks[2].Type != "session_ref" {
+		t.Fatalf("unexpected reopened project blocks: %+v", persisted)
+	}
+}

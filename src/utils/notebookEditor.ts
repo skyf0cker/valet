@@ -936,3 +936,265 @@ export function mapRenderedOffsetToRawOffset(rawText: string, renderedOffset: nu
 
   return rawText.length;
 }
+
+/**
+ * Returns the ordered block IDs in the inclusive span between `anchorId` and `headId`.
+ */
+export function getBlockRangeIds(
+  blocks: NotebookBlock[],
+  anchorId: string,
+  headId: string
+): string[] {
+  const anchorIdx = blocks.findIndex((b) => b.id === anchorId);
+  const headIdx = blocks.findIndex((b) => b.id === headId);
+  if (anchorIdx === -1 || headIdx === -1) return [];
+  const start = Math.min(anchorIdx, headIdx);
+  const end = Math.max(anchorIdx, headIdx);
+  return blocks.slice(start, end + 1).map((b) => b.id);
+}
+
+/**
+ * Deletes all blocks in `selectedIds`, keeps at least one empty paragraph when everything
+ * is deleted, normalizes remaining indents, and returns the next focus target.
+ */
+export function deleteSelectedBlocks(
+  blocks: NotebookBlock[],
+  selectedIds: ReadonlySet<string>
+): { blocks: NotebookBlock[]; focusBlockId: string | null; focusCursorPos: number } | null {
+  const firstIdx = blocks.findIndex((b) => selectedIds.has(b.id));
+  if (firstIdx === -1) return null;
+
+  const remaining = blocks.filter((b) => !selectedIds.has(b.id));
+  if (remaining.length === 0) {
+    const fresh: NotebookBlock = {
+      id: makeBlockId("blk"),
+      type: "paragraph",
+      content: "",
+    };
+    return { blocks: [fresh], focusBlockId: fresh.id, focusCursorPos: 0 };
+  }
+
+  const normalized = normalizeBlockIndents(remaining);
+  const isEditable = (b: NotebookBlock | undefined): b is NotebookBlock =>
+    Boolean(b && b.type !== "divider" && b.type !== "session_ref");
+
+  for (let i = Math.min(firstIdx - 1, normalized.length - 1); i >= 0; i--) {
+    const cand = normalized[i];
+    if (isEditable(cand)) {
+      const len =
+        cand.type === "code" ? cand.content.length : splitInlineRefs(cand.content).editableText.length;
+      return { blocks: normalized, focusBlockId: cand.id, focusCursorPos: len };
+    }
+  }
+
+  for (let i = Math.max(0, Math.min(firstIdx, normalized.length - 1)); i < normalized.length; i++) {
+    const cand = normalized[i];
+    if (isEditable(cand)) {
+      return { blocks: normalized, focusBlockId: cand.id, focusCursorPos: 0 };
+    }
+  }
+
+  return { blocks: normalized, focusBlockId: null, focusCursorPos: 0 };
+}
+
+/**
+ * Batch-indents or outdents selected blocks in document order while preserving valid nesting
+ * relative to preceding blocks and preventing floating orphan indents on unselected children.
+ */
+export function indentSelectedBlocks(
+  blocks: NotebookBlock[],
+  selectedIds: ReadonlySet<string>,
+  delta: 1 | -1
+): NotebookBlock[] | null {
+  const result: NotebookBlock[] = [];
+  let changed = false;
+
+  for (let i = 0; i < blocks.length; i++) {
+    const blk = blocks[i]!;
+    const prev = i > 0 ? result[i - 1] : undefined;
+    const maxAllowed =
+      prev && isIndentableBlockType(prev.type)
+        ? Math.min(MAX_NOTEBOOK_INDENT, clampBlockIndent(prev.type, prev.indent) + 1)
+        : 0;
+    const curIndent = clampBlockIndent(blk.type, blk.indent);
+
+    if (selectedIds.has(blk.id) && isIndentableBlockType(blk.type)) {
+      const target = Math.max(0, Math.min(maxAllowed, curIndent + delta));
+      if (target !== curIndent) changed = true;
+      result.push(withNormalizedIndent(blk, target));
+    } else {
+      const clamped = isIndentableBlockType(blk.type) ? Math.min(curIndent, maxAllowed) : 0;
+      if (clamped !== curIndent) changed = true;
+      result.push(withNormalizedIndent(blk, clamped));
+    }
+  }
+
+  return changed ? result : null;
+}
+
+/**
+ * Clones all selected blocks with new IDs and inserts them right after the last selected item.
+ */
+export function duplicateSelectedBlocks(
+  blocks: NotebookBlock[],
+  selectedIds: ReadonlySet<string>
+): { blocks: NotebookBlock[]; duplicatedIds: string[] } | null {
+  let lastIdx = -1;
+  const selected: NotebookBlock[] = [];
+  for (let i = 0; i < blocks.length; i++) {
+    if (selectedIds.has(blocks[i]!.id)) {
+      selected.push(blocks[i]!);
+      lastIdx = i;
+    }
+  }
+  if (selected.length === 0 || lastIdx === -1) return null;
+
+  const clones = selected.map((blk) => ({
+    ...blk,
+    id: makeBlockId("blk"),
+  }));
+  const next = [...blocks];
+  next.splice(lastIdx + 1, 0, ...clones);
+  return {
+    blocks: normalizeBlockIndents(next),
+    duplicatedIds: clones.map((c) => c.id),
+  };
+}
+
+/**
+ * Moves all selected blocks together one slot up or down in the document.
+ */
+export function moveSelectedBlocks(
+  blocks: NotebookBlock[],
+  selectedIds: ReadonlySet<string>,
+  delta: -1 | 1
+): NotebookBlock[] | null {
+  const indices: number[] = [];
+  const selected: NotebookBlock[] = [];
+  const remaining: NotebookBlock[] = [];
+
+  for (let i = 0; i < blocks.length; i++) {
+    const blk = blocks[i]!;
+    if (selectedIds.has(blk.id)) {
+      indices.push(i);
+      selected.push(blk);
+    } else {
+      remaining.push(blk);
+    }
+  }
+
+  if (indices.length === 0) return null;
+  const firstIdx = indices[0]!;
+  const lastIdx = indices[indices.length - 1]!;
+
+  if (delta === -1) {
+    if (firstIdx <= 0) return null;
+    const anchorBeforeId = blocks[firstIdx - 1]!.id;
+    const insertAt = remaining.findIndex((b) => b.id === anchorBeforeId);
+    if (insertAt === -1) return null;
+    remaining.splice(insertAt, 0, ...selected);
+    return normalizeBlockIndents(remaining);
+  }
+
+  if (lastIdx >= blocks.length - 1) return null;
+  const anchorAfterId = blocks[lastIdx + 1]!.id;
+  const anchorPos = remaining.findIndex((b) => b.id === anchorAfterId);
+  if (anchorPos === -1) return null;
+  remaining.splice(anchorPos + 1, 0, ...selected);
+  return normalizeBlockIndents(remaining);
+}
+
+/**
+ * Converts all editable selected blocks (skipping dividers & session cards) into `targetType`.
+ */
+export function convertSelectedBlocks(
+  blocks: NotebookBlock[],
+  selectedIds: ReadonlySet<string>,
+  targetType: NotebookBlockType
+): NotebookBlock[] | null {
+  let changed = false;
+  const converted = blocks.map((b) => {
+    if (!selectedIds.has(b.id) || b.type === "divider" || b.type === "session_ref") {
+      return b;
+    }
+    if (b.type === targetType) return b;
+    changed = true;
+    const nextBlk: NotebookBlock = {
+      ...b,
+      type: targetType,
+      language: targetType === "code" ? b.language || "bash" : undefined,
+      checked: targetType === "todo" ? Boolean(b.checked) : undefined,
+    };
+    if (!isIndentableBlockType(targetType)) {
+      delete nextBlk.indent;
+    }
+    return nextBlk;
+  });
+  return changed ? normalizeBlockIndents(converted) : null;
+}
+
+/**
+ * Toggles all selected `todo` blocks together (checks all if any is unchecked, else unchecks).
+ */
+export function toggleSelectedTodos(
+  blocks: NotebookBlock[],
+  selectedIds: ReadonlySet<string>
+): NotebookBlock[] | null {
+  const todos = blocks.filter((b) => selectedIds.has(b.id) && b.type === "todo");
+  if (todos.length === 0) return null;
+  const targetChecked = todos.some((b) => !b.checked);
+  return blocks.map((b) =>
+    selectedIds.has(b.id) && b.type === "todo" ? { ...b, checked: targetChecked } : b
+  );
+}
+
+/**
+ * Replaces the selected block range with Markdown parsed from `pastedText`.
+ */
+export function replaceSelectedBlocksWithMarkdown(
+  blocks: NotebookBlock[],
+  selectedIds: ReadonlySet<string>,
+  pastedText: string
+): { blocks: NotebookBlock[]; focusBlockId: string; focusCursorPos: number } | null {
+  const firstIdx = blocks.findIndex((b) => selectedIds.has(b.id));
+  if (firstIdx === -1 || !pastedText) return null;
+
+  const parsed = parseMarkdownToBlocks(pastedText);
+  const replacement: NotebookBlock[] =
+    parsed.length > 0
+      ? [...parsed]
+      : [{ id: makeBlockId("blk"), type: "paragraph", content: "" }];
+
+  const lastInserted = replacement[replacement.length - 1]!;
+  if (lastInserted.type === "divider" || lastInserted.type === "session_ref") {
+    replacement.push({ id: makeBlockId("blk"), type: "paragraph", content: "" });
+  }
+
+  const remainingBefore: NotebookBlock[] = [];
+  const remainingAfter: NotebookBlock[] = [];
+  for (let i = 0; i < blocks.length; i++) {
+    const blk = blocks[i]!;
+    if (selectedIds.has(blk.id)) continue;
+    if (i < firstIdx) {
+      remainingBefore.push(blk);
+    } else {
+      remainingAfter.push(blk);
+    }
+  }
+
+  const combined = normalizeBlockIndents([...remainingBefore, ...replacement, ...remainingAfter]);
+  const lastEditable = [...replacement]
+    .reverse()
+    .find((b) => b.type !== "divider" && b.type !== "session_ref");
+  const focusBlock = lastEditable ?? replacement[replacement.length - 1]!;
+  const focusCursorPos =
+    focusBlock.type === "code"
+      ? focusBlock.content.length
+      : splitInlineRefs(focusBlock.content).editableText.length;
+
+  return {
+    blocks: combined,
+    focusBlockId: focusBlock.id,
+    focusCursorPos,
+  };
+}

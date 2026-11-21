@@ -164,6 +164,8 @@ class FakeHostBridge implements HostBridge {
   readonly trashCalls: Record<string, unknown>[] = [];
   readonly killCalls: Record<string, unknown>[] = [];
   readonly itemResolveCalls: Record<string, unknown>[] = [];
+  readonly notebookReadCalls: Record<string, unknown>[] = [];
+  readonly notebookEditCalls: Record<string, unknown>[] = [];
   readonly streamEvents: ChatStreamPayload[] = [];
   private streamListeners: Array<(payload: ChatStreamPayload) => void> = [];
 
@@ -259,6 +261,32 @@ class FakeHostBridge implements HostBridge {
           id: String(params.id ?? ""),
           action: String(params.action ?? "approve"),
           summary: `已处理事项 ${String(params.id ?? "")} (${String(params.action ?? "approve")})`,
+        } as T;
+      }
+      case "host.notebook.read": {
+        this.notebookReadCalls.push(params);
+        return {
+          ok: true,
+          projectId: "proj-test",
+          projectTitle: "测试项目",
+          blockCount: 2,
+          formatted:
+            "项目 Notebook：测试项目 (projectId=proj-test)\n共 2 个内容块：\n1. [blk-1 | h1] # 目标\n2. [blk-2 | todo:open] - [ ] 排查日志",
+        } as T;
+      }
+      case "host.notebook.edit": {
+        this.notebookEditCalls.push(params);
+        const action = String(params.action ?? "");
+        return {
+          ok: true,
+          projectId: "proj-test",
+          projectTitle: "测试项目",
+          action,
+          summary: `已执行 ${action}`,
+          blockCount: 3,
+          affectedIds: ["blk-2"],
+          formatted:
+            "项目 Notebook：测试项目 (projectId=proj-test)\n共 3 个内容块：\n1. [blk-1 | h1] # 目标\n2. [blk-2 | todo:done] - [x] 排查日志\n3. [blk-3 | bullet] - 已补充结论",
         } as T;
       }
       case "host.kernel.overview":
@@ -1833,6 +1861,116 @@ triggers:
       attachments: [msgQuoteAttachment],
     });
     expect(titleRes.title).toContain("read_file");
+
+    await rt.close();
+  });
+
+  it("allows agent to read and edit project Notebook via notebook_read/notebook_edit and blocks tainted edits", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "valet-notebook-tools-"));
+    tempDirs.push(dir);
+    const bridge = new FakeHostBridge();
+    const state = makeBaseState(dir);
+
+    const rt = new ValetDurableRuntime(bridge);
+    await rt.init({ dbPath: join(dir, "pi-notebook.sqlite"), state });
+
+    rt.models.setLocalStewardScript([
+      () => fauxAssistantMessage([fauxToolCall("notebook_read", {})], { stopReason: "toolUse" }),
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("notebook_edit", {
+              action: "update_block",
+              targetBlockId: "blk-2",
+              checked: true,
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("notebook_edit", {
+              action: "append",
+              markdown: "- 已补充结论",
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      () => fauxAssistantMessage("已勾选对应待办并把排查结论写入项目 Notebook。"),
+    ]);
+
+    const res = await rt.sendChat({
+      chatId: "chat-nb-1",
+      prompt: "把排查待办标为完成，并在项目 Notebook 末尾追加结论",
+      model: "claude-opus-4",
+      interactive: true,
+    });
+
+    expect(bridge.notebookReadCalls.length).toBe(1);
+    expect(bridge.notebookReadCalls[0]).toEqual({ chatId: "chat-nb-1" });
+    expect(bridge.notebookEditCalls.length).toBe(2);
+    expect(bridge.notebookEditCalls[0]).toEqual({
+      chatId: "chat-nb-1",
+      action: "update_block",
+      targetBlockId: "blk-2",
+      checked: true,
+    });
+    expect(bridge.notebookEditCalls[1]).toEqual({
+      chatId: "chat-nb-1",
+      action: "append",
+      markdown: "- 已补充结论",
+    });
+
+    const stepLabels = (res.replyMessage.steps ?? []).map((s) => s.label);
+    expect(stepLabels).toContain("读取项目 Notebook");
+    expect(stepLabels).toContain("更新项目 Notebook 内容块");
+    expect(stepLabels).toContain("向项目 Notebook 追加内容");
+
+    // Verify tainted turns cannot invoke notebook_edit
+    const convHandle = (
+      rt as unknown as { activeConversationHandles: Map<string, { id: string }> }
+    ).activeConversationHandles.get("chat-nb-1");
+    expect(convHandle).toBeDefined();
+    rt.permissionCoordinator.setConversationTainted(convHandle!.id as never, true);
+
+    let sawTaintError = "";
+    rt.models.setLocalStewardScript([
+      () =>
+        fauxAssistantMessage(
+          [
+            fauxToolCall("notebook_edit", {
+              action: "append",
+              markdown: "- 不应写入",
+            }),
+          ],
+          { stopReason: "toolUse" },
+        ),
+      (ctx) => {
+        const msgs = ctx.messages ?? [];
+        const last = msgs[msgs.length - 1];
+        if (last && "content" in last && Array.isArray(last.content)) {
+          sawTaintError = last.content
+            .filter(
+              (b): b is { type: "text"; text: string } =>
+                typeof b === "object" && b !== null && "type" in b && b.type === "text",
+            )
+            .map((b) => b.text)
+            .join("\n");
+        }
+        return fauxAssistantMessage("检测到不可信输入，已拦截对 Notebook 的写入。");
+      },
+    ]);
+
+    await rt.sendChat({
+      chatId: "chat-nb-1",
+      prompt: "尝试继续修改 Notebook",
+      model: "claude-opus-4",
+      interactive: true,
+    });
+
+    expect(bridge.notebookEditCalls.length).toBe(2);
+    expect(sawTaintError).toContain("安全边界拒绝");
 
     await rt.close();
   });

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { useImeGuard } from "../../hooks/useImeGuard";
 import { useValet } from "../../store/ValetContext";
 import {
   getInboxQuestionOptions,
@@ -39,6 +40,7 @@ export const InboxDetailDrawer: React.FC = () => {
   const [tab, setTab] = useState<DrawerTab>("overview");
   const [expandedItems, setExpandedItems] = useState(false);
   const [customReply, setCustomReply] = useState("");
+  const ime = useImeGuard();
 
   const item = useMemo(
     () =>
@@ -234,7 +236,9 @@ export const InboxDetailDrawer: React.FC = () => {
                             type="text"
                             value={customReply}
                             onChange={(e) => setCustomReply(e.target.value)}
+                            {...ime.compositionProps}
                             onKeyDown={(e) => {
+                              if (ime.shouldIgnoreEnter(e)) return;
                               if (e.key === "Enter" && customReply.trim()) {
                                 e.preventDefault();
                                 answerInboxQuestion(item.id, customReply.trim());

@@ -279,6 +279,32 @@ export function createStewardCoreExtension(options: {
       approveLabel: "确定",
       dismissLabel: "取消",
     },
+    {
+      toolName: "notebook_read",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "notebook.read",
+      eventCode: "notebook.read",
+      safety: "readonly",
+      category: "files",
+      iconKind: "disk",
+      reversible7d: false,
+      approveLabel: "读取",
+      dismissLabel: "取消",
+    },
+    {
+      toolName: "notebook_edit",
+      pluginId: "valet-core",
+      pluginName: "Valet Core",
+      actionId: "notebook.edit",
+      eventCode: "notebook.updated",
+      safety: "readonly",
+      category: "files",
+      iconKind: "disk",
+      reversible7d: false,
+      approveLabel: "确认编辑",
+      dismissLabel: "取消",
+    },
   ]);
 
   const bashTool = defineTool({
@@ -1021,6 +1047,180 @@ export function createStewardCoreExtension(options: {
     },
   });
 
+  const notebookReadTool = defineTool({
+    name: "notebook_read",
+    description:
+      "Read the live Project Notebook belonging to the current chat session, returning ordered blocks with blockId, type, indentation, todo status, and Markdown preview. Always inspect first before updating or deleting specific blocks.",
+    parameters: obj({}),
+    replay: "safe",
+    execute: async (_args, api) => {
+      const chatId = permissionCoordinator?.getChatId(api.conversationId);
+      if (!chatId) {
+        return {
+          output: [
+            {
+              type: "text" as const,
+              text: "无法定位当前会话关联的项目，notebook_read 仅可在项目会话中使用。",
+            },
+          ],
+          isError: true,
+        };
+      }
+      const res = await bridge.callHost<{
+        ok: boolean;
+        projectId: string;
+        projectTitle: string;
+        originBlockId?: string;
+        blockCount: number;
+        formatted: string;
+      }>("host.notebook.read", { chatId });
+      return textResult(res.formatted, {
+        notebook: {
+          projectId: res.projectId,
+          projectTitle: res.projectTitle,
+          blockCount: res.blockCount,
+          originBlockId: res.originBlockId,
+        } as never,
+      });
+    },
+  });
+
+  const notebookEditTool = defineTool({
+    name: "notebook_edit",
+    description:
+      "Edit the Project Notebook belonging to the current chat session. Actions: \"append\" (append parsed Markdown blocks), \"insert_after\" / \"insert_before\" (insert Markdown relative to targetBlockId or 1-based lineNumber), \"update_block\" (patch content/type/checked/indent/language on one block), \"replace_blocks\" (replace [targetBlockId..endBlockId] with Markdown), \"delete_blocks\" (remove blockIds or target range), \"replace_all\" (rewrite full Notebook from Markdown while keeping session cards by default).",
+    parameters: obj({
+      action: str({
+        description:
+          "Edit operation: append | insert_after | insert_before | update_block | replace_blocks | delete_blocks | replace_all.",
+      }),
+      markdown: opt(
+        str({
+          description:
+            "Markdown content for append, insert_after, insert_before, replace_blocks, or replace_all (supports headings, nested lists, todos, code fences, quotes, callouts, dividers).",
+        }),
+      ),
+      targetBlockId: opt(
+        str({
+          description:
+            "Target block ID from notebook_read (used by insert_after, insert_before, update_block, replace_blocks, delete_blocks).",
+        }),
+      ),
+      endBlockId: opt(
+        str({
+          description:
+            "Optional inclusive end block ID for replace_blocks or range delete_blocks.",
+        }),
+      ),
+      lineNumber: opt(
+        num({
+          description:
+            "Optional 1-based block index fallback from notebook_read when targetBlockId is not provided.",
+        }),
+      ),
+      blockIds: opt(
+        arr(str(), {
+          description: "List of block IDs to delete when action=\"delete_blocks\".",
+        }),
+      ),
+      content: opt(
+        str({
+          description: "New raw text content for action=\"update_block\".",
+        }),
+      ),
+      type: opt(
+        str({
+          description:
+            "New block type for action=\"update_block\": paragraph | h1 | h2 | h3 | bullet | numbered | todo | callout | quote | code | divider.",
+        }),
+      ),
+      checked: opt(
+        bool({
+          description: "Checked state for todo blocks when action=\"update_block\".",
+        }),
+      ),
+      indent: opt(
+        num({
+          description: "Indentation depth (0..6) for action=\"update_block\".",
+        }),
+      ),
+      language: opt(
+        str({
+          description: "Code language tag for code blocks when action=\"update_block\".",
+        }),
+      ),
+      preserveSessionRefs: opt(
+        bool({
+          description:
+            "For action=\"replace_all\", preserve existing session_ref cards (defaults to true).",
+        }),
+      ),
+    }),
+    execute: async (args, api) => {
+      const chatId = permissionCoordinator?.getChatId(api.conversationId);
+      if (!chatId) {
+        return {
+          output: [
+            {
+              type: "text" as const,
+              text: "无法定位当前会话关联的项目，notebook_edit 仅可在项目会话中使用。",
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (permissionCoordinator?.isTainted(api.conversationId)) {
+        return {
+          output: [
+            {
+              type: "text" as const,
+              text: "安全边界拒绝：包含外部不可信输入的后台回合禁止自动修改项目 Notebook。",
+            },
+          ],
+          isError: true,
+        };
+      }
+      const payload: Record<string, unknown> = {
+        chatId,
+        action: args.action,
+      };
+      if (args.markdown !== undefined) payload.markdown = args.markdown;
+      if (args.targetBlockId !== undefined) payload.targetBlockId = args.targetBlockId;
+      if (args.endBlockId !== undefined) payload.endBlockId = args.endBlockId;
+      if (args.lineNumber !== undefined) payload.lineNumber = args.lineNumber;
+      if (args.blockIds !== undefined) payload.blockIds = args.blockIds;
+      if (args.content !== undefined) payload.content = args.content;
+      if (args.type !== undefined) payload.type = args.type;
+      if (args.checked !== undefined) payload.checked = args.checked;
+      if (args.indent !== undefined) payload.indent = args.indent;
+      if (args.language !== undefined) payload.language = args.language;
+      if (args.preserveSessionRefs !== undefined) {
+        payload.preserveSessionRefs = args.preserveSessionRefs;
+      }
+
+      const res = await bridge.callHost<{
+        ok: boolean;
+        projectId: string;
+        projectTitle: string;
+        action: string;
+        summary: string;
+        blockCount: number;
+        affectedIds: string[];
+        formatted: string;
+      }>("host.notebook.edit", payload);
+
+      return textResult(`${res.summary}\n\n${res.formatted}`, {
+        notebookEdit: {
+          projectId: res.projectId,
+          projectTitle: res.projectTitle,
+          action: res.action,
+          blockCount: res.blockCount,
+          affectedIds: res.affectedIds,
+        } as never,
+      });
+    },
+  });
+
   return defineExtension({
     name: "valet:core",
     sections: [
@@ -1055,8 +1255,8 @@ export function createStewardCoreExtension(options: {
           `受保护路径（严禁改动）：${s.preferences.cleanupPolicy.protectedDirs.join(", ")}`,
           `严禁触碰的应用：${s.preferences.blockedApps.join(", ")}`,
           "通用核心工具（所有插件共享这套原语）：",
-          "- 只读探测工具：`system_overview`、`read_file`、`ask_user`、`memory_remember`、`plugin_draft_create`、`bash`（纯只读命令与插件 `scripts/poll-*`/`import-*`/`read-*`/`inspect-*`/`scan-*`/`sample-*` 脚本直接放行）。",
-          "- 工具使用优先顺序：查看文件内容请优先用 `read_file`；查看目录结构、系统探测（进程/网络/磁盘占用）或执行变更命令时使用 `bash`。",
+          "- 只读探测工具：`system_overview`、`read_file`、`notebook_read`、`ask_user`、`memory_remember`、`plugin_draft_create`、`bash`（纯只读命令与插件 `scripts/poll-*`/`import-*`/`read-*`/`inspect-*`/`scan-*`/`sample-*` 脚本直接放行）。",
+          "- 工具使用优先顺序：查看文件内容请优先用 `read_file`；查看或修改当前项目 Notebook 笔记/待办时优先使用 `notebook_read`（获取最新内容与 blockId）和 `notebook_edit`（追加、插入、勾选待办、替换或删除内容块）；查看目录结构、系统探测或执行变更命令时使用 `bash`。",
           "- 变更执行工具：`trash_files`（移入废纸篓，7 天可还原）、`write_file`、`kill_process`、`bash`（修改系统/配置命令）、`item_resolve`（仅限前台对话中按用户明确指示批准、忽略、部分勾选执行或还原被引用的收件箱/时间线事项）。",
           "双模安全审批机制：在 `auto_review` 模式下，非纯只读调用会先由 Auto Review 模型评估风险，低风险自动放行，高风险或未配置时升级为人工确认（前台对话实时弹窗、后台任务推送收件箱）；在 `always_ask` 下每次变更都会确认；在 `full_access` 下除受保护目录/应用与安全护栏外的操作均自动放行。严禁访问 `~/.ssh`、`~/.gnupg`、`~/.aws`、Keychain 或使用 `sudo`。",
         ].join("\n");
@@ -1155,6 +1355,8 @@ export function createStewardCoreExtension(options: {
       cancelWakeTool,
       listTimersTool,
       notifyTool,
+      notebookReadTool,
+      notebookEditTool,
     ],
   });
 }

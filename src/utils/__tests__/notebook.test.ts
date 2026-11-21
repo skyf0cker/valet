@@ -9,6 +9,7 @@ import {
   joinTextWithInlineRefs,
   parseInlineNotebookText,
   removeInlineRefAt,
+  serializeBlocksToMarkdown,
   splitInlineRefs,
 } from "../notebook";
 
@@ -361,5 +362,24 @@ describe("notebook Notion markdown extensions", () => {
       { kind: "text", text: " 和 " },
       { kind: "link", label: "官网", href: "https://valet.dev" },
     ]);
+  });
+
+  it("serializes a selected subset of blocks without a project title header", () => {
+    const subset: Project["blocks"] = [
+      { id: "b1", type: "bullet", content: "Parent" },
+      { id: "b2", type: "todo", checked: true, content: "Done child", indent: 1 },
+      { id: "n1", type: "numbered", content: "First" },
+      { id: "c1", type: "code", language: "bash", content: "echo hi" },
+    ];
+    expect(serializeBlocksToMarkdown(subset, [])).toBe(
+      [
+        "- Parent",
+        "  - [x] Done child",
+        "1. First",
+        "```bash",
+        "echo hi",
+        "```",
+      ].join("\n")
+    );
   });
 });

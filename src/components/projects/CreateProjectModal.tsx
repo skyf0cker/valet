@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { useImeGuard } from "../../hooks/useImeGuard";
 import { useValet } from "../../store/ValetContext";
 import type { ProjectIconKind } from "../../types/valet";
 import {
@@ -31,6 +32,7 @@ export const CreateProjectModal: React.FC<{
   const [tagsInput, setTagsInput] = useState("");
   const [icon, setIcon] = useState<ProjectIconKind>("book");
   const [submitting, setSubmitting] = useState(false);
+  const ime = useImeGuard();
 
   useEffect(() => {
     if (open) {
@@ -74,7 +76,16 @@ export const CreateProjectModal: React.FC<{
       title="新建项目"
       subtitle="项目既是对话的管理容器，也是一个支持 Markdown 与 @valet 的 Notebook"
     >
-      <form onSubmit={(e) => void handleSubmit(e)} className="flex flex-col gap-4">
+      <form
+        onSubmit={(e) => void handleSubmit(e)}
+        {...ime.compositionProps}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && ime.shouldIgnoreEnter(e)) {
+            e.preventDefault();
+          }
+        }}
+        className="flex flex-col gap-4"
+      >
         <div className="flex flex-col gap-1.5">
           <label className="font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--ink-subtle)]">
             图标与项目名称

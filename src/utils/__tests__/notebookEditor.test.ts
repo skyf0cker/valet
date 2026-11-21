@@ -6,12 +6,20 @@ import {
   applyMarkdownPasteToBlocks,
   clampBlockIndent,
   computeNumberedListMarkers,
+  convertSelectedBlocks,
+  deleteSelectedBlocks,
+  duplicateSelectedBlocks,
+  getBlockRangeIds,
   indentBlockSubtree,
+  indentSelectedBlocks,
   mapRenderedOffsetToRawOffset,
   MAX_NOTEBOOK_INDENT,
   moveBlockSubtree,
+  moveSelectedBlocks,
   parseMarkdownToBlocks,
+  replaceSelectedBlocksWithMarkdown,
   toggleInlineMarkdownFormat,
+  toggleSelectedTodos,
 } from "../notebookEditor";
 
 describe("notebookEditor indentation and subtree movement", () => {
@@ -300,5 +308,128 @@ describe("notebookEditor inline formatting, code editing, and click caret mappin
     expect(mapRenderedOffsetToRawOffset(raw, 23)).toBe(30);
     // End of rendered string -> end of raw string
     expect(mapRenderedOffsetToRawOffset(raw, 999)).toBe(raw.length);
+  });
+});
+
+describe("notebookEditor multi-block selection operations", () => {
+  it("computes inclusive forward and reverse block ranges cleanly", () => {
+    const blocks: NotebookBlock[] = [
+      { id: "a", type: "paragraph", content: "A" },
+      { id: "b", type: "bullet", content: "B" },
+      { id: "c", type: "todo", content: "C" },
+      { id: "d", type: "paragraph", content: "D" },
+    ];
+    expect(getBlockRangeIds(blocks, "b", "d")).toEqual(["b", "c", "d"]);
+    expect(getBlockRangeIds(blocks, "d", "b")).toEqual(["b", "c", "d"]);
+    expect(getBlockRangeIds(blocks, "b", "missing")).toEqual([]);
+  });
+
+  it("deletes multi-block selections, normalizes indents, and falls back to one empty paragraph", () => {
+    const blocks: NotebookBlock[] = [
+      { id: "h", type: "h1", content: "Title" },
+      { id: "b1", type: "bullet", content: "Parent" },
+      { id: "b2", type: "bullet", content: "Child", indent: 1 },
+      { id: "p", type: "paragraph", content: "Trailing", indent: 1 },
+    ];
+
+    const partial = deleteSelectedBlocks(blocks, new Set(["b1", "b2"]));
+    expect(partial).not.toBe(null);
+    expect(partial!.blocks.map((b) => [b.id, b.indent ?? 0])).toEqual([
+      ["h", 0],
+      ["p", 0],
+    ]);
+    expect(partial!.focusBlockId).toBe("h");
+    expect(partial!.focusCursorPos).toBe("Title".length);
+
+    const clearAll = deleteSelectedBlocks(
+      blocks,
+      new Set(["h", "b1", "b2", "p"])
+    );
+    expect(clearAll).not.toBe(null);
+    expect(clearAll!.blocks).toHaveLength(1);
+    expect(clearAll!.blocks[0]!.type).toBe("paragraph");
+    expect(clearAll!.blocks[0]!.content).toBe("");
+    expect(clearAll!.focusBlockId).toBe(clearAll!.blocks[0]!.id);
+  });
+
+  it("batch-indents and outdents selected blocks while preserving valid hierarchy", () => {
+    const blocks: NotebookBlock[] = [
+      { id: "p0", type: "bullet", content: "Anchor" },
+      { id: "p1", type: "bullet", content: "First" },
+      { id: "p2", type: "bullet", content: "Nested", indent: 1 },
+      { id: "unselected", type: "bullet", content: "Child", indent: 2 },
+    ];
+
+    const indented = indentSelectedBlocks(blocks, new Set(["p1", "p2"]), 1);
+    expect(indented).not.toBe(null);
+    expect(indented!.map((b) => b.indent ?? 0)).toEqual([0, 1, 2, 2]);
+
+    const outdented = indentSelectedBlocks(indented!, new Set(["p1", "p2"]), -1);
+    expect(outdented).not.toBe(null);
+    expect(outdented!.map((b) => b.indent ?? 0)).toEqual([0, 0, 1, 2]);
+
+    // Outdenting p2 again pulls unselected level-2 child down to level 1 so no orphan exists
+    const outdentedAgain = indentSelectedBlocks(outdented!, new Set(["p2"]), -1);
+    expect(outdentedAgain).not.toBe(null);
+    expect(outdentedAgain!.map((b) => b.indent ?? 0)).toEqual([0, 0, 0, 1]);
+  });
+
+  it("duplicates, moves, converts, toggles todos, and replaces selected blocks via Markdown paste", () => {
+    const blocks: NotebookBlock[] = [
+      { id: "a", type: "paragraph", content: "One" },
+      { id: "b", type: "todo", checked: false, content: "Two" },
+      { id: "div", type: "divider", content: "" },
+      { id: "c", type: "todo", checked: true, content: "Three" },
+    ];
+
+    const dup = duplicateSelectedBlocks(blocks, new Set(["a", "b"]));
+    expect(dup).not.toBe(null);
+    expect(dup!.blocks.map((x) => x.content)).toEqual([
+      "One",
+      "Two",
+      "One",
+      "Two",
+      "",
+      "Three",
+    ]);
+    expect(dup!.duplicatedIds).toHaveLength(2);
+    expect(dup!.duplicatedIds[0]).not.toBe("a");
+
+    const movedDown = moveSelectedBlocks(blocks, new Set(["a", "b"]), 1);
+    expect(movedDown).not.toBe(null);
+    expect(movedDown!.map((x) => x.id)).toEqual(["div", "a", "b", "c"]);
+
+    const movedUp = moveSelectedBlocks(movedDown!, new Set(["a", "b"]), -1);
+    expect(movedUp).not.toBe(null);
+    expect(movedUp!.map((x) => x.id)).toEqual(["a", "b", "div", "c"]);
+    expect(moveSelectedBlocks(blocks, new Set(["a", "b"]), -1)).toBe(null);
+
+    const converted = convertSelectedBlocks(blocks, new Set(["a", "div"]), "h2");
+    expect(converted).not.toBe(null);
+    expect(converted![0]!.type).toBe("h2");
+    expect(converted![2]!.type).toBe("divider");
+
+    const toggledTodos = toggleSelectedTodos(blocks, new Set(["b", "c"]));
+    expect(toggledTodos).not.toBe(null);
+    expect(toggledTodos![1]!.checked).toBe(true);
+    expect(toggledTodos![3]!.checked).toBe(true);
+
+    const uncheckAll = toggleSelectedTodos(toggledTodos!, new Set(["b", "c"]));
+    expect(uncheckAll![1]!.checked).toBe(false);
+    expect(uncheckAll![3]!.checked).toBe(false);
+
+    const replaced = replaceSelectedBlocksWithMarkdown(
+      blocks,
+      new Set(["b", "div"]),
+      "- New bullet\n  - Sub item"
+    );
+    expect(replaced).not.toBe(null);
+    expect(replaced!.blocks.map((x) => [x.type, x.content, x.indent ?? 0])).toEqual([
+      ["paragraph", "One", 0],
+      ["bullet", "New bullet", 0],
+      ["bullet", "Sub item", 1],
+      ["todo", "Three", 0],
+    ]);
+    expect(replaced!.focusCursorPos).toBe("Sub item".length);
   });
 });

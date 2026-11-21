@@ -5,6 +5,7 @@ import type {
   PluginDraftSpec,
 } from "../../types/valet";
 import { CheckIcon } from "../ui/Icons";
+import { useImeGuard } from "../../hooks/useImeGuard";
 import { stripThinkMarkup } from "../../utils/chatClipboard";
 import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { Modal } from "../ui/Modal";
@@ -258,6 +259,7 @@ export const PermissionAskCard: React.FC<{
 }> = ({ request, onResolve }) => {
   const [note, setNote] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const ime = useImeGuard();
   const isQuestion = request.toolName === "ask_user";
 
   const submit = (decision: "allow_once" | "allow_session" | "deny", customNote?: string) => {
@@ -336,7 +338,9 @@ export const PermissionAskCard: React.FC<{
             type="text"
             value={note}
             onChange={(e) => setNote(e.target.value)}
+            {...ime.compositionProps}
             onKeyDown={(e) => {
+              if (ime.shouldIgnoreEnter(e)) return;
               if (e.key === "Enter" && note.trim()) {
                 e.preventDefault();
                 submit("allow_once", note.trim());

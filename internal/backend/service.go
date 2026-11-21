@@ -1220,6 +1220,12 @@ func (s *Service) handleSidecarHostRequest(ctx context.Context, method string, r
 	case "host.item.resolve":
 		return s.execHostItemResolve(ctx, raw)
 
+	case "host.notebook.read":
+		return s.execHostNotebookRead(raw)
+
+	case "host.notebook.edit":
+		return s.execHostNotebookEdit(raw)
+
 	default:
 		return nil, fmt.Errorf("unknown host RPC method: %s", method)
 	}

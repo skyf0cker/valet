@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useImeGuard } from "../../hooks/useImeGuard";
 import { useValet } from "../../store/ValetContext";
 import type {
   ChatThread,
@@ -16,6 +17,7 @@ import {
   makeBlockId,
   parseInlineNotebookText,
   removeInlineRefAt,
+  serializeBlocksToMarkdown,
   splitInlineRefs,
   type InlineRefToken,
 } from "../../utils/notebook";
@@ -25,12 +27,20 @@ import {
   applyMarkdownPasteToBlocks,
   clampBlockIndent,
   computeNumberedListMarkers,
+  convertSelectedBlocks,
+  deleteSelectedBlocks,
+  duplicateSelectedBlocks,
+  getBlockRangeIds,
   indentBlockSubtree,
+  indentSelectedBlocks,
   isIndentableBlockType,
   mapRenderedOffsetToRawOffset,
   moveBlockSubtree,
+  moveSelectedBlocks,
   normalizeBlockIndents,
+  replaceSelectedBlocksWithMarkdown,
   toggleInlineMarkdownFormat,
+  toggleSelectedTodos,
   type InlineFormatKind,
 } from "../../utils/notebookEditor";
 import {
@@ -51,6 +61,7 @@ import {
   type MentionAction,
   type SlashBlockChoice,
 } from "./NotebookMentionPopover";
+import { NotebookSelectionBar } from "./NotebookSelectionBar";
 import { InlineSessionChip, SessionRefBlockCard } from "./SessionRefCard";
 
 export function exportProjectMarkdownFile(project: Project, threads: ChatThread[]): void {
@@ -209,6 +220,78 @@ function isTextareaOnVisualLastLine(el: HTMLTextAreaElement, selEnd: number): bo
   return selEnd === el.value.length;
 }
 
+const SELECTION_INTERACTIVE_SELECTOR = [
+  "button",
+  "a",
+  "input",
+  "select",
+  "[data-inline-interactive]",
+  "[data-block-gutter]",
+  "[data-block-menu]",
+  "[data-notebook-toolbar]",
+  "[data-valet-composer]",
+  "[data-popover]",
+].join(", ");
+
+function isSelectionInteractiveTarget(target: EventTarget | null): boolean {
+  if (!target || typeof Element === "undefined" || !(target instanceof Element)) {
+    return false;
+  }
+  return Boolean(target.closest(SELECTION_INTERACTIVE_SELECTOR));
+}
+
+function findBlockIdAtClientY(container: HTMLElement, clientY: number): string | null {
+  const elements = Array.from(container.querySelectorAll<HTMLElement>("[data-block-id]"));
+  if (elements.length === 0) return null;
+
+  for (const el of elements) {
+    const rect = el.getBoundingClientRect();
+    if (clientY >= rect.top && clientY <= rect.bottom) {
+      return el.dataset.blockId ?? null;
+    }
+  }
+
+  const firstRect = elements[0]!.getBoundingClientRect();
+  if (clientY < firstRect.top) {
+    return elements[0]!.dataset.blockId ?? null;
+  }
+
+  let nearestId = elements[elements.length - 1]!.dataset.blockId ?? null;
+  let minDistance = Number.POSITIVE_INFINITY;
+  for (const el of elements) {
+    const rect = el.getBoundingClientRect();
+    const dist =
+      clientY < rect.top ? rect.top - clientY : clientY > rect.bottom ? clientY - rect.bottom : 0;
+    if (dist < minDistance) {
+      minDistance = dist;
+      nearestId = el.dataset.blockId ?? null;
+    }
+  }
+  return nearestId;
+}
+
+function findScrollContainer(el: HTMLElement | null): HTMLElement | null {
+  let cur = el?.parentElement ?? null;
+  while (cur) {
+    const style = window.getComputedStyle(cur);
+    if (
+      (style.overflowY === "auto" || style.overflowY === "scroll") &&
+      cur.scrollHeight > cur.clientHeight
+    ) {
+      return cur;
+    }
+    cur = cur.parentElement;
+  }
+  return null;
+}
+
+interface MarqueeRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
 function getEditableTypographyClass(type: NotebookBlockType, checked?: boolean): string {
   switch (type) {
     case "h1":
@@ -252,6 +335,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
   const [workingDirDraft, setWorkingDirDraft] = useState(project.workingDir ?? "");
   const [addingTag, setAddingTag] = useState(false);
   const [tagDraft, setTagDraft] = useState("");
+  const headerIme = useImeGuard();
 
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
   const [textSelection, setTextSelection] = useState<{
@@ -280,7 +364,11 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
   const [draggedBlockId, setDraggedBlockId] = useState<string | null>(null);
   const [dragOverBlockId, setDragOverBlockId] = useState<string | null>(null);
   const [highlightedBlockId, setHighlightedBlockId] = useState<string | null>(null);
+  const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
+  const [isDraggingSelection, setIsDraggingSelection] = useState(false);
+  const [marqueeRect, setMarqueeRect] = useState<MarqueeRect | null>(null);
 
+  const editorRootRef = useRef<HTMLDivElement | null>(null);
   const blockTextareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   const pendingSelectionRef = useRef<{ blockId: string; start: number; end: number } | null>(
     null
@@ -290,6 +378,21 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
   blocksRef.current = project.blocks;
   const focusedBlockIdRef = useRef<string | null>(null);
   focusedBlockIdRef.current = focusedBlockId;
+  const selectedBlockIdsRef = useRef<string[]>([]);
+  selectedBlockIdsRef.current = selectedBlockIds;
+  const selectedBlockIdSet = useMemo(() => new Set(selectedBlockIds), [selectedBlockIds]);
+  const selectionAnchorIdRef = useRef<string | null>(null);
+  const selectionHeadIdRef = useRef<string | null>(null);
+  const dragSessionRef = useRef<{
+    mode: "block-cross" | "marquee";
+    anchorBlockId?: string;
+    startClientX: number;
+    startClientY: number;
+    startScrollTop: number;
+    scrollContainer: HTMLElement | null;
+    active: boolean;
+  } | null>(null);
+  const suppressNextClickRef = useRef(false);
   const historyRef = useRef<{
     past: NotebookHistorySnapshot[];
     future: NotebookHistorySnapshot[];
@@ -302,7 +405,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     lastCoalesceAt: 0,
   });
 
-  // Reset local header drafts & history when switching projects
+  // Reset local header drafts, selection & history when switching projects
   useEffect(() => {
     setTitleDraft(project.title);
     setDescDraft(project.description ?? "");
@@ -313,6 +416,12 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     setSlashState(null);
     setValetComposerState(null);
     setBlockMenuId(null);
+    setSelectedBlockIds([]);
+    setIsDraggingSelection(false);
+    setMarqueeRect(null);
+    selectionAnchorIdRef.current = null;
+    selectionHeadIdRef.current = null;
+    dragSessionRef.current = null;
     historyRef.current = {
       past: [],
       future: [],
@@ -473,8 +582,18 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     [project.id, updateProject]
   );
 
+  const projectThreadsRef = useRef(projectThreads);
+  projectThreadsRef.current = projectThreads;
+
+  const clearBlockSelection = useCallback(() => {
+    selectionAnchorIdRef.current = null;
+    selectionHeadIdRef.current = null;
+    setSelectedBlockIds((cur) => (cur.length > 0 ? [] : cur));
+  }, []);
+
   const focusBlockAt = useCallback(
     (blockId: string, cursorPos?: number, cursorEnd?: number) => {
+      clearBlockSelection();
       if (cursorPos !== undefined) {
         pendingSelectionRef.current = {
           blockId,
@@ -484,8 +603,146 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       }
       setFocusedBlockId(blockId);
     },
+    [clearBlockSelection]
+  );
+
+  const selectBlockRange = useCallback(
+    (anchorId: string, headId: string) => {
+      const range = getBlockRangeIds(blocksRef.current, anchorId, headId);
+      if (range.length === 0) return;
+      selectionAnchorIdRef.current = anchorId;
+      selectionHeadIdRef.current = headId;
+      const activeEl = document.activeElement;
+      if (
+        activeEl instanceof HTMLElement &&
+        editorRootRef.current?.contains(activeEl) &&
+        (activeEl instanceof HTMLTextAreaElement || activeEl.getAttribute("role") === "textbox")
+      ) {
+        activeEl.blur();
+      }
+      setFocusedBlockId(null);
+      setTextSelection(null);
+      setMentionState(null);
+      setSlashState(null);
+      setBlockMenuId(null);
+      setSelectedBlockIds(range);
+    },
     []
   );
+
+  const handleSelectAllBlocks = useCallback(() => {
+    const cur = blocksRef.current;
+    if (cur.length === 0) return;
+    selectionAnchorIdRef.current = cur[0]!.id;
+    selectionHeadIdRef.current = cur[cur.length - 1]!.id;
+    const activeEl = document.activeElement;
+    if (activeEl instanceof HTMLElement && editorRootRef.current?.contains(activeEl)) {
+      activeEl.blur();
+    }
+    setFocusedBlockId(null);
+    setTextSelection(null);
+    setMentionState(null);
+    setSlashState(null);
+    setBlockMenuId(null);
+    setSelectedBlockIds(cur.map((b) => b.id));
+  }, []);
+
+  const handleDeleteSelectedBlocks = useCallback(() => {
+    const ids = new Set(selectedBlockIdsRef.current);
+    const res = deleteSelectedBlocks(blocksRef.current, ids);
+    if (!res) return;
+    clearBlockSelection();
+    commitBlocks(res.blocks);
+    if (res.focusBlockId) {
+      focusBlockAt(res.focusBlockId, res.focusCursorPos);
+    } else {
+      setFocusedBlockId(null);
+    }
+  }, [clearBlockSelection, commitBlocks, focusBlockAt]);
+
+  const handleIndentSelectedBlocks = useCallback(
+    (delta: 1 | -1) => {
+      const ids = new Set(selectedBlockIdsRef.current);
+      const next = indentSelectedBlocks(blocksRef.current, ids, delta);
+      if (!next) return;
+      commitBlocks(next);
+    },
+    [commitBlocks]
+  );
+
+  const handleCopySelectedBlocks = useCallback(() => {
+    const ids = new Set(selectedBlockIdsRef.current);
+    const selected = blocksRef.current.filter((b) => ids.has(b.id));
+    if (selected.length === 0) return;
+    const md = serializeBlocksToMarkdown(selected, projectThreadsRef.current);
+    if (!md) return;
+    void copyTextToClipboard(md).then((ok) => {
+      pushToast(
+        ok ? `已复制选中的 ${selected.length} 个块` : "复制失败，请检查剪贴板权限",
+        ok ? "success" : "warning"
+      );
+    });
+  }, [pushToast]);
+
+  const handleCutSelectedBlocks = useCallback(() => {
+    const ids = new Set(selectedBlockIdsRef.current);
+    const selected = blocksRef.current.filter((b) => ids.has(b.id));
+    if (selected.length === 0) return;
+    const md = serializeBlocksToMarkdown(selected, projectThreadsRef.current);
+    const count = selected.length;
+    if (md) {
+      void copyTextToClipboard(md);
+    }
+    const res = deleteSelectedBlocks(blocksRef.current, ids);
+    if (!res) return;
+    clearBlockSelection();
+    commitBlocks(res.blocks);
+    if (res.focusBlockId) {
+      focusBlockAt(res.focusBlockId, res.focusCursorPos);
+    } else {
+      setFocusedBlockId(null);
+    }
+    pushToast(`已剪切 ${count} 个块`, "success");
+  }, [clearBlockSelection, commitBlocks, focusBlockAt, pushToast]);
+
+  const handleDuplicateSelectedBlocks = useCallback(() => {
+    const ids = new Set(selectedBlockIdsRef.current);
+    const res = duplicateSelectedBlocks(blocksRef.current, ids);
+    if (!res) return;
+    commitBlocks(res.blocks);
+    if (res.duplicatedIds.length > 0) {
+      selectionAnchorIdRef.current = res.duplicatedIds[0]!;
+      selectionHeadIdRef.current = res.duplicatedIds[res.duplicatedIds.length - 1]!;
+      setSelectedBlockIds(res.duplicatedIds);
+    }
+  }, [commitBlocks]);
+
+  const handleMoveSelectedBlocks = useCallback(
+    (delta: -1 | 1) => {
+      const ids = new Set(selectedBlockIdsRef.current);
+      const next = moveSelectedBlocks(blocksRef.current, ids, delta);
+      if (!next) return;
+      commitBlocks(next);
+    },
+    [commitBlocks]
+  );
+
+  const handleConvertSelectedBlocks = useCallback(
+    (targetType: NotebookBlockType) => {
+      const ids = new Set(selectedBlockIdsRef.current);
+      const next = convertSelectedBlocks(blocksRef.current, ids, targetType);
+      if (!next) return;
+      commitBlocks(next);
+    },
+    [commitBlocks]
+  );
+
+  const handleToggleSelectedTodos = useCallback(() => {
+    const ids = new Set(selectedBlockIdsRef.current);
+    const next = toggleSelectedTodos(blocksRef.current, ids);
+    if (!next) return;
+    commitBlocks(next);
+  }, [commitBlocks]);
 
   const handleUndo = useCallback(() => {
     const hist = historyRef.current;
@@ -505,6 +762,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
     setMentionState(null);
     setSlashState(null);
+    clearBlockSelection();
     commitBlocks(prev.blocks, { recordHistory: false });
     if (prev.focusedBlockId) {
       focusBlockAt(prev.focusedBlockId, prev.selStart, prev.selEnd);
@@ -512,7 +770,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       setFocusedBlockId(null);
     }
     return true;
-  }, [commitBlocks, focusBlockAt]);
+  }, [clearBlockSelection, commitBlocks, focusBlockAt]);
 
   const handleRedo = useCallback(() => {
     const hist = historyRef.current;
@@ -532,6 +790,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
     setMentionState(null);
     setSlashState(null);
+    clearBlockSelection();
     commitBlocks(nextSnap.blocks, { recordHistory: false });
     if (nextSnap.focusedBlockId) {
       focusBlockAt(nextSnap.focusedBlockId, nextSnap.selStart, nextSnap.selEnd);
@@ -539,34 +798,342 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       setFocusedBlockId(null);
     }
     return true;
-  }, [commitBlocks, focusBlockAt]);
+  }, [clearBlockSelection, commitBlocks, focusBlockAt]);
 
+  // Global mousemove / mouseup tracking for Notion-style cross-block drag & margin marquee
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.defaultPrevented) return;
-      const active = document.activeElement;
-      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+    const onMouseMove = (e: MouseEvent) => {
+      const session = dragSessionRef.current;
+      const root = editorRootRef.current;
+      if (!session || !root) return;
+
+      const sc = session.scrollContainer;
+      if (sc && session.active) {
+        const scRect = sc.getBoundingClientRect();
+        if (e.clientY < scRect.top + 48) {
+          sc.scrollTop -= Math.max(4, Math.round((scRect.top + 48 - e.clientY) / 3));
+        } else if (e.clientY > scRect.bottom - 48) {
+          sc.scrollTop += Math.max(4, Math.round((e.clientY - (scRect.bottom - 48)) / 3));
+        }
+      }
+
+      const dx = e.clientX - session.startClientX;
+      const dy = e.clientY - session.startClientY;
+
+      if (session.mode === "block-cross" && session.anchorBlockId) {
+        const overBlockId = findBlockIdAtClientY(root, e.clientY);
+        if (!session.active) {
+          if (
+            overBlockId &&
+            overBlockId !== session.anchorBlockId &&
+            Math.hypot(dx, dy) > 4
+          ) {
+            session.active = true;
+            window.getSelection()?.removeAllRanges();
+            const active = document.activeElement;
+            if (active instanceof HTMLElement && root.contains(active)) {
+              active.blur();
+            }
+            setFocusedBlockId(null);
+            setTextSelection(null);
+            setMentionState(null);
+            setSlashState(null);
+            setBlockMenuId(null);
+            setIsDraggingSelection(true);
+          } else {
+            return;
+          }
+        }
+        if (overBlockId) {
+          const range = getBlockRangeIds(
+            blocksRef.current,
+            session.anchorBlockId,
+            overBlockId
+          );
+          if (range.length > 0) {
+            selectionAnchorIdRef.current = session.anchorBlockId;
+            selectionHeadIdRef.current = overBlockId;
+            setSelectedBlockIds(range);
+          }
+        }
         return;
+      }
+
+      if (session.mode === "marquee") {
+        if (!session.active) {
+          if (Math.abs(dx) <= 6 && Math.abs(dy) <= 6) return;
+          session.active = true;
+          window.getSelection()?.removeAllRanges();
+          const active = document.activeElement;
+          if (active instanceof HTMLElement && root.contains(active)) {
+            active.blur();
+          }
+          setFocusedBlockId(null);
+          setTextSelection(null);
+          setMentionState(null);
+          setSlashState(null);
+          setBlockMenuId(null);
+          setIsDraggingSelection(true);
+        }
+
+        const scrollOffset = sc ? sc.scrollTop - session.startScrollTop : 0;
+        const anchorViewportY = session.startClientY - scrollOffset;
+        const rect: MarqueeRect = {
+          left: Math.min(session.startClientX, e.clientX),
+          top: Math.min(anchorViewportY, e.clientY),
+          width: Math.abs(e.clientX - session.startClientX),
+          height: Math.abs(e.clientY - anchorViewportY),
+        };
+        setMarqueeRect(rect);
+
+        const hits: string[] = [];
+        const blockEls = root.querySelectorAll<HTMLElement>("[data-block-id]");
+        for (const el of blockEls) {
+          const bRect = el.getBoundingClientRect();
+          const intersects =
+            bRect.right >= rect.left &&
+            bRect.left <= rect.left + rect.width &&
+            bRect.bottom >= rect.top &&
+            bRect.top <= rect.top + rect.height;
+          if (intersects && el.dataset.blockId) {
+            hits.push(el.dataset.blockId);
+          }
+        }
+        if (hits.length > 0) {
+          selectionAnchorIdRef.current = hits[0]!;
+          selectionHeadIdRef.current = hits[hits.length - 1]!;
+        } else {
+          selectionAnchorIdRef.current = null;
+          selectionHeadIdRef.current = null;
+        }
+        setSelectedBlockIds(hits);
+      }
+    };
+
+    const onMouseUp = () => {
+      const session = dragSessionRef.current;
+      if (!session) return;
+      dragSessionRef.current = null;
+      setIsDraggingSelection(false);
+      setMarqueeRect(null);
+      if (session.active) {
+        suppressNextClickRef.current = true;
+        window.setTimeout(() => {
+          suppressNextClickRef.current = false;
+        }, 0);
+      } else if (session.mode === "marquee" && selectedBlockIdsRef.current.length > 0) {
+        clearBlockSelection();
+      }
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [clearBlockSelection]);
+
+  // Window keyboard & paste handlers for block multi-selection + unfocused Undo/Redo/SelectAll
+  useEffect(() => {
+    const isModalOrNonEditorEditable = (): boolean => {
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLInputElement ||
+        active instanceof HTMLTextAreaElement ||
+        active instanceof HTMLSelectElement ||
+        (active instanceof HTMLElement && active.isContentEditable)
+      ) {
+        return true;
+      }
+      if (active instanceof HTMLElement && active.closest('[role="dialog"]')) {
+        return true;
       }
       if (
         active instanceof HTMLElement &&
         active !== document.body &&
         !active.closest('[data-notebook-editor="true"]')
       ) {
-        return;
+        return true;
       }
+      return false;
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || isModalOrNonEditorEditable()) return;
+
       const meta = e.metaKey || e.ctrlKey;
       const lower = e.key.toLowerCase();
+
       if (meta && !e.altKey && lower === "z") {
         const handled = e.shiftKey ? handleRedo() : handleUndo();
         if (handled) e.preventDefault();
-      } else if (e.ctrlKey && !e.metaKey && !e.altKey && lower === "y") {
+        return;
+      }
+      if (e.ctrlKey && !e.metaKey && !e.altKey && lower === "y") {
         if (handleRedo()) e.preventDefault();
+        return;
+      }
+
+      if (meta && !e.altKey && !e.shiftKey && lower === "a") {
+        if (document.querySelector('[role="dialog"]')) return;
+        e.preventDefault();
+        handleSelectAllBlocks();
+        return;
+      }
+
+      const selected = selectedBlockIdsRef.current;
+      if (selected.length === 0) return;
+
+      if (e.key === "Escape") {
+        e.preventDefault();
+        clearBlockSelection();
+        return;
+      }
+
+      if ((e.key === "Backspace" || e.key === "Delete") && !meta && !e.altKey) {
+        e.preventDefault();
+        handleDeleteSelectedBlocks();
+        return;
+      }
+
+      if (e.key === "Tab" && !meta && !e.altKey) {
+        e.preventDefault();
+        handleIndentSelectedBlocks(e.shiftKey ? -1 : 1);
+        return;
+      }
+
+      if (meta && !e.altKey && !e.shiftKey && lower === "c") {
+        if (!window.getSelection()?.toString()) {
+          e.preventDefault();
+          handleCopySelectedBlocks();
+        }
+        return;
+      }
+
+      if (meta && !e.altKey && !e.shiftKey && lower === "x") {
+        if (!window.getSelection()?.toString()) {
+          e.preventDefault();
+          handleCutSelectedBlocks();
+        }
+        return;
+      }
+
+      if (meta && !e.altKey && !e.shiftKey && lower === "d") {
+        e.preventDefault();
+        handleDuplicateSelectedBlocks();
+        return;
+      }
+
+      if (meta && e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+        e.preventDefault();
+        handleMoveSelectedBlocks(e.key === "ArrowUp" ? -1 : 1);
+        return;
+      }
+
+      if (meta && e.altKey && QUICK_CONVERT_CODES[e.code]) {
+        e.preventDefault();
+        handleConvertSelectedBlocks(QUICK_CONVERT_CODES[e.code]!);
+        return;
+      }
+
+      if (meta && !e.altKey && !e.shiftKey && e.key === "Enter") {
+        e.preventDefault();
+        handleToggleSelectedTodos();
+        return;
+      }
+
+      if (!meta && !e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+        const cur = blocksRef.current;
+        const selectedSet = new Set(selected);
+        const dir = e.key === "ArrowUp" ? -1 : 1;
+        const firstSelectedIdx = cur.findIndex((b) => selectedSet.has(b.id));
+        const lastSelectedIdx = (() => {
+          for (let i = cur.length - 1; i >= 0; i--) {
+            if (selectedSet.has(cur[i]!.id)) return i;
+          }
+          return -1;
+        })();
+
+        if (e.shiftKey) {
+          e.preventDefault();
+          const anchor =
+            selectionAnchorIdRef.current ??
+            (dir === -1 ? cur[lastSelectedIdx]?.id : cur[firstSelectedIdx]?.id) ??
+            null;
+          const curHead =
+            selectionHeadIdRef.current ??
+            (dir === -1 ? cur[firstSelectedIdx]?.id : cur[lastSelectedIdx]?.id) ??
+            anchor;
+          if (!anchor || !curHead) return;
+          const headIdx = cur.findIndex((b) => b.id === curHead);
+          const nextIdx = Math.max(0, Math.min(cur.length - 1, headIdx + dir));
+          const nextHead = cur[nextIdx]!.id;
+          const nextRange = getBlockRangeIds(cur, anchor, nextHead);
+          if (nextRange.length > 0) {
+            selectionAnchorIdRef.current = anchor;
+            selectionHeadIdRef.current = nextHead;
+            setSelectedBlockIds(nextRange);
+          }
+          return;
+        }
+
+        // Plain Up/Down collapses selection and focuses the neighboring editable block
+        e.preventDefault();
+        const startIdx =
+          dir === -1 ? Math.max(0, firstSelectedIdx - 1) : Math.min(cur.length - 1, lastSelectedIdx + 1);
+        for (let i = startIdx; i >= 0 && i < cur.length; i += dir) {
+          const cand = cur[i];
+          if (cand && !NON_TEXT_BLOCK_TYPES.has(cand.type)) {
+            const len =
+              cand.type === "code" ? cand.content.length : splitInlineRefs(cand.content).editableText.length;
+            focusBlockAt(cand.id, dir === -1 ? len : 0);
+            return;
+          }
+        }
+        clearBlockSelection();
       }
     };
+
+    const onPaste = (e: ClipboardEvent) => {
+      if (isModalOrNonEditorEditable()) return;
+      if (selectedBlockIdsRef.current.length === 0) return;
+      const pasted = e.clipboardData?.getData("text/plain");
+      if (!pasted) return;
+      const res = replaceSelectedBlocksWithMarkdown(
+        blocksRef.current,
+        new Set(selectedBlockIdsRef.current),
+        pasted
+      );
+      if (!res) return;
+      e.preventDefault();
+      clearBlockSelection();
+      commitBlocks(res.blocks);
+      focusBlockAt(res.focusBlockId, res.focusCursorPos);
+    };
+
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [handleRedo, handleUndo]);
+    window.addEventListener("paste", onPaste);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("paste", onPaste);
+    };
+  }, [
+    clearBlockSelection,
+    commitBlocks,
+    focusBlockAt,
+    handleConvertSelectedBlocks,
+    handleCopySelectedBlocks,
+    handleCutSelectedBlocks,
+    handleDeleteSelectedBlocks,
+    handleDuplicateSelectedBlocks,
+    handleIndentSelectedBlocks,
+    handleMoveSelectedBlocks,
+    handleRedo,
+    handleSelectAllBlocks,
+    handleToggleSelectedTodos,
+    handleUndo,
+  ]);
 
   const commitTitle = () => {
     const trimmed = titleDraft.trim();
@@ -1126,6 +1693,40 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     const el = e.currentTarget;
     const selStart = el.selectionStart ?? 0;
     const selEnd = el.selectionEnd ?? 0;
+
+    // 2-stage Select All: first ⌘A selects inside the block, second ⌘A selects all blocks
+    if (meta && !e.altKey && !e.shiftKey && lowerKey === "a") {
+      if (el.value.length === 0 || (selStart === 0 && selEnd === el.value.length)) {
+        e.preventDefault();
+        handleSelectAllBlocks();
+      }
+      return;
+    }
+
+    // Shift+ArrowUp / Shift+ArrowDown crossing out of the block initiates cross-block selection
+    if (!meta && !e.altKey && e.shiftKey && e.key === "ArrowUp" && selStart === 0 && blockIndex > 0) {
+      e.preventDefault();
+      const prevBlk = blocksRef.current[blockIndex - 1];
+      if (prevBlk) {
+        selectBlockRange(block.id, prevBlk.id);
+      }
+      return;
+    }
+    if (
+      !meta &&
+      !e.altKey &&
+      e.shiftKey &&
+      e.key === "ArrowDown" &&
+      selEnd === el.value.length &&
+      blockIndex < blocksRef.current.length - 1
+    ) {
+      e.preventDefault();
+      const nextBlk = blocksRef.current[blockIndex + 1];
+      if (nextBlk) {
+        selectBlockRange(block.id, nextBlk.id);
+      }
+      return;
+    }
 
     // Universal block shortcuts (Duplicate / Move subtree / Quick convert)
     if (meta && !e.altKey && !e.shiftKey && lowerKey === "d") {
@@ -1773,7 +2374,11 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         role="textbox"
         tabIndex={0}
         onClick={(e) => {
+          if (suppressNextClickRef.current) return;
           if ((e.target as HTMLElement).closest("[data-inline-interactive]")) {
+            return;
+          }
+          if (e.shiftKey || (e.metaKey || e.ctrlKey) && selectedBlockIdsRef.current.length > 0) {
             return;
           }
           const renderedOffset = getClickedRenderedOffset(
@@ -1788,7 +2393,14 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
           focusBlockAt(block.id, targetOffset);
         }}
         onFocus={(e) => {
-          if (e.target !== e.currentTarget) return;
+          if (
+            e.target !== e.currentTarget ||
+            suppressNextClickRef.current ||
+            selectedBlockIdsRef.current.length > 0 ||
+            dragSessionRef.current?.active
+          ) {
+            return;
+          }
           focusBlockAt(block.id, editableText.length);
         }}
         className={`min-h-[24px] w-full cursor-text whitespace-pre-wrap break-words ${typoClass}`}
@@ -1798,25 +2410,112 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     );
   };
 
+  const handleBlockMouseDown = (
+    e: React.MouseEvent<HTMLDivElement>,
+    block: NotebookBlock
+  ) => {
+    if (e.button !== 0 || isSelectionInteractiveTarget(e.target)) return;
+
+    if (e.shiftKey) {
+      e.preventDefault();
+      const anchorId =
+        selectionAnchorIdRef.current ?? focusedBlockIdRef.current ?? block.id;
+      selectBlockRange(anchorId, block.id);
+      suppressNextClickRef.current = true;
+      window.setTimeout(() => {
+        suppressNextClickRef.current = false;
+      }, 0);
+      return;
+    }
+
+    if ((e.metaKey || e.ctrlKey) && selectedBlockIdsRef.current.length > 0) {
+      e.preventDefault();
+      const cur = selectedBlockIdsRef.current;
+      const next = cur.includes(block.id)
+        ? cur.filter((id) => id !== block.id)
+        : blocksRef.current
+            .map((b) => b.id)
+            .filter((id) => cur.includes(id) || id === block.id);
+      selectionAnchorIdRef.current = next[0] ?? null;
+      selectionHeadIdRef.current = next[next.length - 1] ?? null;
+      setSelectedBlockIds(next);
+      suppressNextClickRef.current = true;
+      window.setTimeout(() => {
+        suppressNextClickRef.current = false;
+      }, 0);
+      return;
+    }
+
+    const sc = findScrollContainer(editorRootRef.current);
+    dragSessionRef.current = {
+      mode: "block-cross",
+      anchorBlockId: block.id,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      startScrollTop: sc?.scrollTop ?? 0,
+      scrollContainer: sc,
+      active: false,
+    };
+  };
+
+  const handleSurfaceMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || isSelectionInteractiveTarget(e.target)) return;
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    if (target.closest("[data-block-id]") || target.closest('[data-notebook-header="true"]')) {
+      return;
+    }
+
+    const sc = findScrollContainer(editorRootRef.current);
+    dragSessionRef.current = {
+      mode: "marquee",
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      startScrollTop: sc?.scrollTop ?? 0,
+      scrollContainer: sc,
+      active: false,
+    };
+  };
+
   return (
     <div
+      ref={editorRootRef}
       data-notebook-editor="true"
-      className="mx-auto w-full max-w-[760px] px-10 pt-7 pb-28 lg:px-14"
-      onClick={(e) => {
-        if (e.target !== e.currentTarget) return;
-        const last = blocks[blocks.length - 1];
-        if (last && last.type === "paragraph" && last.content === "") {
-          focusBlockAt(last.id, 0);
-        }
-      }}
+      onMouseDown={handleSurfaceMouseDown}
+      className={`min-h-full w-full ${isDraggingSelection ? "select-none" : ""}`}
     >
-      <datalist id="valet-code-languages">
-        {CODE_LANGUAGES.map((lang) => (
-          <option key={lang} value={lang} />
-        ))}
-      </datalist>
+      {marqueeRect && marqueeRect.width > 2 && marqueeRect.height > 2 && (
+        <div
+          aria-hidden="true"
+          style={{
+            left: marqueeRect.left,
+            top: marqueeRect.top,
+            width: marqueeRect.width,
+            height: marqueeRect.height,
+          }}
+          className="pointer-events-none fixed z-30 rounded-[4px] border border-[var(--ink-primary)]/45 bg-[var(--ink-primary)]/10"
+        />
+      )}
 
-      {/* Utility Actions Strip */}
+      <div
+        className="mx-auto w-full max-w-[760px] px-10 pt-7 pb-28 lg:px-14"
+        onClick={(e) => {
+          if (suppressNextClickRef.current || e.target !== e.currentTarget) return;
+          clearBlockSelection();
+          const last = blocks[blocks.length - 1];
+          if (last && last.type === "paragraph" && last.content === "") {
+            focusBlockAt(last.id, 0);
+          }
+        }}
+      >
+        <datalist id="valet-code-languages">
+          {CODE_LANGUAGES.map((lang) => (
+            <option key={lang} value={lang} />
+          ))}
+        </datalist>
+
+        <div data-notebook-header="true">
+          {/* Utility Actions Strip */}
       <div className="mb-3 flex flex-wrap items-center gap-1.5 text-[11.5px] text-[var(--ink-muted)]">
         <button
           type="button"
@@ -1862,8 +2561,9 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         value={titleDraft}
         onChange={(e) => setTitleDraft(e.target.value)}
         onBlur={commitTitle}
+        {...headerIme.compositionProps}
         onKeyDown={(e) => {
-          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+          if (headerIme.shouldIgnoreEnter(e)) return;
           if (e.key === "Enter") {
             e.preventDefault();
             commitTitle();
@@ -1882,8 +2582,9 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         value={descDraft}
         onChange={(e) => setDescDraft(e.target.value)}
         onBlur={commitDescription}
+        {...headerIme.compositionProps}
         onKeyDown={(e) => {
-          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+          if (headerIme.shouldIgnoreEnter(e)) return;
           if (e.key === "Enter") {
             e.preventDefault();
             commitDescription();
@@ -1952,8 +2653,9 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                 value={tagDraft}
                 onChange={(e) => setTagDraft(e.target.value)}
                 onBlur={handleAddTag}
+                {...headerIme.compositionProps}
                 onKeyDown={(e) => {
-                  if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                  if (headerIme.shouldIgnoreEnter(e)) return;
                   if (e.key === "Enter") {
                     e.preventDefault();
                     handleAddTag();
@@ -1984,8 +2686,9 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
             value={workingDirDraft}
             onChange={(e) => setWorkingDirDraft(e.target.value)}
             onBlur={commitWorkingDir}
+            {...headerIme.compositionProps}
             onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+              if (headerIme.shouldIgnoreEnter(e)) return;
               if (e.key === "Enter") {
                 e.preventDefault();
                 commitWorkingDir();
@@ -1997,6 +2700,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
           />
         </div>
       </div>
+      </div>
 
       {/* Block Editor Body */}
       <div className="mt-5 flex flex-col gap-1.5">
@@ -2005,6 +2709,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
           const isMentionOpen = mentionState?.blockId === block.id;
           const isSlashOpen = slashState?.blockId === block.id;
           const isHighlighted = highlightedBlockId === block.id;
+          const isSelectedBlock = selectedBlockIdSet.has(block.id);
           const isDragTarget = dragOverBlockId === block.id;
           const indent = clampBlockIndent(block.type, block.indent);
           const indentable = isIndentableBlockType(block.type);
@@ -2020,6 +2725,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
               key={block.id}
               data-block-id={block.id}
               style={indent > 0 ? { marginLeft: indent * 24 } : undefined}
+              onMouseDown={(e) => handleBlockMouseDown(e, block)}
               onDragOver={(e) => {
                 if (!draggedBlockId || draggedBlockId === block.id) return;
                 e.preventDefault();
@@ -2037,9 +2743,11 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                 setDragOverBlockId(null);
               }}
               className={`group/block relative rounded-[8px] px-1 py-0.5 transition-colors ${
-                isHighlighted
-                  ? "bg-[var(--bg-subtle)]/90 ring-2 ring-[var(--ink-primary)]/35"
-                  : ""
+                isSelectedBlock
+                  ? "bg-[var(--ink-primary)]/[0.11] ring-1 ring-inset ring-[var(--ink-primary)]/25"
+                  : isHighlighted
+                    ? "bg-[var(--bg-subtle)]/90 ring-2 ring-[var(--ink-primary)]/35"
+                    : ""
               } ${isDragTarget ? "border-t-2 border-[var(--ink-primary)]" : ""}`}
             >
               {/* Subtle vertical indentation guides for nested blocks */}
@@ -2054,7 +2762,10 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                 ))}
 
               {/* Left Block Gutter (+ insert / ⋮⋮ block menu & drag) */}
-              <div className="absolute top-[5px] -left-11 flex w-10 items-center justify-end gap-0.5 opacity-0 transition-opacity group-hover/block:opacity-100 focus-within:opacity-100">
+              <div
+                data-block-gutter="true"
+                className="absolute top-[5px] -left-11 flex w-10 items-center justify-end gap-0.5 opacity-0 transition-opacity group-hover/block:opacity-100 focus-within:opacity-100"
+              >
                 <button
                   type="button"
                   title="在下方插入块或 @valet"
@@ -2071,7 +2782,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                 <button
                   type="button"
                   draggable
-                  title="拖拽排序 / 块菜单"
+                  title="拖拽排序 / 块菜单 (⇧点击或⌘点击可多选)"
                   onDragStart={() => setDraggedBlockId(block.id)}
                   onDragEnd={() => {
                     setDraggedBlockId(null);
@@ -2080,6 +2791,24 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                   onMouseDown={(e) => e.stopPropagation()}
                   onClick={(e) => {
                     e.stopPropagation();
+                    if (e.shiftKey) {
+                      const anchorId =
+                        selectionAnchorIdRef.current ?? focusedBlockIdRef.current ?? block.id;
+                      selectBlockRange(anchorId, block.id);
+                      return;
+                    }
+                    if (e.metaKey || e.ctrlKey) {
+                      const cur = selectedBlockIdsRef.current;
+                      const next = cur.includes(block.id)
+                        ? cur.filter((id) => id !== block.id)
+                        : blocksRef.current
+                            .map((b) => b.id)
+                            .filter((id) => cur.includes(id) || id === block.id);
+                      selectionAnchorIdRef.current = next[0] ?? null;
+                      selectionHeadIdRef.current = next[next.length - 1] ?? null;
+                      setSelectedBlockIds(next);
+                      return;
+                    }
                     setBlockMenuId((cur) => (cur === block.id ? null : block.id));
                   }}
                   className="flex h-5 w-5 cursor-grab items-center justify-center rounded-[5px] text-[var(--ink-subtle)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] active:cursor-grabbing"
@@ -2091,6 +2820,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
               {/* Block Action Popover Menu */}
               {blockMenuId === block.id && (
                 <div
+                  data-block-menu="true"
                   onMouseDown={(e) => e.stopPropagation()}
                   className="animate-valet-modal-in absolute top-7 -left-10 z-50 w-56 overflow-hidden rounded-[10px] border border-[var(--border-control)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-popover)]"
                 >
@@ -2228,7 +2958,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
               {/* Block Body */}
               {isInlineComposerActive && valetComposerState ? (
-                <div className="my-1.5 flex flex-col gap-2">
+                <div data-valet-composer="true" className="my-1.5 flex flex-col gap-2">
                   {(valetComposerState.beforeText.trim() || valetComposerState.afterText.trim()) && (
                     <div className="text-[14px] leading-[22px] text-[var(--ink-body)]">
                       {valetComposerState.beforeText}
@@ -2365,7 +3095,10 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                     }}
                     rows={Math.max(2, block.content.split("\n").length)}
                     value={block.content}
-                    onFocus={() => setFocusedBlockId(block.id)}
+                    onFocus={() => {
+                      clearBlockSelection();
+                      setFocusedBlockId(block.id);
+                    }}
                     onBlur={() => {
                       window.setTimeout(() => {
                         setFocusedBlockId((cur) => {
@@ -2444,29 +3177,48 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
               {/* Anchored Popovers */}
               {isMentionOpen && mentionState && (
-                <NotebookMentionPopover
-                  projectId={project.id}
-                  query={mentionState.query}
-                  onSelect={handleMentionSelect}
-                  onClose={() => setMentionState(null)}
-                />
+                <div data-popover="true">
+                  <NotebookMentionPopover
+                    projectId={project.id}
+                    query={mentionState.query}
+                    onSelect={handleMentionSelect}
+                    onClose={() => setMentionState(null)}
+                  />
+                </div>
               )}
 
               {isSlashOpen && slashState && (
-                <NotebookSlashPopover
-                  query={slashState.query}
-                  onSelect={handleSlashSelect}
-                  onClose={() => setSlashState(null)}
-                />
+                <div data-popover="true">
+                  <NotebookSlashPopover
+                    query={slashState.query}
+                    onSelect={handleSlashSelect}
+                    onClose={() => setSlashState(null)}
+                  />
+                </div>
               )}
             </div>
           );
         })}
       </div>
 
+      {/* Sticky Multi-Block Selection Toolbar */}
+      {selectedBlockIds.length > 0 && (
+        <NotebookSelectionBar
+          count={selectedBlockIds.length}
+          onConvert={handleConvertSelectedBlocks}
+          onIndent={handleIndentSelectedBlocks}
+          onCopy={handleCopySelectedBlocks}
+          onDuplicate={handleDuplicateSelectedBlocks}
+          onDelete={handleDeleteSelectedBlocks}
+          onClear={clearBlockSelection}
+        />
+      )}
+
       {/* Bottom Notion Blank Space Click Target */}
       <div
         onClick={() => {
+          if (suppressNextClickRef.current) return;
+          clearBlockSelection();
           const last = blocks[blocks.length - 1];
           if (last && last.type === "paragraph" && last.content === "") {
             focusBlockAt(last.id, 0);
@@ -2482,6 +3234,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         }}
         className="mt-4 min-h-[120px] cursor-text"
       />
+      </div>
     </div>
   );
 };

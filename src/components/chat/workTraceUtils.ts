@@ -62,10 +62,13 @@ export function classifyStepCategory(step: StepRowItem): StepCategory {
     name === "write_file" ||
     name === "list_dir" ||
     name === "trash_files" ||
+    name === "notebook_read" ||
+    name === "notebook_edit" ||
     label.startsWith("读取 ·") ||
     label.startsWith("写入 ·") ||
     label.startsWith("浏览目录") ||
-    label.startsWith("移入废纸篓")
+    label.startsWith("移入废纸篓") ||
+    label.includes("Notebook")
   ) {
     return "file";
   }
