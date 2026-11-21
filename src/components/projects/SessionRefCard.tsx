@@ -7,7 +7,7 @@ import { BowtieSvg, CloseIcon } from "../ui/Icons";
 type SessionStatusKind = "running" | "pending" | "completed" | "idle";
 
 function useSessionLiveStatus(thread: ChatThread | undefined) {
-  const { state, chatStreams, runningChatIds } = useValet();
+  const { state, chatStreams, runningChatIds, unreadChatCounts } = useValet();
 
   if (!thread) {
     return {
@@ -15,8 +15,11 @@ function useSessionLiveStatus(thread: ChatThread | undefined) {
       label: "已归档或不存在",
       liveDetail: "",
       pendingCount: 0,
+      unreadCount: 0,
     };
   }
+
+  const unreadCount = !thread.archived ? (unreadChatCounts[thread.id] ?? 0) : 0;
 
   const stream = chatStreams[thread.id];
   const isRunning =
@@ -44,6 +47,7 @@ function useSessionLiveStatus(thread: ChatThread | undefined) {
         (stream?.partialText ? extractThreadSummary({ ...thread, messages: [{ id: "tmp", role: "assistant", content: stream.partialText, createdAt: "" }] }) : "") ||
         "正在分析上下文并调度工具…",
       pendingCount: pendingInbox.length,
+      unreadCount,
     };
   }
 
@@ -53,6 +57,7 @@ function useSessionLiveStatus(thread: ChatThread | undefined) {
       label: `待你确认 · ${pendingInbox.length} 项待批`,
       liveDetail: "",
       pendingCount: pendingInbox.length,
+      unreadCount,
     };
   }
 
@@ -62,6 +67,7 @@ function useSessionLiveStatus(thread: ChatThread | undefined) {
     label: hasAssistantReply ? "已完成" : "待发起",
     liveDetail: "",
     pendingCount: 0,
+    unreadCount,
   };
 }
 
@@ -73,14 +79,23 @@ export const InlineSessionChip: React.FC<{
   const thread = state.chatThreads.find((t) => t.id === sessionId);
   const status = useSessionLiveStatus(thread);
 
+  const hasUnread =
+    status.unreadCount > 0 &&
+    status.kind !== "running" &&
+    status.kind !== "pending";
+
   const shortStatus =
     status.kind === "running"
       ? "进行中"
       : status.kind === "pending"
         ? "待确认"
-        : status.kind === "completed"
-          ? "已完成"
-          : "未找到";
+        : hasUnread
+          ? status.unreadCount > 1
+            ? `${status.unreadCount} 未读`
+            : "新回复"
+          : status.kind === "completed"
+            ? "已完成"
+            : "未找到";
 
   return (
     <span
@@ -88,7 +103,9 @@ export const InlineSessionChip: React.FC<{
       className={`mx-1 inline-flex items-center overflow-hidden rounded-[6px] border align-baseline text-[12px] leading-[16px] transition-colors ${
         status.kind === "pending"
           ? "border-[var(--amber-border)] bg-[var(--amber-bg)] text-[var(--ink-strong)] hover:border-[var(--amber-pill)]"
-          : "border-[var(--border-control)] bg-[var(--bg-subtle)] text-[var(--ink-strong)] hover:border-[var(--border-strong)]"
+          : hasUnread
+            ? "border-[var(--core-badge-border)] bg-[var(--core-badge-bg)]/50 text-[var(--ink-strong)] hover:border-[var(--border-strong)]"
+            : "border-[var(--border-control)] bg-[var(--bg-subtle)] text-[var(--ink-strong)] hover:border-[var(--border-strong)]"
       }`}
     >
       <button
@@ -122,15 +139,20 @@ export const InlineSessionChip: React.FC<{
           {thread?.title ?? "已移除会话"}
         </span>
         <span
-          className={`shrink-0 font-mono text-[10px] ${
+          className={`inline-flex shrink-0 items-center gap-1 font-mono text-[10px] ${
             status.kind === "pending"
               ? "text-[var(--amber-text)]"
-              : status.kind === "running"
-                ? "text-[var(--ink-primary)]"
-                : "text-[var(--ink-muted)]"
+              : hasUnread
+                ? "font-semibold text-[var(--ink-strong)]"
+                : status.kind === "running"
+                  ? "text-[var(--ink-primary)]"
+                  : "text-[var(--ink-muted)]"
           }`}
         >
-          {shortStatus}
+          {hasUnread && (
+            <span className="h-1.5 w-1.5 rounded-full bg-[var(--duty-dot)]" />
+          )}
+          <span>{shortStatus}</span>
         </span>
         <span className="shrink-0 text-[11px] text-[var(--ink-subtle)]">↗</span>
       </button>
@@ -173,10 +195,15 @@ export const SessionRefBlockCard: React.FC<{
     (thread ? extractThreadSummary(thread) : "") ||
     (thread?.messages[0]?.content ?? "点击进入查看完整对话与执行详情。");
 
+  const hasUnreadBlock =
+    status.unreadCount > 0 && status.kind === "completed";
+
   const accentBorder =
     status.kind === "pending"
       ? "border-l-[3px] border-l-[var(--amber-icon)]"
-      : "border-l-[3px] border-l-[var(--ink-primary)]";
+      : hasUnreadBlock
+        ? "border-l-[3px] border-l-[var(--duty-dot)]"
+        : "border-l-[3px] border-l-[var(--ink-primary)]";
 
   return (
     <div
@@ -215,9 +242,11 @@ export const SessionRefBlockCard: React.FC<{
           className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium leading-[14px] ${
             status.kind === "pending"
               ? "border-[var(--amber-pill)] bg-[var(--amber-bg)] text-[var(--amber-text)]"
-              : status.kind === "running"
-                ? "border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-strong)]"
-                : "border-[var(--border-light)] bg-[var(--bg-surface)] text-[var(--ink-muted)]"
+              : hasUnreadBlock
+                ? "border-[var(--core-badge-border)] bg-[var(--core-badge-bg)] text-[var(--core-badge-fg)]"
+                : status.kind === "running"
+                  ? "border-[var(--border-control)] bg-[var(--bg-surface)] text-[var(--ink-strong)]"
+                  : "border-[var(--border-light)] bg-[var(--bg-surface)] text-[var(--ink-muted)]"
           }`}
         >
           {status.kind === "running" && (
@@ -237,7 +266,12 @@ export const SessionRefBlockCard: React.FC<{
               />
             </svg>
           )}
-          <span>{status.label}</span>
+          {hasUnreadBlock && (
+            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--duty-dot)]" />
+          )}
+          <span>
+            {hasUnreadBlock ? `${status.unreadCount} 条未读` : status.label}
+          </span>
         </span>
 
         <div className="flex-1" />

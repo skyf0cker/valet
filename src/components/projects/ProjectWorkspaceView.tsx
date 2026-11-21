@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useValet } from "../../store/ValetContext";
 import { DEFAULT_PROJECT_ID } from "../../types/valet";
+import { countUnreadThreads } from "../../utils/chatUnread";
 import { SidebarToggleButton } from "../Sidebar";
 import { ChatView } from "../chat/ChatView";
 import { MoreHorizontalIcon, PlusIcon, ProjectGlyph } from "../ui/Icons";
@@ -12,6 +13,7 @@ import { ProjectSessionsView } from "./ProjectSessionsView";
 export const ProjectWorkspaceView: React.FC = () => {
   const {
     state,
+    unreadChatCounts,
     sidebarCollapsed,
     setProjectTab,
     createNewChat,
@@ -52,6 +54,7 @@ export const ProjectWorkspaceView: React.FC = () => {
     (t) => (t.projectId || DEFAULT_PROJECT_ID) === activeProject.id
   );
   const activeSessionCount = projectThreads.filter((t) => !t.archived).length;
+  const projectUnreadCount = countUnreadThreads(unreadChatCounts, projectThreads);
   const activeTab = state.activeProjectTab === "sessions" ? "sessions" : "notebook";
 
   return (
@@ -109,6 +112,14 @@ export const ProjectWorkspaceView: React.FC = () => {
             <span className="font-mono text-[10.5px] text-[var(--ink-subtle)]">
               {activeSessionCount}
             </span>
+            {projectUnreadCount > 0 && (
+              <span
+                className="inline-flex items-center gap-1 rounded-full bg-[var(--duty-dot)] px-1.5 py-[1px] font-mono text-[9.5px] font-bold leading-none text-[var(--ink-on-primary)]"
+                title={`${projectUnreadCount} 个未读会话`}
+              >
+                {projectUnreadCount} 未读
+              </span>
+            )}
           </button>
         </div>
 

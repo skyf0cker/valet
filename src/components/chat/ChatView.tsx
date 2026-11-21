@@ -27,6 +27,7 @@ export const ChatView: React.FC = () => {
     state,
     chatStreams,
     runningChatIds,
+    unreadChatCounts,
     sidebarCollapsed,
     createNewChat,
     selectChatThread,
@@ -82,6 +83,10 @@ export const ChatView: React.FC = () => {
     ? projectThreads
     : [thread, ...projectThreads];
 
+  const otherUnreadCount = projectThreads.filter(
+    (t) => t.id !== thread.id && (unreadChatCounts[t.id] ?? 0) > 0
+  ).length;
+
   const hasNotebookBacklink =
     Boolean(parentProject) &&
     (Boolean(thread.originBlockId) ||
@@ -125,18 +130,28 @@ export const ChatView: React.FC = () => {
         )}
 
         {/* Scoped Thread Switcher Dropdown */}
-        <div className="app-no-drag min-w-0">
+        <div className="app-no-drag flex min-w-0 items-center gap-1.5">
           <SelectMenu
             value={thread.id}
-            options={switcherThreads.map((t) => ({
-              value: t.id,
-              label: t.archived ? `${t.title}（已归档）` : t.title,
-              hint: t.updatedAt,
-            }))}
+            options={switcherThreads.map((t) => {
+              const unread =
+                t.id !== thread.id ? (unreadChatCounts[t.id] ?? 0) : 0;
+              return {
+                value: t.id,
+                label: t.archived ? `${t.title}（已归档）` : t.title,
+                hint: unread > 0 ? `${unread} 未读 · ${t.updatedAt}` : t.updatedAt,
+              };
+            })}
             onChange={(id) => selectChatThread(id)}
             align="left"
             triggerClassName="border-0 bg-transparent px-1 font-semibold text-[13px] lg:text-[14px] text-[var(--ink-strong)] hover:bg-[var(--bg-subtle)]"
           />
+          {otherUnreadCount > 0 && (
+            <span
+              className="h-2 w-2 shrink-0 rounded-full bg-[var(--duty-dot)] shadow-[0_0_0_2.5px_var(--duty-halo)]"
+              title={`本项目另有 ${otherUnreadCount} 个未读会话`}
+            />
+          )}
         </div>
 
         <div className="flex-1" />

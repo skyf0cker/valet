@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useValet } from "../store/ValetContext";
 import { getDarkThemeMeta } from "../constants/themes";
 import { DEFAULT_PROJECT_ID, type AppView } from "../types/valet";
+import { countUnreadThreads } from "../utils/chatUnread";
 import { CreateProjectModal } from "./projects/CreateProjectModal";
 import { DutyPulse } from "./ui/DutyPulse";
 import {
@@ -52,7 +53,9 @@ export const Sidebar: React.FC = () => {
   const {
     state,
     chatStream,
+    chatStreams,
     runningChatIds,
+    unreadChatCounts,
     nodTick,
     sidebarCollapsed,
     setActiveView,
@@ -100,6 +103,7 @@ export const Sidebar: React.FC = () => {
   const visibleProjects = state.projects.filter((p) => !p.archived);
   const activeThreads = state.chatThreads.filter((t) => !t.archived);
   const archivedThreads = state.chatThreads.filter((t) => t.archived);
+  const totalUnreadChats = countUnreadThreads(unreadChatCounts, activeThreads);
 
   const pendingInboxCount = state.inboxItems.filter(
     (i) => i.status === "pending"
@@ -197,7 +201,7 @@ export const Sidebar: React.FC = () => {
     label: string;
     shortcut?: string;
     badge?: number;
-    badgeTone?: "amber" | "neutral";
+    badgeTone?: "amber" | "accent" | "neutral";
     icon: React.ReactNode;
   }> = [
     {
@@ -220,6 +224,8 @@ export const Sidebar: React.FC = () => {
       id: "projects",
       label: "项目",
       shortcut: "⌘ 2",
+      badge: totalUnreadChats > 0 ? totalUnreadChats : undefined,
+      badgeTone: "accent",
       icon: <BookOpenIcon size={16} />,
     },
     {
@@ -307,6 +313,14 @@ export const Sidebar: React.FC = () => {
                 {item.icon}
                 {item.badge !== undefined && item.id === "inbox" && (
                   <span className="absolute -top-[3px] -right-[3px] flex h-[15px] min-w-[15px] items-center justify-center rounded-full border-[1.5px] border-[var(--bg-sidebar)] bg-[var(--amber-icon)] px-0.5 font-mono text-[9px] font-bold leading-[10px] text-white">
+                    {item.badge}
+                  </span>
+                )}
+                {item.badge !== undefined && item.id === "projects" && (
+                  <span
+                    className="absolute -top-[3px] -right-[3px] flex h-[15px] min-w-[15px] items-center justify-center rounded-full border-[1.5px] border-[var(--bg-sidebar)] bg-[var(--duty-dot)] px-0.5 font-mono text-[9px] font-bold leading-[10px] text-[var(--ink-on-primary)]"
+                    title={`${item.badge} 个未读会话`}
+                  >
                     {item.badge}
                   </span>
                 )}
@@ -492,7 +506,9 @@ export const Sidebar: React.FC = () => {
                         : "bg-[var(--nav-active-badge-bg)] text-[var(--nav-active-fg)]"
                       : item.badgeTone === "amber"
                         ? "border border-[var(--amber-pill)] bg-[var(--amber-bg)] text-[var(--amber-text)]"
-                        : "bg-[var(--bg-hover)] text-[var(--ink-body)]"
+                        : item.badgeTone === "accent"
+                          ? "border border-[var(--core-badge-border)] bg-[var(--core-badge-bg)] text-[var(--core-badge-fg)]"
+                          : "bg-[var(--bg-hover)] text-[var(--ink-body)]"
                   }`}
                 >
                   {item.badge}
@@ -536,6 +552,10 @@ export const Sidebar: React.FC = () => {
           {visibleProjects.map((project) => {
             const projectThreads = activeThreads.filter(
               (t) => (t.projectId || DEFAULT_PROJECT_ID) === project.id
+            );
+            const projectUnreadCount = countUnreadThreads(
+              unreadChatCounts,
+              projectThreads
             );
             const isExpanded = expandedProjects[project.id] ?? project.id === state.activeProjectId;
             const inProjectsView =
@@ -593,9 +613,18 @@ export const Sidebar: React.FC = () => {
                     </span>
                   )}
 
-                  <span className="w-4 shrink-0 text-right font-mono text-[10px] text-[var(--ink-subtle)] group-hover:hidden">
-                    {projectThreads.length}
-                  </span>
+                  {projectUnreadCount > 0 ? (
+                    <span
+                      className="inline-flex h-[16px] min-w-[16px] shrink-0 items-center justify-center rounded-full bg-[var(--duty-dot)] px-1 font-mono text-[9.5px] font-bold leading-none text-[var(--ink-on-primary)] group-hover:hidden"
+                      title={`${projectUnreadCount} 个未读会话`}
+                    >
+                      {projectUnreadCount > 99 ? "99+" : projectUnreadCount}
+                    </span>
+                  ) : (
+                    <span className="w-4 shrink-0 text-right font-mono text-[10px] text-[var(--ink-subtle)] group-hover:hidden">
+                      {projectThreads.length}
+                    </span>
+                  )}
 
                   <button
                     type="button"
@@ -620,11 +649,17 @@ export const Sidebar: React.FC = () => {
                           inProjectsView &&
                           state.activeProjectTab === "session" &&
                           state.activeChatId === thread.id;
+                        const threadStream = chatStreams[thread.id];
                         const isRunning =
                           (runningChatIds[thread.id] ?? 0) > 0 ||
-                          (chatStream?.chatId === thread.id &&
-                            chatStream.phase !== "done" &&
-                            chatStream.phase !== "error");
+                          Boolean(
+                            threadStream &&
+                              threadStream.phase !== "done" &&
+                              threadStream.phase !== "error"
+                          );
+                        const hasLivePermission = Boolean(
+                          threadStream?.pendingPermission
+                        );
                         const hasPending = state.inboxItems.some(
                           (it) =>
                             it.status === "pending" &&
@@ -632,6 +667,10 @@ export const Sidebar: React.FC = () => {
                               (it.linkedTimelineEventId &&
                                 thread.linkedEventIds.includes(it.linkedTimelineEventId)))
                         );
+                        const unreadCount = isSessionActive
+                          ? 0
+                          : (unreadChatCounts[thread.id] ?? 0);
+                        const isUnread = unreadCount > 0;
 
                         return (
                           <div
@@ -639,7 +678,9 @@ export const Sidebar: React.FC = () => {
                             className={`group flex h-[28px] w-full shrink-0 items-center rounded-[6px] transition-colors ${
                               isSessionActive
                                 ? "bg-[var(--bg-hover)] font-semibold text-[var(--ink-strong)]"
-                                : "text-[var(--ink-secondary)] hover:bg-[var(--bg-hover)]/50 hover:text-[var(--ink-strong)]"
+                                : isUnread
+                                  ? "font-medium text-[var(--ink-strong)] hover:bg-[var(--bg-hover)]/50"
+                                  : "text-[var(--ink-secondary)] hover:bg-[var(--bg-hover)]/50 hover:text-[var(--ink-strong)]"
                             }`}
                           >
                             <button
@@ -664,20 +705,40 @@ export const Sidebar: React.FC = () => {
                                       strokeLinecap="round"
                                     />
                                   </svg>
+                                ) : hasPending || hasLivePermission ? (
+                                  <span className="h-[5.5px] w-[5.5px] rounded-full bg-[var(--amber-icon)]" />
+                                ) : isUnread ? (
+                                  <span
+                                    className="h-[6.5px] w-[6.5px] rounded-full bg-[var(--duty-dot)] shadow-[0_0_0_2.5px_var(--duty-halo)]"
+                                    title={`${unreadCount} 条未读回复`}
+                                  />
                                 ) : (
                                   <span
                                     className={`h-[5.5px] w-[5.5px] rounded-full ${
-                                      hasPending
-                                        ? "bg-[var(--amber-icon)]"
-                                        : isSessionActive
-                                          ? "bg-[var(--ink-primary)]"
-                                          : "bg-[var(--ink-subtle)]"
+                                      isSessionActive
+                                        ? "bg-[var(--ink-primary)]"
+                                        : "bg-[var(--ink-subtle)]"
                                     }`}
                                   />
                                 )}
                               </span>
-                              <span className="min-w-0 flex-1 truncate">{thread.title}</span>
+                              <span
+                                className={`min-w-0 flex-1 truncate ${
+                                  isUnread ? "font-semibold text-[var(--ink-strong)]" : ""
+                                }`}
+                              >
+                                {thread.title}
+                              </span>
                             </button>
+
+                            {isUnread && (
+                              <span
+                                className="mr-1.5 inline-flex h-[16px] min-w-[16px] shrink-0 items-center justify-center rounded-full bg-[var(--duty-dot)] px-1 font-mono text-[9.5px] font-bold leading-none text-[var(--ink-on-primary)] group-hover:hidden group-focus-within:hidden"
+                                title={`${unreadCount} 条未读回复`}
+                              >
+                                {unreadCount > 99 ? "99+" : unreadCount}
+                              </span>
+                            )}
 
                             <button
                               type="button"
@@ -687,7 +748,11 @@ export const Sidebar: React.FC = () => {
                               }}
                               title="归档对话"
                               aria-label={`归档对话 ${thread.title}`}
-                              className="mr-1 flex h-[20px] w-[20px] shrink-0 cursor-pointer items-center justify-center rounded-[5px] text-[var(--ink-subtle)] opacity-0 transition-opacity hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] group-hover:opacity-100 focus:opacity-100"
+                              className={`mr-1 h-[20px] w-[20px] shrink-0 cursor-pointer items-center justify-center rounded-[5px] text-[var(--ink-subtle)] transition-opacity hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)] ${
+                                isUnread
+                                  ? "hidden group-hover:flex group-focus-within:flex"
+                                  : "flex opacity-0 group-hover:opacity-100 focus:opacity-100"
+                              }`}
                             >
                               <ArchiveIcon size={11} />
                             </button>

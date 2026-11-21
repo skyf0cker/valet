@@ -34,6 +34,14 @@ import {
   buildTimelineQuoteAttachment,
 } from "../utils/chatQuotes";
 import {
+  collectAssistantMessageIds,
+  computeNextUnreadCounts,
+  getVisibleChatId,
+  loadPersistedUnreadCounts,
+  persistUnreadCounts,
+  pruneUnreadCounts,
+} from "../utils/chatUnread";
+import {
   buildNotebookContextAttachment,
   createDefaultProject,
   deriveFallbackSessionTitle,
@@ -357,6 +365,7 @@ export interface ValetContextValue {
   chatStream: ChatStreamPayload | null;
   chatStreams: Record<string, ChatStreamPayload>;
   runningChatIds: Record<string, number>;
+  unreadChatCounts: Record<string, number>;
   queuedMessages: Record<string, QueuedChatMessage[]>;
   toasts: ToastMessage[];
   nodTick: number;
@@ -490,6 +499,8 @@ export interface ValetContextValue {
   setComposerDraft: (chatId: string, draft: ComposerDraft) => void;
   quoteInboxItemToChat: (itemId: string) => void;
   quoteTimelineEventToChat: (eventId: string) => void;
+  markChatRead: (chatId: string) => void;
+  markAllChatsRead: (projectId?: string) => void;
   selectChatThread: (chatId: string) => void;
   createNewChat: (projectId?: string) => void;
   archiveChatThread: (chatId: string, archived?: boolean) => void;
@@ -554,6 +565,15 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   }, [chatStreams, state.activeChatId]);
   const [runningChatIds, setRunningChatIds] = useState<Record<string, number>>({});
   const runningChatCountRef = useRef<Record<string, number>>({});
+  const [unreadChatCounts, setUnreadChatCounts] = useState<Record<string, number>>(
+    loadPersistedUnreadCounts
+  );
+  const unreadChatCountsRef = useRef<Record<string, number>>(unreadChatCounts);
+  unreadChatCountsRef.current = unreadChatCounts;
+  const backendHydratedRef = useRef<boolean>(!isMyGo());
+  const seenAssistantIdsRef = useRef<Record<string, Set<string>>>(
+    isMyGo() ? {} : collectAssistantMessageIds(state.chatThreads)
+  );
   const [queuedMessages, setQueuedMessages] = useState<Record<string, QueuedChatMessage[]>>({});
   const queuedMessagesRef = useRef<Record<string, QueuedChatMessage[]>>({});
   const abortedChatRef = useRef<Record<string, boolean>>({});
@@ -612,6 +632,36 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setArrivalNotice(null);
   }, []);
 
+  // Persist unread chat badges
+  useEffect(() => {
+    persistUnreadCounts(unreadChatCounts);
+  }, [unreadChatCounts]);
+
+  // Track newly received assistant replies in non-visible chats and clear when viewed
+  useEffect(() => {
+    if (!backendHydratedRef.current) return;
+    const visibleChatId = getVisibleChatId({
+      activeView: state.activeView,
+      activeProjectTab: state.activeProjectTab,
+      activeChatId: state.activeChatId,
+    });
+    const res = computeNextUnreadCounts({
+      prevUnread: unreadChatCountsRef.current,
+      seenAssistantIds: seenAssistantIdsRef.current,
+      threads: state.chatThreads,
+      visibleChatId,
+    });
+    seenAssistantIdsRef.current = res.nextSeen;
+    if (res.changed) {
+      setUnreadChatCounts(res.nextUnread);
+    }
+  }, [
+    state.chatThreads,
+    state.activeView,
+    state.activeProjectTab,
+    state.activeChatId,
+  ]);
+
   // Persist snapshot (standalone browser mode only)
   useEffect(() => {
     if (isMyGo()) return;
@@ -647,7 +697,14 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     void Valet.getSnapshot()
       .then((snap) => {
         if (!active) return;
-        setState(normalizeProjectsState(snap as unknown as ValetSnapshot));
+        const normalized = normalizeProjectsState(snap as unknown as ValetSnapshot);
+        seenAssistantIdsRef.current = collectAssistantMessageIds(normalized.chatThreads);
+        backendHydratedRef.current = true;
+        const visibleId = getVisibleChatId(normalized);
+        setUnreadChatCounts((prev) =>
+          pruneUnreadCounts(prev, normalized.chatThreads, visibleId)
+        );
+        setState(normalized);
       })
       .catch(() => {
         // Ignore startup errors if window closes early
@@ -746,11 +803,21 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       void promise
         .then((snap) => {
           const pendingIds = new Set(Object.keys(pendingProjectSaveTimersRef.current));
-          setState((prev) =>
-            replaceNav
-              ? normalizeProjectsState(snap as unknown as ValetSnapshot)
-              : mergeBackendSnapshot(prev, snap, pendingIds)
-          );
+          if (replaceNav) {
+            const normalized = normalizeProjectsState(snap as unknown as ValetSnapshot);
+            seenAssistantIdsRef.current = collectAssistantMessageIds(normalized.chatThreads);
+            backendHydratedRef.current = true;
+            setUnreadChatCounts((prev) =>
+              pruneUnreadCounts(
+                prev,
+                normalized.chatThreads,
+                getVisibleChatId(normalized)
+              )
+            );
+            setState(normalized);
+            return;
+          }
+          setState((prev) => mergeBackendSnapshot(prev, snap, pendingIds));
         })
         .catch((err: unknown) => {
           pushToast(err instanceof Error ? err.message : String(err), "danger");
@@ -2543,22 +2610,61 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     [pushToast]
   );
 
-  const openProjectSession = useCallback((chatId: string) => {
-    setState((prev) => {
-      const target = prev.chatThreads.find((t) => t.id === chatId);
-      const nextProjectId = target?.projectId || prev.activeProjectId || DEFAULT_PROJECT_ID;
-      return {
-        ...prev,
-        activeView: "projects",
-        activeProjectId: nextProjectId,
-        activeProjectTab: "session",
-        activeChatId: chatId,
-        selectedInboxItemId: null,
-        selectedTimelineEventId: null,
-        activePluginDetailId: null,
-      };
+  const markChatRead = useCallback((chatId: string) => {
+    if (!chatId) return;
+    setUnreadChatCounts((prev) => {
+      if (!(chatId in prev)) return prev;
+      const next = { ...prev };
+      delete next[chatId];
+      return next;
     });
   }, []);
+
+  const markAllChatsRead = useCallback((projectId?: string) => {
+    if (!projectId) {
+      setUnreadChatCounts((prev) => (Object.keys(prev).length === 0 ? prev : {}));
+      return;
+    }
+    const threads = stateRef.current.chatThreads;
+    const projectChatIds = new Set(
+      threads
+        .filter((t) => (t.projectId || DEFAULT_PROJECT_ID) === projectId)
+        .map((t) => t.id)
+    );
+    setUnreadChatCounts((prev) => {
+      let changed = false;
+      const next: Record<string, number> = {};
+      for (const [id, count] of Object.entries(prev)) {
+        if (projectChatIds.has(id)) {
+          changed = true;
+        } else {
+          next[id] = count;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, []);
+
+  const openProjectSession = useCallback(
+    (chatId: string) => {
+      markChatRead(chatId);
+      setState((prev) => {
+        const target = prev.chatThreads.find((t) => t.id === chatId);
+        const nextProjectId = target?.projectId || prev.activeProjectId || DEFAULT_PROJECT_ID;
+        return {
+          ...prev,
+          activeView: "projects",
+          activeProjectId: nextProjectId,
+          activeProjectTab: "session",
+          activeChatId: chatId,
+          selectedInboxItemId: null,
+          selectedTimelineEventId: null,
+          activePluginDetailId: null,
+        };
+      });
+    },
+    [markChatRead]
+  );
 
   const selectChatThread = useCallback(
     (chatId: string) => {
@@ -3270,6 +3376,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }) => {
       const activeId = stateRef.current.activeChatId;
       if (!activeId) return;
+      markChatRead(activeId);
       if ((runningChatCountRef.current[activeId] ?? 0) > 0) {
         const policy = stateRef.current.preferences.busyMessagePolicy ?? "queue";
         if (policy === "steer") {
@@ -3897,13 +4004,17 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setComposerQuoteSignal(null);
     setTimelineFocusSignal(null);
     setFocusedNotebookBlock(null);
+    setUnreadChatCounts({});
+    persistUnreadCounts({});
     if (isMyGo()) {
       syncFromBackend(Valet.resetAllData(), true);
       pushToast("已重置全部本地数据", "warning");
       return;
     }
     localStorage.removeItem(STORAGE_KEY);
-    setState(normalizeProjectsState(createInitialSnapshot()));
+    const initial = normalizeProjectsState(createInitialSnapshot());
+    seenAssistantIdsRef.current = collectAssistantMessageIds(initial.chatThreads);
+    setState(initial);
     pushToast("已重置全部本地数据", "warning");
   }, [pushToast, syncFromBackend]);
 
@@ -3914,6 +4025,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       chatStreams,
       queuedMessages,
       runningChatIds,
+      unreadChatCounts,
       toasts,
       nodTick,
       commandPaletteOpen,
@@ -3975,6 +4087,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setComposerDraft,
       quoteInboxItemToChat,
       quoteTimelineEventToChat,
+      markChatRead,
+      markAllChatsRead,
       focusedNotebookBlock,
       selectProject,
       setProjectTab,
@@ -4038,6 +4152,7 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       chatStreams,
       queuedMessages,
       runningChatIds,
+      unreadChatCounts,
       clearArrivalNotice,
       clearHeartbeatLogs,
       clearMemories,
@@ -4066,6 +4181,8 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       isCompactViewport,
       lastWorkflowUpdate,
       listPluginWorkflowRuns,
+      markAllChatsRead,
+      markChatRead,
       moveChatThreadToProject,
       nodTick,
       openInboxItemInTimeline,

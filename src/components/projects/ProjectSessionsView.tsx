@@ -5,13 +5,15 @@ import { extractThreadSummary } from "../../utils/notebook";
 import { ArchiveIcon, BookOpenIcon, PlusIcon, SearchIcon } from "../ui/Icons";
 import { SelectMenu } from "../ui/SelectMenu";
 
-type SessionFilter = "all" | "running" | "pending" | "archived";
+type SessionFilter = "all" | "unread" | "running" | "pending" | "archived";
 
 export const ProjectSessionsView: React.FC<{ project: Project }> = ({ project }) => {
   const {
     state,
     chatStreams,
     runningChatIds,
+    unreadChatCounts,
+    markAllChatsRead,
     openProjectSession,
     createNewChat,
     moveChatThreadToProject,
@@ -50,6 +52,9 @@ export const ProjectSessionsView: React.FC<{ project: Project }> = ({ project })
 
   const activeThreads = projectThreads.filter((t) => !t.archived);
   const archivedThreads = projectThreads.filter((t) => Boolean(t.archived));
+  const unreadThreadCount = activeThreads.filter(
+    (t) => (unreadChatCounts[t.id] ?? 0) > 0
+  ).length;
   const runningCount = activeThreads.filter(isThreadRunning).length;
   const pendingThreadCount = activeThreads.filter((t) => getThreadPendingCount(t) > 0).length;
 
@@ -58,6 +63,7 @@ export const ProjectSessionsView: React.FC<{ project: Project }> = ({ project })
       filter === "archived"
         ? archivedThreads
         : activeThreads.filter((t) => {
+            if (filter === "unread") return (unreadChatCounts[t.id] ?? 0) > 0;
             if (filter === "running") return isThreadRunning(t);
             if (filter === "pending") return getThreadPendingCount(t) > 0;
             return true;
@@ -71,10 +77,31 @@ export const ProjectSessionsView: React.FC<{ project: Project }> = ({ project })
       if (summary.includes(q)) return true;
       return t.messages.some((m) => m.content.toLowerCase().includes(q));
     });
-  }, [activeThreads, archivedThreads, filter, searchQuery, chatStreams, runningChatIds, state.inboxItems]);
+  }, [
+    activeThreads,
+    archivedThreads,
+    filter,
+    searchQuery,
+    chatStreams,
+    runningChatIds,
+    unreadChatCounts,
+    state.inboxItems,
+  ]);
 
-  const filterPills: Array<{ id: SessionFilter; label: string; count: number; dotAmber?: boolean }> = [
+  const filterPills: Array<{
+    id: SessionFilter;
+    label: string;
+    count: number;
+    dotAmber?: boolean;
+    dotAccent?: boolean;
+  }> = [
     { id: "all", label: "全部", count: activeThreads.length },
+    {
+      id: "unread",
+      label: "未读",
+      count: unreadThreadCount,
+      dotAccent: unreadThreadCount > 0,
+    },
     { id: "running", label: "进行中", count: runningCount },
     { id: "pending", label: "待批事项", count: pendingThreadCount, dotAmber: pendingThreadCount > 0 },
     { id: "archived", label: "已归档", count: archivedThreads.length },
@@ -95,6 +122,18 @@ export const ProjectSessionsView: React.FC<{ project: Project }> = ({ project })
             {project.title}
           </h1>
           <div className="flex items-center gap-3 font-mono text-[11px] text-[var(--ink-muted)]">
+            {unreadThreadCount > 0 && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => markAllChatsRead(project.id)}
+                  className="cursor-pointer font-sans text-[11.5px] font-medium text-[var(--ink-secondary)] underline-offset-2 hover:text-[var(--ink-strong)] hover:underline"
+                >
+                  全部标为已读
+                </button>
+                <span className="text-[var(--ink-subtle)]">/</span>
+              </>
+            )}
             <span>{activeThreads.length} 活跃会话</span>
             <span className="text-[var(--ink-subtle)]">/</span>
             <span>{archivedThreads.length} 已归档</span>
@@ -127,6 +166,13 @@ export const ProjectSessionsView: React.FC<{ project: Project }> = ({ project })
                   <span
                     className={`h-1.5 w-1.5 rounded-full ${
                       active ? "bg-[var(--ink-on-primary)]" : "bg-[var(--amber-icon)]"
+                    }`}
+                  />
+                )}
+                {pill.dotAccent && (
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      active ? "bg-[var(--ink-on-primary)]" : "bg-[var(--duty-dot)]"
                     }`}
                   />
                 )}
@@ -174,11 +220,13 @@ export const ProjectSessionsView: React.FC<{ project: Project }> = ({ project })
                 ? `没有匹配「${searchQuery}」的会话`
                 : filter === "archived"
                   ? "暂无已归档会话"
-                  : filter === "running"
-                    ? "当前没有正在运行中的会话"
-                    : filter === "pending"
-                      ? "暂无待你确认的会话事项"
-                      : "当前项目下还没有会话"}
+                  : filter === "unread"
+                    ? "当前没有未读回复的会话"
+                    : filter === "running"
+                      ? "当前没有正在运行中的会话"
+                      : filter === "pending"
+                        ? "暂无待你确认的会话事项"
+                        : "当前项目下还没有会话"}
             </p>
             {filter === "all" && !searchQuery && (
               <button
@@ -195,6 +243,9 @@ export const ProjectSessionsView: React.FC<{ project: Project }> = ({ project })
           filteredThreads.map((thread) => {
             const running = isThreadRunning(thread);
             const pendingCount = getThreadPendingCount(thread);
+            const unreadCount = thread.archived
+              ? 0
+              : (unreadChatCounts[thread.id] ?? 0);
             const summary =
               extractThreadSummary(thread) ||
               thread.messages[0]?.content ||
@@ -228,6 +279,11 @@ export const ProjectSessionsView: React.FC<{ project: Project }> = ({ project })
                       className="h-2 w-2 rounded-full bg-[var(--amber-icon)]"
                       title={`${pendingCount} 项待批`}
                     />
+                  ) : unreadCount > 0 ? (
+                    <span
+                      className="h-2 w-2 rounded-full bg-[var(--duty-dot)] shadow-[0_0_0_3px_var(--duty-halo)]"
+                      title={`${unreadCount} 条未读`}
+                    />
                   ) : (
                     <span
                       className={`h-2 w-2 rounded-full ${
@@ -244,9 +300,19 @@ export const ProjectSessionsView: React.FC<{ project: Project }> = ({ project })
                   className="min-w-0 flex-1 cursor-pointer text-left"
                 >
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="truncate text-[14px] font-medium text-[var(--ink-strong)]">
+                    <span
+                      className={`truncate text-[14px] text-[var(--ink-strong)] ${
+                        unreadCount > 0 ? "font-semibold" : "font-medium"
+                      }`}
+                    >
                       {thread.title}
                     </span>
+
+                    {unreadCount > 0 && (
+                      <span className="rounded-full border border-[var(--core-badge-border)] bg-[var(--core-badge-bg)] px-2 py-[1px] text-[10.5px] font-medium text-[var(--core-badge-fg)]">
+                        {unreadCount} 条未读
+                      </span>
+                    )}
 
                     {pendingCount > 0 && (
                       <span className="rounded-full border border-[var(--amber-pill)] bg-[var(--amber-bg)] px-2 py-[1px] text-[10.5px] font-medium text-[var(--amber-text)]">
