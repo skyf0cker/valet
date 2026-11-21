@@ -1,5 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { DARK_THEME_OPTIONS, normalizeDarkTheme } from "../constants/themes";
+import {
+  DARK_THEME_OPTIONS,
+  LIGHT_THEME_OPTIONS,
+  normalizeDarkTheme,
+  normalizeLightTheme,
+} from "../constants/themes";
 import { useValet } from "../store/ValetContext";
 import type { SettingsSectionId } from "../types/valet";
 import { isReversibleTrashInboxItem } from "../utils/inbox";
@@ -120,11 +125,31 @@ export const CommandPalette: React.FC = () => {
             appearance: state.preferences.appearance === "dark" ? "light" : "dark",
           }),
       },
+      ...LIGHT_THEME_OPTIONS.map((opt) => {
+        const isCurrent = normalizeLightTheme(state.preferences.lightTheme) === opt.id;
+        return {
+          id: `act-light-theme-${opt.id}`,
+          group: "外观主题 · 浅色",
+          title: `切换浅色主题 · ${opt.name} (${opt.enName})`,
+          subtitle: `${opt.tagline}${isCurrent ? " · 当前已选" : ""}`,
+          onSelect: () => {
+            const isCurrentlyLight =
+              document.documentElement.dataset.theme !== "dark";
+            if (!isCurrentlyLight) {
+              updatePreferences({ lightTheme: opt.id, appearance: "light" });
+              pushToast(`已切换至浅色 · ${opt.name}`);
+            } else {
+              updatePreferences({ lightTheme: opt.id });
+              pushToast(`已切换浅色主题 · ${opt.name}`);
+            }
+          },
+        };
+      }),
       ...DARK_THEME_OPTIONS.map((opt) => {
         const isCurrent = normalizeDarkTheme(state.preferences.darkTheme) === opt.id;
         return {
           id: `act-dark-theme-${opt.id}`,
-          group: "外观主题",
+          group: "外观主题 · 深色",
           title: `切换深色主题 · ${opt.name} (${opt.enName})`,
           subtitle: `${opt.tagline}${isCurrent ? " · 当前已选" : ""}`,
           onSelect: () => {
@@ -239,6 +264,7 @@ export const CommandPalette: React.FC = () => {
     state.isPaused,
     state.plugins,
     state.preferences.appearance,
+    state.preferences.lightTheme,
     state.preferences.darkTheme,
     state.projects,
     state.timelineEvents,

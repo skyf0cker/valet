@@ -4,8 +4,10 @@ import {
   blocksToMarkdown,
   buildNotebookContextAttachment,
   deriveFallbackSessionTitle,
+  detectMarkdownShortcut,
   extractInlineRefs,
   joinTextWithInlineRefs,
+  parseInlineNotebookText,
   removeInlineRefAt,
   splitInlineRefs,
 } from "../notebook";
@@ -280,5 +282,84 @@ describe("deriveFallbackSessionTitle", () => {
       "检查本机端口占用情况"
     );
     expect(deriveFallbackSessionTitle("   ")).toBe("新对话");
+  });
+});
+
+describe("notebook Notion markdown extensions", () => {
+  it("exports nested lists with 2-space indentation and per-level numbering", () => {
+    const project = makeTestProject(
+      [
+        { id: "b1", type: "bullet", content: "Parent bullet" },
+        { id: "b2", type: "bullet", content: "Nested bullet", indent: 1 },
+        { id: "b3", type: "todo", checked: true, content: "Nested done", indent: 2 },
+        { id: "n1", type: "numbered", content: "Step 1" },
+        { id: "n1a", type: "numbered", content: "Sub 1", indent: 1 },
+        { id: "n2", type: "numbered", content: "Step 2" },
+      ],
+      "项目文档"
+    );
+
+    expect(blocksToMarkdown(project, [])).toBe(
+      [
+        "# 项目文档",
+        "",
+        "- Parent bullet",
+        "  - Nested bullet",
+        "    - [x] Nested done",
+        "1. Step 1",
+        "  1. Sub 1",
+        "2. Step 2",
+        "",
+      ].join("\n")
+    );
+  });
+
+  it("supports extended Markdown shortcuts including Enter-triggered fences and empty-list todo conversion", () => {
+    expect(detectMarkdownShortcut("2. Second")).toEqual({
+      type: "numbered",
+      content: "Second",
+    });
+    expect(detectMarkdownShortcut("1)Paren")).toBe(null);
+    expect(detectMarkdownShortcut("1) Paren")).toEqual({
+      type: "numbered",
+      content: "Paren",
+    });
+    expect(detectMarkdownShortcut("* [ ] Check")).toEqual({
+      type: "todo",
+      content: "Check",
+      checked: false,
+    });
+    expect(detectMarkdownShortcut("> [!note] Heads up")).toEqual({
+      type: "callout",
+      content: "Heads up",
+    });
+    expect(detectMarkdownShortcut("***")).toEqual({
+      type: "divider",
+      content: "",
+    });
+    expect(detectMarkdownShortcut("```ts", { trigger: "enter" })).toEqual({
+      type: "code",
+      content: "",
+      language: "ts",
+    });
+    expect(detectMarkdownShortcut("[] Next task", { currentType: "bullet" })).toEqual({
+      type: "todo",
+      content: "Next task",
+      checked: false,
+    });
+  });
+
+  it("auto-links bare URLs while stripping trailing punctuation and preserving code spans", () => {
+    const segs = parseInlineNotebookText(
+      "访问 https://example.com/docs，对比 `https://ignored.local` 和 [官网](https://valet.dev)"
+    );
+    expect(segs).toEqual([
+      { kind: "text", text: "访问 " },
+      { kind: "link", label: "https://example.com/docs", href: "https://example.com/docs" },
+      { kind: "text", text: "，对比 " },
+      { kind: "code", text: "https://ignored.local" },
+      { kind: "text", text: " 和 " },
+      { kind: "link", label: "官网", href: "https://valet.dev" },
+    ]);
   });
 });

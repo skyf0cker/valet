@@ -344,6 +344,7 @@ type NotebookBlock struct {
 	ID        string `json:"id"`
 	Type      string `json:"type"` // "paragraph" | "h1" | "h2" | "h3" | "bullet" | "numbered" | "todo" | "callout" | "quote" | "code" | "divider" | "session_ref"
 	Content   string `json:"content"`
+	Indent    int    `json:"indent,omitempty"`
 	Checked   bool   `json:"checked,omitempty"`
 	Language  string `json:"language,omitempty"`
 	SessionID string `json:"sessionId,omitempty"`
@@ -517,7 +518,8 @@ type ValetPreferences struct {
 	LaunchAtLogin         bool                        `json:"launchAtLogin"`
 	ShowMenuBarIcon       bool                        `json:"showMenuBarIcon"`
 	Appearance            string                      `json:"appearance"` // "light" | "dark" | "auto"
-	DarkTheme             string                      `json:"darkTheme,omitempty"` // "cursor" | "vercel" | "vesper" | "onedark" | "tokyo-night" | "catppuccin"
+	LightTheme            string                      `json:"lightTheme,omitempty"` // "cursor-light" | "vercel-light" | "one-light" | "tokyo-day" | "catppuccin-latte" | "solarized-light"
+	DarkTheme             string                      `json:"darkTheme,omitempty"` // "cursor" | "vercel" | "onedark" | "tokyo-night" | "catppuccin" | "vesper"
 	Language              string                      `json:"language"`
 	GlobalHotkey          []string                    `json:"globalHotkey"`
 	BusyMessagePolicy     string                      `json:"busyMessagePolicy,omitempty"` // "queue" | "steer"
@@ -753,10 +755,20 @@ type BuiltinSkillMeta struct {
 	Source      string `json:"source,omitempty"` // "builtin" | "user"
 }
 
+// NormalizeLightTheme clamps lightTheme to a supported palette ID.
+func NormalizeLightTheme(raw string) string {
+	switch raw {
+	case "cursor-light", "vercel-light", "one-light", "tokyo-day", "catppuccin-latte", "solarized-light":
+		return raw
+	default:
+		return "cursor-light"
+	}
+}
+
 // NormalizeDarkTheme clamps darkTheme to a supported palette ID.
 func NormalizeDarkTheme(raw string) string {
 	switch raw {
-	case "cursor", "vercel", "vesper", "onedark", "tokyo-night", "catppuccin":
+	case "cursor", "vercel", "onedark", "tokyo-night", "catppuccin", "vesper":
 		return raw
 	default:
 		return "cursor"

@@ -8,6 +8,7 @@ import {
   type ProjectTab,
   type ValetSnapshot,
 } from "../types/valet";
+import { clampBlockIndent, computeNumberedListMarkers } from "./notebookEditor";
 
 const MAX_NOTEBOOK_EXCERPT_CHARS = 10_000;
 
@@ -37,13 +38,23 @@ export function normalizeProjectsState(snapshot: ValetSnapshot): ValetSnapshot {
 
   for (const p of rawProjects) {
     if (!p || !p.id) continue;
+    const normalizedBlocks: NotebookBlock[] =
+      Array.isArray(p.blocks) && p.blocks.length > 0
+        ? p.blocks.map((blk) => {
+            const normIndent = clampBlockIndent(blk.type, blk.indent);
+            const nextBlk: NotebookBlock = { ...blk };
+            if (normIndent > 0) {
+              nextBlk.indent = normIndent;
+            } else {
+              delete nextBlk.indent;
+            }
+            return nextBlk;
+          })
+        : [{ id: makeBlockId("blk"), type: "paragraph", content: "" }];
     const normalized: Project = {
       ...p,
       tags: Array.isArray(p.tags) ? p.tags : [],
-      blocks:
-        Array.isArray(p.blocks) && p.blocks.length > 0
-          ? p.blocks
-          : [{ id: makeBlockId("blk"), type: "paragraph", content: "" }],
+      blocks: normalizedBlocks,
     };
     if (p.id === DEFAULT_PROJECT_ID) {
       defaultProj = {
@@ -194,6 +205,7 @@ function formatSingleBlockLines(
 ): { lines: string[]; trailingBlank: boolean } {
   const rawText = overrideText ?? blk.content ?? "";
   const text = blk.type === "code" ? rawText : formatInlineTokensForMarkdown(rawText, threadsById);
+  const indentPrefix = "  ".repeat(clampBlockIndent(blk.type, blk.indent));
   switch (blk.type) {
     case "h1":
       return { lines: [`# ${text}`], trailingBlank: true };
@@ -202,19 +214,19 @@ function formatSingleBlockLines(
     case "h3":
       return { lines: [`### ${text}`], trailingBlank: true };
     case "bullet":
-      return { lines: [`- ${text}`], trailingBlank: false };
+      return { lines: [`${indentPrefix}- ${text}`], trailingBlank: false };
     case "numbered":
-      return { lines: [`${orderedNumber}. ${text}`], trailingBlank: false };
+      return { lines: [`${indentPrefix}${orderedNumber}. ${text}`], trailingBlank: false };
     case "todo":
-      return { lines: [`- [${blk.checked ? "x" : " "}] ${text}`], trailingBlank: false };
+      return { lines: [`${indentPrefix}- [${blk.checked ? "x" : " "}] ${text}`], trailingBlank: false };
     case "callout":
       return {
-        lines: ["> [!note]", ...text.split("\n").map((l) => `> ${l}`)],
+        lines: [`${indentPrefix}> [!note]`, ...text.split("\n").map((l) => `${indentPrefix}> ${l}`)],
         trailingBlank: true,
       };
     case "quote":
       return {
-        lines: text.split("\n").map((l) => `> ${l}`),
+        lines: text.split("\n").map((l) => `${indentPrefix}> ${l}`),
         trailingBlank: true,
       };
     case "code":
@@ -239,7 +251,7 @@ function formatSingleBlockLines(
     case "paragraph":
     default:
       return text.trim()
-        ? { lines: [text], trailingBlank: true }
+        ? { lines: [`${indentPrefix}${text}`], trailingBlank: true }
         : { lines: [], trailingBlank: false };
   }
 }
@@ -255,6 +267,7 @@ function formatSingleBlockMarkdown(
 
 export function blocksToMarkdown(project: Project, threads: ChatThread[]): string {
   const threadsById = new Map(threads.map((t) => [t.id, t]));
+  const markers = computeNumberedListMarkers(project.blocks);
   const lines: string[] = [`# ${project.title}`];
 
   if (project.tags.length > 0 || project.workingDir) {
@@ -265,14 +278,9 @@ export function blocksToMarkdown(project: Project, threads: ChatThread[]): strin
   }
 
   lines.push("");
-  let orderedCounter = 0;
   for (const blk of project.blocks) {
-    if (blk.type !== "numbered") {
-      orderedCounter = 0;
-    } else {
-      orderedCounter += 1;
-    }
-    const formatted = formatSingleBlockLines(blk, orderedCounter, threadsById);
+    const orderedNumber = markers[blk.id]?.index ?? 1;
+    const formatted = formatSingleBlockLines(blk, orderedNumber, threadsById);
     if (formatted.lines.length > 0) {
       lines.push(...formatted.lines);
       if (formatted.trailingBlank) {
@@ -297,6 +305,7 @@ export function buildNotebookContextAttachment(
   } = typeof origin === "string" ? { originSection: origin } : (origin ?? {});
 
   const threadsById = new Map(threads.map((t) => [t.id, t]));
+  const markers = computeNumberedListMarkers(project.blocks);
 
   interface AnnotatedEntry {
     blockId: string;
@@ -310,15 +319,10 @@ export function buildNotebookContextAttachment(
   }
 
   const entries: AnnotatedEntry[] = [];
-  let orderedCounter = 0;
   let lineNo = 0;
 
   for (const blk of project.blocks) {
-    if (blk.type !== "numbered") {
-      orderedCounter = 0;
-    } else {
-      orderedCounter += 1;
-    }
+    const orderedNumber = markers[blk.id]?.index ?? 1;
 
     const isOrigin = Boolean(originBlockId && blk.id === originBlockId);
     const rawContent = blk.content ?? "";
@@ -351,7 +355,7 @@ export function buildNotebookContextAttachment(
     const typeLabel = getNotebookBlockTypeLabel(blk);
     const markdownText = isBlankOrigin
       ? "（空白行）"
-      : formatSingleBlockMarkdown(blk, orderedCounter, threadsById, effectiveOverride);
+      : formatSingleBlockMarkdown(blk, orderedNumber, threadsById, effectiveOverride);
 
     let plainText = "";
     if (!isBlankOrigin) {
@@ -504,12 +508,50 @@ export function buildNotebookContextAttachment(
   };
 }
 
-export function detectMarkdownShortcut(raw: string): {
+export function detectMarkdownShortcut(
+  raw: string,
+  options?: { trigger?: "input" | "enter"; currentType?: NotebookBlockType }
+): {
   type: NotebookBlockType;
   content: string;
   checked?: boolean;
   language?: string;
 } | null {
+  const trigger = options?.trigger ?? "input";
+  const currentType = options?.currentType ?? "paragraph";
+
+  if (trigger === "enter") {
+    if (currentType !== "paragraph") return null;
+    const trimmed = raw.trim();
+    const fenceEnter = /^```([a-zA-Z0-9_+-]*)$/.exec(trimmed);
+    if (fenceEnter) {
+      return { type: "code", content: "", language: fenceEnter[1] || "bash" };
+    }
+    if (/^(?:---+|\*\*\*+|___+)$/.test(trimmed)) {
+      return { type: "divider", content: "" };
+    }
+    if (/^>\s*\[!(?:note|info|tip)\]$/i.test(trimmed)) {
+      return { type: "callout", content: "" };
+    }
+    return null;
+  }
+
+  if (currentType === "bullet" || currentType === "numbered" || currentType === "todo") {
+    const todoChecked = /^\[[xX]\]\s(.*)$/.exec(raw);
+    if (todoChecked) {
+      return { type: "todo", content: todoChecked[1] ?? "", checked: true };
+    }
+    const todoUnchecked = /^\[\s?\]\s(.*)$/.exec(raw);
+    if (todoUnchecked) {
+      return { type: "todo", content: todoUnchecked[1] ?? "", checked: false };
+    }
+    return null;
+  }
+
+  if (currentType !== "paragraph") {
+    return null;
+  }
+
   if (/^###\s(.*)$/.test(raw)) {
     return { type: "h3", content: raw.replace(/^###\s/, "") };
   }
@@ -519,27 +561,34 @@ export function detectMarkdownShortcut(raw: string): {
   if (/^#\s(.*)$/.test(raw)) {
     return { type: "h1", content: raw.replace(/^#\s/, "") };
   }
-  const todoChecked = /^-\s\[[xX]\]\s(.*)$/.exec(raw) ?? /^\[[xX]\]\s(.*)$/.exec(raw);
+  const todoChecked =
+    /^[-*+]\s\[[xX]\]\s(.*)$/.exec(raw) ?? /^\[[xX]\]\s(.*)$/.exec(raw);
   if (todoChecked) {
     return { type: "todo", content: todoChecked[1] ?? "", checked: true };
   }
-  const todoUnchecked = /^-\s\[\s?\]\s(.*)$/.exec(raw) ?? /^\[\s?\]\s(.*)$/.exec(raw);
+  const todoUnchecked =
+    /^[-*+]\s\[\s?\]\s(.*)$/.exec(raw) ?? /^\[\s?\]\s(.*)$/.exec(raw);
   if (todoUnchecked) {
     return { type: "todo", content: todoUnchecked[1] ?? "", checked: false };
   }
   if (/^[-*+]\s(.*)$/.test(raw)) {
     return { type: "bullet", content: raw.replace(/^[-*+]\s/, "") };
   }
-  if (/^1\.\s(.*)$/.test(raw)) {
-    return { type: "numbered", content: raw.replace(/^1\.\s/, "") };
+  const numbered = /^\d+[.)]\s(.*)$/.exec(raw);
+  if (numbered) {
+    return { type: "numbered", content: numbered[1] ?? "" };
+  }
+  const callout = /^>\s*\[!(?:note|info|tip)\]\s(.*)$/i.exec(raw);
+  if (callout) {
+    return { type: "callout", content: callout[1] ?? "" };
   }
   if (/^>\s(.*)$/.test(raw)) {
     return { type: "quote", content: raw.replace(/^>\s/, "") };
   }
-  if (/^---$/.test(raw.trim())) {
+  if (/^(?:---|___|\*\*\*)$/.test(raw.trim())) {
     return { type: "divider", content: "" };
   }
-  const codeFence = /^```([a-zA-Z0-9_-]*)\s$/.exec(raw);
+  const codeFence = /^```([a-zA-Z0-9_+-]*)\s$/.exec(raw);
   if (codeFence) {
     return { type: "code", content: "", language: codeFence[1] || "bash" };
   }
@@ -672,7 +721,17 @@ export type InlineSegment =
   | { kind: "timeline"; eventId: string };
 
 const INLINE_TOKEN_RE =
-  /\[\[session:([^\]]+)\]\]|\[\[inbox:([^\]]+)\]\]|\[\[timeline:([^\]]+)\]\]|`([^`]+)`|\*\*([^*]+)\*\*|~~([^~]+)~~|\*([^*]+)\*|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
+  /\[\[session:([^\]]+)\]\]|\[\[inbox:([^\]]+)\]\]|\[\[timeline:([^\]]+)\]\]|`([^`]+)`|\*\*([^*]+)\*\*|~~([^~]+)~~|\*([^*]+)\*|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>()'"\u0080-\uffff]+)/g;
+
+function pushTextSegment(out: InlineSegment[], text: string): void {
+  if (!text) return;
+  const prev = out[out.length - 1];
+  if (prev && prev.kind === "text") {
+    prev.text += text;
+  } else {
+    out.push({ kind: "text", text });
+  }
+}
 
 export function parseInlineNotebookText(text: string): InlineSegment[] {
   if (!text) return [];
@@ -683,7 +742,7 @@ export function parseInlineNotebookText(text: string): InlineSegment[] {
   let match: RegExpExecArray | null;
   while ((match = INLINE_TOKEN_RE.exec(text)) !== null) {
     if (match.index > lastIndex) {
-      out.push({ kind: "text", text: text.slice(lastIndex, match.index) });
+      pushTextSegment(out, text.slice(lastIndex, match.index));
     }
     if (match[1]) {
       out.push({ kind: "session", sessionId: match[1] });
@@ -701,12 +760,25 @@ export function parseInlineNotebookText(text: string): InlineSegment[] {
       out.push({ kind: "italic", text: match[7] });
     } else if (match[8] !== undefined && match[9] !== undefined) {
       out.push({ kind: "link", label: match[8], href: match[9] });
+    } else if (match[10] !== undefined) {
+      const rawUrl = match[10];
+      const trailingMatch = /[.,;:!?)\]}>。，；：！？）】]+$/.exec(rawUrl);
+      const cleanUrl = trailingMatch ? rawUrl.slice(0, trailingMatch.index) : rawUrl;
+      const trailingText = trailingMatch ? trailingMatch[0] : "";
+      if (cleanUrl) {
+        out.push({ kind: "link", label: cleanUrl, href: cleanUrl });
+      } else {
+        pushTextSegment(out, rawUrl);
+      }
+      if (trailingText) {
+        pushTextSegment(out, trailingText);
+      }
     }
     lastIndex = INLINE_TOKEN_RE.lastIndex;
   }
 
   if (lastIndex < text.length) {
-    out.push({ kind: "text", text: text.slice(lastIndex) });
+    pushTextSegment(out, text.slice(lastIndex));
   }
   return out;
 }

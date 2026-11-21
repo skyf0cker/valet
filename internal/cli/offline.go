@@ -338,6 +338,7 @@ func (o *offlineBackend) status() (map[string]any, error) {
 		"models":           snap.Preferences.Models,
 		"autonomyLevel":    snap.Preferences.AutonomyLevel,
 		"appearance":       snap.Preferences.Appearance,
+		"lightTheme":       snap.Preferences.LightTheme,
 		"darkTheme":        snap.Preferences.DarkTheme,
 		"systemMetrics":    snap.SystemMetrics,
 		"counts": map[string]int{

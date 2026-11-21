@@ -361,6 +361,7 @@ export interface NotebookBlock {
   id: string;
   type: string;
   content: string;
+  indent?: number;
   checked?: boolean;
   language?: string;
   sessionId?: string;
@@ -717,6 +718,7 @@ export interface ValetPreferences {
   launchAtLogin: boolean;
   showMenuBarIcon: boolean;
   appearance: string;
+  lightTheme?: string;
   darkTheme?: string;
   language: string;
   globalHotkey: string[];

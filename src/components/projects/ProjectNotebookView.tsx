@@ -6,6 +6,7 @@ import type {
   NotebookBlockType,
   Project,
 } from "../../types/valet";
+import { copyTextToClipboard } from "../../utils/chatClipboard";
 import {
   blocksToMarkdown,
   detectMarkdownShortcut,
@@ -19,6 +20,20 @@ import {
   type InlineRefToken,
 } from "../../utils/notebook";
 import {
+  applyCodeBlockEnter,
+  applyCodeBlockTab,
+  applyMarkdownPasteToBlocks,
+  clampBlockIndent,
+  computeNumberedListMarkers,
+  indentBlockSubtree,
+  isIndentableBlockType,
+  mapRenderedOffsetToRawOffset,
+  moveBlockSubtree,
+  normalizeBlockIndents,
+  toggleInlineMarkdownFormat,
+  type InlineFormatKind,
+} from "../../utils/notebookEditor";
+import {
   BowtieSvg,
   CheckIcon,
   ClockIcon,
@@ -29,6 +44,7 @@ import {
   PlusIcon,
 } from "../ui/Icons";
 import { InlineValetComposer } from "./InlineValetComposer";
+import { NotebookFormatToolbar } from "./NotebookFormatToolbar";
 import {
   NotebookMentionPopover,
   NotebookSlashPopover,
@@ -82,6 +98,117 @@ const CONVERT_OPTIONS: Array<{ type: NotebookBlockType; label: string }> = [
 
 const NON_TEXT_BLOCK_TYPES = new Set<NotebookBlockType>(["divider", "session_ref"]);
 
+const CODE_LANGUAGES = [
+  "bash",
+  "typescript",
+  "javascript",
+  "go",
+  "python",
+  "json",
+  "yaml",
+  "sql",
+  "rust",
+  "swift",
+  "markdown",
+  "html",
+  "css",
+  "text",
+];
+
+const QUICK_CONVERT_CODES: Record<string, NotebookBlockType> = {
+  Digit0: "paragraph",
+  Digit1: "h1",
+  Digit2: "h2",
+  Digit3: "h3",
+  Digit4: "todo",
+  Digit5: "bullet",
+  Digit6: "numbered",
+  Digit7: "quote",
+  Digit8: "code",
+  Digit9: "callout",
+};
+
+interface NotebookHistorySnapshot {
+  blocks: NotebookBlock[];
+  focusedBlockId: string | null;
+  selStart: number;
+  selEnd: number;
+}
+
+function getClickedRenderedOffset(
+  container: HTMLElement,
+  clientX: number,
+  clientY: number
+): number | null {
+  if (typeof document === "undefined") return null;
+  let range: Range | null = null;
+  if (typeof document.caretRangeFromPoint === "function") {
+    range = document.caretRangeFromPoint(clientX, clientY);
+  } else {
+    const caretPosFn = (
+      document as Document & {
+        caretPositionFromPoint?: (
+          x: number,
+          y: number
+        ) => { offsetNode: Node; offset: number } | null;
+      }
+    ).caretPositionFromPoint;
+    if (typeof caretPosFn === "function") {
+      const pos = caretPosFn.call(document, clientX, clientY);
+      if (pos) {
+        range = document.createRange();
+        range.setStart(pos.offsetNode, pos.offset);
+        range.collapse(true);
+      }
+    }
+  }
+  if (!range || !container.contains(range.startContainer)) return null;
+
+  let offset = 0;
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parentEl = node.parentElement;
+      if (parentEl?.closest("[data-inline-interactive], [data-placeholder-text]")) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+
+  let current = walker.nextNode();
+  while (current) {
+    if (current === range.startContainer) {
+      return offset + range.startOffset;
+    }
+    try {
+      if (range.comparePoint(current, 0) >= 0) {
+        return offset;
+      }
+    } catch {
+      return null;
+    }
+    offset += current.textContent?.length ?? 0;
+    current = walker.nextNode();
+  }
+  return offset;
+}
+
+function isTextareaOnVisualFirstLine(el: HTMLTextAreaElement, selStart: number): boolean {
+  const before = el.value.slice(0, selStart);
+  if (before.includes("\n")) return false;
+  const lineHeight = Number.parseFloat(window.getComputedStyle(el).lineHeight || "24") || 24;
+  if (el.scrollHeight <= lineHeight * 1.65) return true;
+  return selStart === 0;
+}
+
+function isTextareaOnVisualLastLine(el: HTMLTextAreaElement, selEnd: number): boolean {
+  const after = el.value.slice(selEnd);
+  if (after.includes("\n")) return false;
+  const lineHeight = Number.parseFloat(window.getComputedStyle(el).lineHeight || "24") || 24;
+  if (el.scrollHeight <= lineHeight * 1.65) return true;
+  return selEnd === el.value.length;
+}
+
 function getEditableTypographyClass(type: NotebookBlockType, checked?: boolean): string {
   switch (type) {
     case "h1":
@@ -127,6 +254,11 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
   const [tagDraft, setTagDraft] = useState("");
 
   const [focusedBlockId, setFocusedBlockId] = useState<string | null>(null);
+  const [textSelection, setTextSelection] = useState<{
+    blockId: string;
+    start: number;
+    end: number;
+  } | null>(null);
   const [mentionState, setMentionState] = useState<{
     blockId: string;
     atIndex: number;
@@ -150,21 +282,43 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
   const [highlightedBlockId, setHighlightedBlockId] = useState<string | null>(null);
 
   const blockTextareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
-  const pendingCursorPosRef = useRef<{ blockId: string; pos: number } | null>(null);
+  const pendingSelectionRef = useRef<{ blockId: string; start: number; end: number } | null>(
+    null
+  );
   const lastCompositionEndRef = useRef(0);
   const blocksRef = useRef<NotebookBlock[]>(project.blocks);
   blocksRef.current = project.blocks;
+  const focusedBlockIdRef = useRef<string | null>(null);
+  focusedBlockIdRef.current = focusedBlockId;
+  const historyRef = useRef<{
+    past: NotebookHistorySnapshot[];
+    future: NotebookHistorySnapshot[];
+    lastCoalesceKey: string | null;
+    lastCoalesceAt: number;
+  }>({
+    past: [],
+    future: [],
+    lastCoalesceKey: null,
+    lastCoalesceAt: 0,
+  });
 
-  // Reset local header drafts when switching projects or syncing remotely when unfocused
+  // Reset local header drafts & history when switching projects
   useEffect(() => {
     setTitleDraft(project.title);
     setDescDraft(project.description ?? "");
     setWorkingDirDraft(project.workingDir ?? "");
     setFocusedBlockId(null);
+    setTextSelection(null);
     setMentionState(null);
     setSlashState(null);
     setValetComposerState(null);
     setBlockMenuId(null);
+    historyRef.current = {
+      past: [],
+      future: [],
+      lastCoalesceKey: null,
+      lastCoalesceAt: 0,
+    };
   }, [project.id]);
 
   useEffect(() => {
@@ -204,19 +358,27 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     return () => window.clearTimeout(timer);
   }, [focusedNotebookBlock, project.id]);
 
-  // Auto-focus & resize active block textarea
+  // Auto-focus & resize active block textarea while preserving sub-control focus
   useEffect(() => {
     if (!focusedBlockId) return;
     const el = blockTextareaRefs.current[focusedBlockId];
     if (!el) return;
-    el.focus();
+    const activeEl = document.activeElement;
+    const isEditingCodeLang =
+      activeEl instanceof HTMLInputElement &&
+      activeEl.dataset.blockLangInput === focusedBlockId;
+    if (activeEl !== el && !isEditingCodeLang) {
+      el.focus();
+    }
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
-    const pending = pendingCursorPosRef.current;
+    const pending = pendingSelectionRef.current;
     if (pending && pending.blockId === focusedBlockId) {
-      const clamped = Math.max(0, Math.min(el.value.length, pending.pos));
-      el.setSelectionRange(clamped, clamped);
-      pendingCursorPosRef.current = null;
+      const start = Math.max(0, Math.min(el.value.length, pending.start));
+      const end = Math.max(start, Math.min(el.value.length, pending.end));
+      el.setSelectionRange(start, end);
+      pendingSelectionRef.current = null;
+      setTextSelection(start !== end ? { blockId: focusedBlockId, start, end } : null);
     }
   }, [focusedBlockId, project.blocks]);
 
@@ -269,37 +431,142 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     [project.blocks]
   );
 
-  const numberedIndices = useMemo(() => {
-    const map: Record<string, number> = {};
-    let counter = 0;
-    for (const blk of blocks) {
-      if (blk.type === "numbered") {
-        counter += 1;
-        map[blk.id] = counter;
-      } else {
-        counter = 0;
-      }
-    }
-    return map;
-  }, [blocks]);
+  const numberedMarkers = useMemo(() => computeNumberedListMarkers(blocks), [blocks]);
 
   const commitBlocks = useCallback(
-    (nextBlocks: NotebookBlock[]) => {
+    (
+      nextBlocks: NotebookBlock[],
+      options?: { recordHistory?: boolean; coalesceKey?: string }
+    ) => {
       const normalized =
         nextBlocks.length > 0
           ? nextBlocks
           : [{ id: makeBlockId("blk"), type: "paragraph" as const, content: "" }];
+
+      if (options?.recordHistory !== false) {
+        const activeId = focusedBlockIdRef.current;
+        const activeEl = activeId ? blockTextareaRefs.current[activeId] : null;
+        const snapshot: NotebookHistorySnapshot = {
+          blocks: blocksRef.current.map((b) => ({ ...b })),
+          focusedBlockId: activeId,
+          selStart: activeEl?.selectionStart ?? 0,
+          selEnd: activeEl?.selectionEnd ?? 0,
+        };
+        const hist = historyRef.current;
+        const now = Date.now();
+        const canCoalesce =
+          Boolean(options?.coalesceKey) &&
+          hist.lastCoalesceKey === options?.coalesceKey &&
+          now - hist.lastCoalesceAt < 700 &&
+          hist.past.length > 0;
+        if (!canCoalesce) {
+          hist.past.push(snapshot);
+          if (hist.past.length > 80) hist.past.shift();
+        }
+        hist.future = [];
+        hist.lastCoalesceKey = options?.coalesceKey ?? null;
+        hist.lastCoalesceAt = options?.coalesceKey ? now : 0;
+      }
+
       updateProject(project.id, { blocks: normalized });
     },
     [project.id, updateProject]
   );
 
-  const focusBlockAt = useCallback((blockId: string, cursorPos?: number) => {
-    if (cursorPos !== undefined) {
-      pendingCursorPosRef.current = { blockId, pos: cursorPos };
+  const focusBlockAt = useCallback(
+    (blockId: string, cursorPos?: number, cursorEnd?: number) => {
+      if (cursorPos !== undefined) {
+        pendingSelectionRef.current = {
+          blockId,
+          start: cursorPos,
+          end: cursorEnd ?? cursorPos,
+        };
+      }
+      setFocusedBlockId(blockId);
+    },
+    []
+  );
+
+  const handleUndo = useCallback(() => {
+    const hist = historyRef.current;
+    const prev = hist.past.pop();
+    if (!prev) return false;
+
+    const activeId = focusedBlockIdRef.current;
+    const activeEl = activeId ? blockTextareaRefs.current[activeId] : null;
+    hist.future.push({
+      blocks: blocksRef.current.map((b) => ({ ...b })),
+      focusedBlockId: activeId,
+      selStart: activeEl?.selectionStart ?? 0,
+      selEnd: activeEl?.selectionEnd ?? 0,
+    });
+    hist.lastCoalesceKey = null;
+    hist.lastCoalesceAt = 0;
+
+    setMentionState(null);
+    setSlashState(null);
+    commitBlocks(prev.blocks, { recordHistory: false });
+    if (prev.focusedBlockId) {
+      focusBlockAt(prev.focusedBlockId, prev.selStart, prev.selEnd);
+    } else {
+      setFocusedBlockId(null);
     }
-    setFocusedBlockId(blockId);
-  }, []);
+    return true;
+  }, [commitBlocks, focusBlockAt]);
+
+  const handleRedo = useCallback(() => {
+    const hist = historyRef.current;
+    const nextSnap = hist.future.pop();
+    if (!nextSnap) return false;
+
+    const activeId = focusedBlockIdRef.current;
+    const activeEl = activeId ? blockTextareaRefs.current[activeId] : null;
+    hist.past.push({
+      blocks: blocksRef.current.map((b) => ({ ...b })),
+      focusedBlockId: activeId,
+      selStart: activeEl?.selectionStart ?? 0,
+      selEnd: activeEl?.selectionEnd ?? 0,
+    });
+    hist.lastCoalesceKey = null;
+    hist.lastCoalesceAt = 0;
+
+    setMentionState(null);
+    setSlashState(null);
+    commitBlocks(nextSnap.blocks, { recordHistory: false });
+    if (nextSnap.focusedBlockId) {
+      focusBlockAt(nextSnap.focusedBlockId, nextSnap.selStart, nextSnap.selEnd);
+    } else {
+      setFocusedBlockId(null);
+    }
+    return true;
+  }, [commitBlocks, focusBlockAt]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      const active = document.activeElement;
+      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+        return;
+      }
+      if (
+        active instanceof HTMLElement &&
+        active !== document.body &&
+        !active.closest('[data-notebook-editor="true"]')
+      ) {
+        return;
+      }
+      const meta = e.metaKey || e.ctrlKey;
+      const lower = e.key.toLowerCase();
+      if (meta && !e.altKey && lower === "z") {
+        const handled = e.shiftKey ? handleRedo() : handleUndo();
+        if (handled) e.preventDefault();
+      } else if (e.ctrlKey && !e.metaKey && !e.altKey && lower === "y") {
+        if (handleRedo()) e.preventDefault();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handleRedo, handleUndo]);
 
   const commitTitle = () => {
     const trimmed = titleDraft.trim();
@@ -342,12 +609,49 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
   const updateBlockContentOrProps = (
     blockId: string,
-    patch: Partial<NotebookBlock>
+    patch: Partial<NotebookBlock>,
+    commitOpts?: { recordHistory?: boolean; coalesceKey?: string }
   ) => {
     const next = blocksRef.current.map((b) =>
       b.id === blockId ? { ...b, ...patch } : b
     );
-    commitBlocks(next);
+    commitBlocks(next, commitOpts);
+  };
+
+  const convertBlockType = (blockId: string, targetType: NotebookBlockType) => {
+    const cur = blocksRef.current;
+    const mapped = cur.map((b) => {
+      if (b.id !== blockId) return b;
+      const nextBlk: NotebookBlock = {
+        ...b,
+        type: targetType,
+        language: targetType === "code" ? b.language || "bash" : undefined,
+        checked: targetType === "todo" ? Boolean(b.checked) : undefined,
+      };
+      if (!isIndentableBlockType(targetType)) {
+        delete nextBlk.indent;
+      }
+      return nextBlk;
+    });
+    commitBlocks(normalizeBlockIndents(mapped));
+  };
+
+  const applyInlineFormat = (block: NotebookBlock, kind: InlineFormatKind) => {
+    if (block.type === "code") return;
+    const el = blockTextareaRefs.current[block.id];
+    if (!el) return;
+    const selStart = el.selectionStart ?? 0;
+    const selEnd = el.selectionEnd ?? 0;
+    const { editableText, refs } = splitInlineRefs(block.content);
+    const formatted = toggleInlineMarkdownFormat(editableText, selStart, selEnd, kind);
+    pendingSelectionRef.current = {
+      blockId: block.id,
+      start: formatted.selectionStart,
+      end: formatted.selectionEnd,
+    };
+    updateBlockContentOrProps(block.id, {
+      content: joinTextWithInlineRefs(formatted.text, refs),
+    });
   };
 
   const handleRemoveInlineRef = (blockId: string, refIndex: number) => {
@@ -368,7 +672,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       focusBlockAt(resetId, 0);
       return;
     }
-    const next = cur.filter((b) => b.id !== blockId);
+    const next = normalizeBlockIndents(cur.filter((b) => b.id !== blockId));
     commitBlocks(next);
     const neighbor = next[Math.max(0, idx - 1)];
     if (neighbor && !NON_TEXT_BLOCK_TYPES.has(neighbor.type)) {
@@ -378,14 +682,38 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     }
   };
 
-  const moveBlock = (blockId: string, delta: -1 | 1) => {
-    const cur = [...blocksRef.current];
+  const indentBlock = (blockId: string, delta: 1 | -1) => {
+    const cur = blocksRef.current;
     const idx = cur.findIndex((b) => b.id === blockId);
-    const target = idx + delta;
-    if (idx === -1 || target < 0 || target >= cur.length) return;
-    const [item] = cur.splice(idx, 1);
-    cur.splice(target, 0, item!);
-    commitBlocks(cur);
+    if (idx === -1) return;
+    const next = indentBlockSubtree(cur, idx, delta);
+    if (!next) return;
+    const el = blockTextareaRefs.current[blockId];
+    if (el) {
+      pendingSelectionRef.current = {
+        blockId,
+        start: el.selectionStart ?? 0,
+        end: el.selectionEnd ?? 0,
+      };
+    }
+    commitBlocks(next);
+  };
+
+  const moveBlock = (blockId: string, delta: -1 | 1) => {
+    const cur = blocksRef.current;
+    const idx = cur.findIndex((b) => b.id === blockId);
+    if (idx === -1) return;
+    const moved = moveBlockSubtree(cur, idx, delta);
+    if (!moved) return;
+    const el = blockTextareaRefs.current[blockId];
+    if (el) {
+      pendingSelectionRef.current = {
+        blockId,
+        start: el.selectionStart ?? 0,
+        end: el.selectionEnd ?? 0,
+      };
+    }
+    commitBlocks(moved.blocks);
   };
 
   const duplicateBlock = (blockId: string) => {
@@ -397,7 +725,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       id: makeBlockId("blk"),
     };
     cur.splice(idx + 1, 0, clone);
-    commitBlocks(cur);
+    commitBlocks(normalizeBlockIndents(cur));
     if (!NON_TEXT_BLOCK_TYPES.has(clone.type)) {
       focusBlockAt(clone.id, getBlockEditableLength(clone));
     }
@@ -411,7 +739,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     if (fromIdx === -1 || toIdx === -1) return;
     const [moved] = cur.splice(fromIdx, 1);
     cur.splice(toIdx, 0, moved!);
-    commitBlocks(cur);
+    commitBlocks(normalizeBlockIndents(cur));
   };
 
   const handleOpenInlineValetAtEndOrFocused = () => {
@@ -459,7 +787,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     selectionStart: number
   ) => {
     if (block.type === "code") {
-      updateBlockContentOrProps(block.id, { content: rawVal });
+      updateBlockContentOrProps(block.id, { content: rawVal }, { coalesceKey: block.id });
       setMentionState(null);
       setSlashState(null);
       return;
@@ -467,48 +795,56 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
     const existingRefs = extractInlineRefs(block.content);
 
-    // 1. Live Markdown prefix conversion on paragraphs
-    if (block.type === "paragraph") {
-      const shortcut = detectMarkdownShortcut(rawVal);
-      if (shortcut && !(shortcut.type === "divider" && existingRefs.length > 0)) {
-        setMentionState(null);
-        setSlashState(null);
-        const cur = blocksRef.current;
-        const idx = cur.findIndex((b) => b.id === block.id);
-        if (shortcut.type === "divider") {
-          const nextPara: NotebookBlock = {
-            id: makeBlockId("blk"),
-            type: "paragraph",
-            content: "",
-          };
-          const next = [...cur];
-          next[idx] = { id: block.id, type: "divider", content: "" };
-          next.splice(idx + 1, 0, nextPara);
-          commitBlocks(next);
-          focusBlockAt(nextPara.id, 0);
-          return;
-        }
-        const next = cur.map((b) =>
-          b.id === block.id
-            ? {
-                ...b,
-                type: shortcut.type,
-                content: joinTextWithInlineRefs(shortcut.content, existingRefs),
-                checked: shortcut.checked,
-                language: shortcut.language,
-              }
-            : b
-        );
-        commitBlocks(next);
-        focusBlockAt(block.id, shortcut.content.length);
+    // 1. Live Markdown prefix conversion (paragraphs + empty-list -> todo conversion)
+    const shortcut = detectMarkdownShortcut(rawVal, {
+      trigger: "input",
+      currentType: block.type,
+    });
+    if (shortcut && !(shortcut.type === "divider" && existingRefs.length > 0)) {
+      setMentionState(null);
+      setSlashState(null);
+      const cur = blocksRef.current;
+      const idx = cur.findIndex((b) => b.id === block.id);
+      if (shortcut.type === "divider") {
+        const nextPara: NotebookBlock = {
+          id: makeBlockId("blk"),
+          type: "paragraph",
+          content: "",
+        };
+        const next = [...cur];
+        next[idx] = { id: block.id, type: "divider", content: "" };
+        next.splice(idx + 1, 0, nextPara);
+        commitBlocks(normalizeBlockIndents(next));
+        focusBlockAt(nextPara.id, 0);
         return;
       }
+      const next = cur.map((b) => {
+        if (b.id !== block.id) return b;
+        const converted: NotebookBlock = {
+          ...b,
+          type: shortcut.type,
+          content: joinTextWithInlineRefs(shortcut.content, existingRefs),
+          checked: shortcut.checked,
+          language: shortcut.language,
+        };
+        if (!isIndentableBlockType(shortcut.type)) {
+          delete converted.indent;
+        }
+        return converted;
+      });
+      commitBlocks(normalizeBlockIndents(next));
+      focusBlockAt(block.id, shortcut.content.length);
+      return;
     }
 
     // Persist normal text edit while preserving existing inline reference chips
-    updateBlockContentOrProps(block.id, {
-      content: joinTextWithInlineRefs(rawVal, existingRefs),
-    });
+    updateBlockContentOrProps(
+      block.id,
+      {
+        content: joinTextWithInlineRefs(rawVal, existingRefs),
+      },
+      { coalesceKey: block.id }
+    );
 
     const beforeCursor = rawVal.slice(0, selectionStart);
 
@@ -552,8 +888,8 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       return;
     }
 
-    // 4. Typing `/...` at start of paragraph opens Slash Block Menu
-    if (block.type === "paragraph" && existingRefs.length === 0) {
+    // 4. Typing `/...` at start of any non-code text block opens Slash Block Menu
+    if (!NON_TEXT_BLOCK_TYPES.has(block.type) && existingRefs.length === 0) {
       const slashMatch = /^\/([^\s]*)$/.exec(rawVal);
       if (slashMatch) {
         setSlashState({
@@ -568,6 +904,30 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
     setMentionState((cur) => (cur?.blockId === block.id ? null : cur));
     setSlashState((cur) => (cur?.blockId === block.id ? null : cur));
+  };
+
+  const handleBlockPaste = (
+    e: React.ClipboardEvent<HTMLTextAreaElement>,
+    block: NotebookBlock,
+    blockIndex: number
+  ) => {
+    if (block.type === "code") return;
+    const pasted = e.clipboardData?.getData("text/plain");
+    if (!pasted) return;
+    const el = e.currentTarget;
+    const res = applyMarkdownPasteToBlocks({
+      blocks: blocksRef.current,
+      blockIndex,
+      selStart: el.selectionStart ?? 0,
+      selEnd: el.selectionEnd ?? 0,
+      pastedText: pasted,
+    });
+    if (!res) return;
+    e.preventDefault();
+    setMentionState(null);
+    setSlashState(null);
+    commitBlocks(res.blocks);
+    focusBlockAt(res.focusBlockId, res.focusCursorPos);
   };
 
   const handleMentionSelect = (action: MentionAction) => {
@@ -670,31 +1030,36 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         const next = [...cur];
         next[idx] = { id: blockId, type: "divider", content: "" };
         next.splice(idx + 1, 0, nextPara);
-        commitBlocks(next);
+        commitBlocks(normalizeBlockIndents(next));
         focusBlockAt(nextPara.id, 0);
         return;
       }
-      const next = cur.map((b) =>
-        b.id === blockId
-          ? {
-              ...b,
-              type: chosenType,
-              content: "",
-              language: chosenType === "code" ? b.language || "bash" : undefined,
-              checked: chosenType === "todo" ? false : undefined,
-            }
-          : b
-      );
-      commitBlocks(next);
+      const next = cur.map((b) => {
+        if (b.id !== blockId) return b;
+        const converted: NotebookBlock = {
+          ...b,
+          type: chosenType,
+          content: "",
+          language: chosenType === "code" ? b.language || "bash" : undefined,
+          checked: chosenType === "todo" ? false : undefined,
+        };
+        if (!isIndentableBlockType(chosenType)) {
+          delete converted.indent;
+        }
+        return converted;
+      });
+      commitBlocks(normalizeBlockIndents(next));
       focusBlockAt(blockId, 0);
       return;
     }
 
     // mode === "insert_after"
+    const sourceIndent = cur[idx] ? clampBlockIndent(cur[idx]!.type, cur[idx]!.indent) : 0;
     const newBlk: NotebookBlock = {
       id: makeBlockId("blk"),
       type: chosenType,
       content: "",
+      ...(sourceIndent > 0 && isIndentableBlockType(chosenType) ? { indent: sourceIndent } : {}),
       language: chosenType === "code" ? "bash" : undefined,
       checked: chosenType === "todo" ? false : undefined,
     };
@@ -707,11 +1072,11 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         content: "",
       };
       next.splice(idx + 2, 0, followPara);
-      commitBlocks(next);
+      commitBlocks(normalizeBlockIndents(next));
       focusBlockAt(followPara.id, 0);
       return;
     }
-    commitBlocks(next);
+    commitBlocks(normalizeBlockIndents(next));
     focusBlockAt(newBlk.id, 0);
   };
 
@@ -728,11 +1093,33 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       return;
     }
 
+    const popoverOpen =
+      mentionState?.blockId === block.id || slashState?.blockId === block.id;
+
     // Popover window capture listener owns navigation/confirmation while open
     if (
-      (mentionState?.blockId === block.id || slashState?.blockId === block.id) &&
+      popoverOpen &&
       (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Escape")
     ) {
+      return;
+    }
+
+    const meta = e.metaKey || e.ctrlKey;
+    const lowerKey = e.key.toLowerCase();
+
+    // Block-level Undo / Redo across block splits, merges, indentation, pastes, and edits
+    if (meta && !e.altKey && lowerKey === "z") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        handleRedo();
+      } else {
+        handleUndo();
+      }
+      return;
+    }
+    if (e.ctrlKey && !e.metaKey && !e.altKey && lowerKey === "y") {
+      e.preventDefault();
+      handleRedo();
       return;
     }
 
@@ -740,8 +1127,62 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     const selStart = el.selectionStart ?? 0;
     const selEnd = el.selectionEnd ?? 0;
 
+    // Universal block shortcuts (Duplicate / Move subtree / Quick convert)
+    if (meta && !e.altKey && !e.shiftKey && lowerKey === "d") {
+      e.preventDefault();
+      duplicateBlock(block.id);
+      return;
+    }
+    if (meta && e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      e.preventDefault();
+      moveBlock(block.id, e.key === "ArrowUp" ? -1 : 1);
+      return;
+    }
+    if (meta && e.altKey && QUICK_CONVERT_CODES[e.code]) {
+      e.preventDefault();
+      const targetType = QUICK_CONVERT_CODES[e.code]!;
+      pendingSelectionRef.current = { blockId: block.id, start: selStart, end: selEnd };
+      convertBlockType(block.id, targetType);
+      focusBlockAt(block.id, selStart, selEnd);
+      return;
+    }
+
+    const focusAdjacentEditableBlock = (direction: -1 | 1, col: number) => {
+      const cur = blocksRef.current;
+      for (let i = blockIndex + direction; i >= 0 && i < cur.length; i += direction) {
+        const candidate = cur[i];
+        if (!candidate || NON_TEXT_BLOCK_TYPES.has(candidate.type)) continue;
+        const candText =
+          candidate.type === "code"
+            ? candidate.content
+            : splitInlineRefs(candidate.content).editableText;
+        if (direction === -1) {
+          const lastLineStart = candText.lastIndexOf("\n") + 1;
+          const lastLineLen = candText.length - lastLineStart;
+          focusBlockAt(candidate.id, lastLineStart + Math.min(col, lastLineLen));
+        } else {
+          const firstNewline = candText.indexOf("\n");
+          const firstLineLen = firstNewline === -1 ? candText.length : firstNewline;
+          focusBlockAt(candidate.id, Math.min(col, firstLineLen));
+        }
+        return true;
+      }
+      return false;
+    };
+
     if (block.type === "code") {
-      if (e.key === "Enter" && e.shiftKey) {
+      if (e.key === "Tab") {
+        e.preventDefault();
+        const nextCode = applyCodeBlockTab(block.content, selStart, selEnd, e.shiftKey);
+        pendingSelectionRef.current = {
+          blockId: block.id,
+          start: nextCode.selectionStart,
+          end: nextCode.selectionEnd,
+        };
+        updateBlockContentOrProps(block.id, { content: nextCode.text });
+        return;
+      }
+      if (e.key === "Enter" && (e.shiftKey || meta)) {
         e.preventDefault();
         const cur = blocksRef.current;
         const nextBlk: NotebookBlock = {
@@ -755,23 +1196,165 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         focusBlockAt(nextBlk.id, 0);
         return;
       }
+      if (e.key === "Enter" && !e.altKey) {
+        e.preventDefault();
+        const nextCode = applyCodeBlockEnter(block.content, selStart, selEnd);
+        pendingSelectionRef.current = {
+          blockId: block.id,
+          start: nextCode.selectionStart,
+          end: nextCode.selectionEnd,
+        };
+        updateBlockContentOrProps(block.id, { content: nextCode.text });
+        return;
+      }
       if (e.key === "Backspace" && block.content === "") {
         e.preventDefault();
         updateBlockContentOrProps(block.id, { type: "paragraph", language: undefined });
         focusBlockAt(block.id, 0);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        el.blur();
+        return;
+      }
+      if (
+        e.key === "ArrowUp" &&
+        !e.shiftKey &&
+        !e.altKey &&
+        !meta &&
+        selStart === selEnd &&
+        !block.content.slice(0, selStart).includes("\n")
+      ) {
+        if (focusAdjacentEditableBlock(-1, selStart)) {
+          e.preventDefault();
+        }
+        return;
+      }
+      if (
+        e.key === "ArrowDown" &&
+        !e.shiftKey &&
+        !e.altKey &&
+        !meta &&
+        selStart === selEnd &&
+        !block.content.slice(selEnd).includes("\n")
+      ) {
+        const lineStart = block.content.lastIndexOf("\n", Math.max(0, selStart - 1)) + 1;
+        if (focusAdjacentEditableBlock(1, selStart - lineStart)) {
+          e.preventDefault();
+        }
       }
       return;
     }
 
     const { editableText, refs } = splitInlineRefs(block.content);
 
+    // Tab / Shift+Tab indentation for indentable blocks (never let Tab escape the editor)
+    if (e.key === "Tab") {
+      e.preventDefault();
+      if (!popoverOpen) {
+        indentBlock(block.id, e.shiftKey ? -1 : 1);
+      }
+      return;
+    }
+
+    // Inline formatting shortcuts
+    if (meta && !e.altKey) {
+      if (!e.shiftKey && lowerKey === "b") {
+        e.preventDefault();
+        applyInlineFormat(block, "bold");
+        return;
+      }
+      if (!e.shiftKey && lowerKey === "i") {
+        e.preventDefault();
+        applyInlineFormat(block, "italic");
+        return;
+      }
+      if (!e.shiftKey && lowerKey === "e") {
+        e.preventDefault();
+        applyInlineFormat(block, "code");
+        return;
+      }
+      if (e.shiftKey && lowerKey === "s") {
+        e.preventDefault();
+        applyInlineFormat(block, "strike");
+        return;
+      }
+      if (!e.shiftKey && lowerKey === "k" && selStart !== selEnd) {
+        e.preventDefault();
+        applyInlineFormat(block, "link");
+        return;
+      }
+      if (e.key === "Enter" && block.type === "todo") {
+        e.preventDefault();
+        pendingSelectionRef.current = { blockId: block.id, start: selStart, end: selEnd };
+        updateBlockContentOrProps(block.id, { checked: !block.checked });
+        return;
+      }
+    }
+
+    if (e.key === "Escape") {
+      e.preventDefault();
+      setTextSelection(null);
+      el.blur();
+      return;
+    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+
+      // Enter-triggered block conversion (e.g. ```ts, ---, > [!note])
+      const enterShortcut = detectMarkdownShortcut(editableText, {
+        trigger: "enter",
+        currentType: block.type,
+      });
+      if (enterShortcut && !(enterShortcut.type === "divider" && refs.length > 0)) {
+        const cur = blocksRef.current;
+        if (enterShortcut.type === "divider") {
+          const nextPara: NotebookBlock = {
+            id: makeBlockId("blk"),
+            type: "paragraph",
+            content: "",
+          };
+          const next = [...cur];
+          next[blockIndex] = { id: block.id, type: "divider", content: "" };
+          next.splice(blockIndex + 1, 0, nextPara);
+          commitBlocks(normalizeBlockIndents(next));
+          focusBlockAt(nextPara.id, 0);
+          return;
+        }
+        const next = cur.map((b) => {
+          if (b.id !== block.id) return b;
+          const converted: NotebookBlock = {
+            ...b,
+            type: enterShortcut.type,
+            content: joinTextWithInlineRefs(enterShortcut.content, refs),
+            checked: enterShortcut.checked,
+            language: enterShortcut.language,
+          };
+          if (!isIndentableBlockType(enterShortcut.type)) {
+            delete converted.indent;
+          }
+          return converted;
+        });
+        commitBlocks(normalizeBlockIndents(next));
+        focusBlockAt(block.id, enterShortcut.content.length);
+        return;
+      }
+
       if (
-        (block.type === "bullet" || block.type === "numbered" || block.type === "todo") &&
+        (block.type === "bullet" ||
+          block.type === "numbered" ||
+          block.type === "todo" ||
+          block.type === "quote" ||
+          block.type === "callout") &&
         editableText.trim() === "" &&
         refs.length === 0
       ) {
+        if (clampBlockIndent(block.type, block.indent) > 0) {
+          indentBlock(block.id, -1);
+          return;
+        }
         updateBlockContentOrProps(block.id, { type: "paragraph", checked: undefined });
         focusBlockAt(block.id, 0);
         return;
@@ -783,10 +1366,13 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         block.type === "bullet" || block.type === "numbered" || block.type === "todo"
           ? block.type
           : "paragraph";
+      const curIndent = clampBlockIndent(block.type, block.indent);
+      const inheritIndent = isIndentableBlockType(continueType) ? curIndent : 0;
       const newBlk: NotebookBlock = {
         id: makeBlockId("blk"),
         type: continueType,
         content: after,
+        ...(inheritIndent > 0 ? { indent: inheritIndent } : {}),
         checked: continueType === "todo" ? false : undefined,
       };
       const next = [...blocksRef.current];
@@ -807,7 +1393,11 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
       refs.length > 0
     ) {
       e.preventDefault();
-      pendingCursorPosRef.current = { blockId: block.id, pos: editableText.length };
+      pendingSelectionRef.current = {
+        blockId: block.id,
+        start: editableText.length,
+        end: editableText.length,
+      };
       handleRemoveInlineRef(block.id, 0);
       return;
     }
@@ -815,8 +1405,13 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     if (e.key === "Backspace" && selStart === 0 && selEnd === 0) {
       if (editableText === "" && refs.length > 0) {
         e.preventDefault();
-        pendingCursorPosRef.current = { blockId: block.id, pos: 0 };
+        pendingSelectionRef.current = { blockId: block.id, start: 0, end: 0 };
         handleRemoveInlineRef(block.id, refs.length - 1);
+        return;
+      }
+      if (clampBlockIndent(block.type, block.indent) > 0) {
+        e.preventDefault();
+        indentBlock(block.id, -1);
         return;
       }
       if (block.type !== "paragraph") {
@@ -826,6 +1421,13 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         return;
       }
       const cur = blocksRef.current;
+      if (blockIndex > 0 && cur[blockIndex - 1]?.type === "divider") {
+        e.preventDefault();
+        const next = normalizeBlockIndents(cur.filter((_, i) => i !== blockIndex - 1));
+        commitBlocks(next);
+        focusBlockAt(block.id, 0);
+        return;
+      }
       if (editableText === "" && refs.length === 0 && cur.length > 1) {
         e.preventDefault();
         deleteBlock(block.id);
@@ -846,35 +1448,38 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
             ),
           };
           next.splice(blockIndex, 1);
-          commitBlocks(next);
+          commitBlocks(normalizeBlockIndents(next));
           focusBlockAt(prev.id, joinPos);
         }
       }
       return;
     }
 
-    if (e.key === "ArrowUp" && selStart === 0 && selEnd === 0) {
-      const cur = blocksRef.current;
-      for (let i = blockIndex - 1; i >= 0; i--) {
-        const candidate = cur[i];
-        if (candidate && !NON_TEXT_BLOCK_TYPES.has(candidate.type)) {
-          e.preventDefault();
-          focusBlockAt(candidate.id, getBlockEditableLength(candidate));
-          break;
-        }
+    if (
+      e.key === "ArrowUp" &&
+      !e.shiftKey &&
+      !e.altKey &&
+      !meta &&
+      selStart === selEnd &&
+      isTextareaOnVisualFirstLine(el, selStart)
+    ) {
+      if (focusAdjacentEditableBlock(-1, selStart)) {
+        e.preventDefault();
       }
       return;
     }
 
-    if (e.key === "ArrowDown" && selStart === editableText.length && selEnd === selStart) {
-      const cur = blocksRef.current;
-      for (let i = blockIndex + 1; i < cur.length; i++) {
-        const candidate = cur[i];
-        if (candidate && !NON_TEXT_BLOCK_TYPES.has(candidate.type)) {
-          e.preventDefault();
-          focusBlockAt(candidate.id, 0);
-          break;
-        }
+    if (
+      e.key === "ArrowDown" &&
+      !e.shiftKey &&
+      !e.altKey &&
+      !meta &&
+      selStart === selEnd &&
+      isTextareaOnVisualLastLine(el, selEnd)
+    ) {
+      const lineStart = el.value.lastIndexOf("\n", Math.max(0, selStart - 1)) + 1;
+      if (focusAdjacentEditableBlock(1, selStart - lineStart)) {
+        e.preventDefault();
       }
     }
   };
@@ -991,7 +1596,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
           ? "输入笔记，键入 / 插入 Markdown 块，或输入 @valet 发起新会话…"
           : "";
       return (
-        <span className="text-[var(--ink-subtle)] select-none">
+        <span data-placeholder-text="true" className="text-[var(--ink-subtle)] select-none">
           {placeholder || "\u00A0"}
         </span>
       );
@@ -1075,9 +1680,19 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
     const typoClass = getEditableTypographyClass(block.type, block.checked);
     const { editableText, refs } = splitInlineRefs(block.content);
 
+    const showFormatToolbar =
+      isFocused &&
+      textSelection?.blockId === block.id &&
+      textSelection.start !== textSelection.end;
+
     if (isFocused) {
       return (
-        <div className="w-full">
+        <div className="relative w-full">
+          {showFormatToolbar && (
+            <NotebookFormatToolbar
+              onFormat={(kind) => applyInlineFormat(block, kind)}
+            />
+          )}
           <textarea
             ref={(el) => {
               blockTextareaRefs.current[block.id] = el;
@@ -1091,6 +1706,24 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                 e.target.selectionStart ?? e.target.value.length
               )
             }
+            onPaste={(e) => handleBlockPaste(e, block, blockIndex)}
+            onSelect={(e) => {
+              const targetEl = e.currentTarget;
+              const start = targetEl.selectionStart ?? 0;
+              const end = targetEl.selectionEnd ?? 0;
+              setTextSelection((cur) => {
+                if (start === end) return cur?.blockId === block.id ? null : cur;
+                if (
+                  cur &&
+                  cur.blockId === block.id &&
+                  cur.start === start &&
+                  cur.end === end
+                ) {
+                  return cur;
+                }
+                return { blockId: block.id, start, end };
+              });
+            }}
             onCompositionEnd={() => {
               lastCompositionEndRef.current = performance.now();
             }}
@@ -1102,6 +1735,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                   if (cur !== block.id) return cur;
                   const activeEl = document.activeElement;
                   if (activeEl === blockTextareaRefs.current[block.id]) return cur;
+                  setTextSelection((sel) => (sel?.blockId === block.id ? null : sel));
                   return null;
                 });
               }, 120);
@@ -1142,7 +1776,16 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
           if ((e.target as HTMLElement).closest("[data-inline-interactive]")) {
             return;
           }
-          focusBlockAt(block.id, editableText.length);
+          const renderedOffset = getClickedRenderedOffset(
+            e.currentTarget,
+            e.clientX,
+            e.clientY
+          );
+          const targetOffset =
+            renderedOffset !== null
+              ? mapRenderedOffsetToRawOffset(editableText, renderedOffset)
+              : editableText.length;
+          focusBlockAt(block.id, targetOffset);
         }}
         onFocus={(e) => {
           if (e.target !== e.currentTarget) return;
@@ -1157,6 +1800,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
 
   return (
     <div
+      data-notebook-editor="true"
       className="mx-auto w-full max-w-[760px] px-10 pt-7 pb-28 lg:px-14"
       onClick={(e) => {
         if (e.target !== e.currentTarget) return;
@@ -1166,6 +1810,12 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
         }
       }}
     >
+      <datalist id="valet-code-languages">
+        {CODE_LANGUAGES.map((lang) => (
+          <option key={lang} value={lang} />
+        ))}
+      </datalist>
+
       {/* Utility Actions Strip */}
       <div className="mb-3 flex flex-wrap items-center gap-1.5 text-[11.5px] text-[var(--ink-muted)]">
         <button
@@ -1181,8 +1831,12 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
           type="button"
           onClick={() => {
             const md = blocksToMarkdown(project, projectThreads);
-            void navigator.clipboard.writeText(md);
-            pushToast("已复制 Notebook Markdown", "success");
+            void copyTextToClipboard(md).then((ok) => {
+              pushToast(
+                ok ? "已复制 Notebook Markdown" : "复制失败，请检查剪贴板权限",
+                ok ? "success" : "warning"
+              );
+            });
           }}
           className="inline-flex cursor-pointer items-center gap-1.5 rounded-[6px] px-2 py-1 transition-colors hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
         >
@@ -1352,11 +2006,20 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
           const isSlashOpen = slashState?.blockId === block.id;
           const isHighlighted = highlightedBlockId === block.id;
           const isDragTarget = dragOverBlockId === block.id;
+          const indent = clampBlockIndent(block.type, block.indent);
+          const indentable = isIndentableBlockType(block.type);
+          const prevBlock = idx > 0 ? blocks[idx - 1] : undefined;
+          const maxAllowedIndent =
+            indentable && prevBlock && isIndentableBlockType(prevBlock.type)
+              ? Math.min(6, clampBlockIndent(prevBlock.type, prevBlock.indent) + 1)
+              : 0;
+          const bulletMod = indent % 3;
 
           return (
             <div
               key={block.id}
               data-block-id={block.id}
+              style={indent > 0 ? { marginLeft: indent * 24 } : undefined}
               onDragOver={(e) => {
                 if (!draggedBlockId || draggedBlockId === block.id) return;
                 e.preventDefault();
@@ -1379,6 +2042,17 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                   : ""
               } ${isDragTarget ? "border-t-2 border-[var(--ink-primary)]" : ""}`}
             >
+              {/* Subtle vertical indentation guides for nested blocks */}
+              {indent > 0 &&
+                Array.from({ length: indent }, (_, lvl) => (
+                  <span
+                    key={lvl}
+                    aria-hidden="true"
+                    style={{ left: -((indent - lvl) * 24 - 10) }}
+                    className="pointer-events-none absolute top-0 bottom-0 w-px bg-[var(--border-light)]/80"
+                  />
+                ))}
+
               {/* Left Block Gutter (+ insert / ⋮⋮ block menu & drag) */}
               <div className="absolute top-[5px] -left-11 flex w-10 items-center justify-end gap-0.5 opacity-0 transition-opacity group-hover/block:opacity-100 focus-within:opacity-100">
                 <button
@@ -1418,7 +2092,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
               {blockMenuId === block.id && (
                 <div
                   onMouseDown={(e) => e.stopPropagation()}
-                  className="animate-valet-modal-in absolute top-7 -left-10 z-50 w-52 overflow-hidden rounded-[10px] border border-[var(--border-control)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-popover)]"
+                  className="animate-valet-modal-in absolute top-7 -left-10 z-50 w-56 overflow-hidden rounded-[10px] border border-[var(--border-control)] bg-[var(--bg-elevated)] p-1 shadow-[var(--shadow-popover)]"
                 >
                   {!NON_TEXT_BLOCK_TYPES.has(block.type) && (
                     <>
@@ -1434,12 +2108,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                               type="button"
                               onClick={() => {
                                 setBlockMenuId(null);
-                                updateBlockContentOrProps(block.id, {
-                                  type: opt.type,
-                                  language:
-                                    opt.type === "code" ? block.language || "bash" : undefined,
-                                  checked: opt.type === "todo" ? Boolean(block.checked) : undefined,
-                                });
+                                convertBlockType(block.id, opt.type);
                                 focusBlockAt(block.id, getBlockEditableLength(block));
                               }}
                               className={`flex w-full cursor-pointer items-center justify-between rounded-[6px] px-2.5 py-1.5 text-left text-[12px] ${
@@ -1454,6 +2123,37 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                           );
                         })}
                       </div>
+                      <div className="my-1 border-t border-[var(--border-light)]" />
+                    </>
+                  )}
+                  {indentable && (indent < maxAllowedIndent || indent > 0) && (
+                    <>
+                      {indent < maxAllowedIndent && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setBlockMenuId(null);
+                            indentBlock(block.id, 1);
+                          }}
+                          className="flex w-full cursor-pointer items-center justify-between rounded-[6px] px-2.5 py-1.5 text-left text-[12px] text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                        >
+                          <span>增加缩进</span>
+                          <span className="font-mono text-[10px] text-[var(--ink-subtle)]">Tab</span>
+                        </button>
+                      )}
+                      {indent > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setBlockMenuId(null);
+                            indentBlock(block.id, -1);
+                          }}
+                          className="flex w-full cursor-pointer items-center justify-between rounded-[6px] px-2.5 py-1.5 text-left text-[12px] text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                        >
+                          <span>减少缩进</span>
+                          <span className="font-mono text-[10px] text-[var(--ink-subtle)]">⇧Tab</span>
+                        </button>
+                      )}
                       <div className="my-1 border-t border-[var(--border-light)]" />
                     </>
                   )}
@@ -1483,9 +2183,10 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                         setBlockMenuId(null);
                         moveBlock(block.id, -1);
                       }}
-                      className="flex w-full cursor-pointer rounded-[6px] px-2.5 py-1.5 text-left text-[12px] text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                      className="flex w-full cursor-pointer items-center justify-between rounded-[6px] px-2.5 py-1.5 text-left text-[12px] text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
                     >
-                      上移一块
+                      <span>上移一块</span>
+                      <span className="font-mono text-[10px] text-[var(--ink-subtle)]">⌘⇧↑</span>
                     </button>
                   )}
                   {idx < blocks.length - 1 && (
@@ -1495,9 +2196,10 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                         setBlockMenuId(null);
                         moveBlock(block.id, 1);
                       }}
-                      className="flex w-full cursor-pointer rounded-[6px] px-2.5 py-1.5 text-left text-[12px] text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                      className="flex w-full cursor-pointer items-center justify-between rounded-[6px] px-2.5 py-1.5 text-left text-[12px] text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
                     >
-                      下移一块
+                      <span>下移一块</span>
+                      <span className="font-mono text-[10px] text-[var(--ink-subtle)]">⌘⇧↓</span>
                     </button>
                   )}
                   <button
@@ -1506,9 +2208,10 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                       setBlockMenuId(null);
                       duplicateBlock(block.id);
                     }}
-                    className="flex w-full cursor-pointer rounded-[6px] px-2.5 py-1.5 text-left text-[12px] text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
+                    className="flex w-full cursor-pointer items-center justify-between rounded-[6px] px-2.5 py-1.5 text-left text-[12px] text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
                   >
-                    复制块
+                    <span>复制块</span>
+                    <span className="font-mono text-[10px] text-[var(--ink-subtle)]">⌘D</span>
                   </button>
                   <button
                     type="button"
@@ -1627,18 +2330,28 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                   <div className="flex items-center justify-between border-b border-[var(--border-light)] px-3 py-1.5">
                     <input
                       type="text"
+                      list="valet-code-languages"
+                      data-block-lang-input={block.id}
                       value={block.language ?? "bash"}
                       onChange={(e) =>
-                        updateBlockContentOrProps(block.id, { language: e.target.value })
+                        updateBlockContentOrProps(
+                          block.id,
+                          { language: e.target.value },
+                          { coalesceKey: `lang-${block.id}` }
+                        )
                       }
                       aria-label="代码块语言"
-                      className="w-24 bg-transparent font-mono text-[11px] text-[var(--ink-muted)] outline-none focus:text-[var(--ink-strong)]"
+                      className="w-28 bg-transparent font-mono text-[11px] text-[var(--ink-muted)] outline-none focus:text-[var(--ink-strong)]"
                     />
                     <button
                       type="button"
                       onClick={() => {
-                        void navigator.clipboard.writeText(block.content);
-                        pushToast("已复制代码片段", "success");
+                        void copyTextToClipboard(block.content).then((ok) => {
+                          pushToast(
+                            ok ? "已复制代码片段" : "复制失败，请手动选中复制",
+                            ok ? "success" : "warning"
+                          );
+                        });
                       }}
                       className="inline-flex cursor-pointer items-center gap-1 rounded-[5px] px-1.5 py-0.5 font-mono text-[10.5px] text-[var(--ink-muted)] hover:bg-[var(--bg-subtle)] hover:text-[var(--ink-strong)]"
                     >
@@ -1650,9 +2363,19 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                     ref={(el) => {
                       blockTextareaRefs.current[block.id] = el;
                     }}
-                    rows={2}
+                    rows={Math.max(2, block.content.split("\n").length)}
                     value={block.content}
                     onFocus={() => setFocusedBlockId(block.id)}
+                    onBlur={() => {
+                      window.setTimeout(() => {
+                        setFocusedBlockId((cur) => {
+                          if (cur !== block.id) return cur;
+                          const activeEl = document.activeElement;
+                          if (activeEl === blockTextareaRefs.current[block.id]) return cur;
+                          return null;
+                        });
+                      }, 120);
+                    }}
                     onChange={(e) =>
                       handleBlockChange(
                         block,
@@ -1661,7 +2384,7 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                       )
                     }
                     onKeyDown={(e) => handleTextareaKeyDown(e, block, idx)}
-                    placeholder="输入命令或代码… (Shift+Enter 跳至下一块)"
+                    placeholder="输入命令或代码… (Tab 缩进，⌘Enter / Shift+Enter 跳至下一块)"
                     spellCheck={false}
                     className="w-full resize-none bg-transparent px-3.5 py-2.5 font-mono text-[12.5px] leading-[20px] text-[var(--ink-strong)] outline-none placeholder:text-[var(--ink-subtle)]"
                   />
@@ -1697,13 +2420,19 @@ export const ProjectNotebookView: React.FC<{ project: Project }> = ({ project })
                 </div>
               ) : block.type === "bullet" ? (
                 <div className="flex items-start gap-2.5 pl-1">
-                  <span className="mt-[9px] h-[5px] w-[5px] shrink-0 rounded-full bg-[var(--ink-muted)]" />
+                  {bulletMod === 0 ? (
+                    <span className="mt-[9px] h-[5px] w-[5px] shrink-0 rounded-full bg-[var(--ink-secondary)]" />
+                  ) : bulletMod === 1 ? (
+                    <span className="mt-[9px] h-[5.5px] w-[5.5px] shrink-0 rounded-full border-[1.35px] border-[var(--ink-muted)]" />
+                  ) : (
+                    <span className="mt-[9.5px] h-[4.5px] w-[4.5px] shrink-0 rounded-[1px] bg-[var(--ink-muted)]" />
+                  )}
                   <div className="min-w-0 flex-1">{renderEditableTextOrDisplay(block, idx)}</div>
                 </div>
               ) : block.type === "numbered" ? (
                 <div className="flex items-start gap-2 pl-0.5">
-                  <span className="mt-[2px] min-w-[18px] shrink-0 font-mono text-[12.5px] text-[var(--ink-muted)]">
-                    {numberedIndices[block.id] ?? 1}.
+                  <span className="mt-[2px] min-w-[20px] shrink-0 font-mono text-[12.5px] text-[var(--ink-muted)]">
+                    {numberedMarkers[block.id]?.label ?? "1."}
                   </span>
                   <div className="min-w-0 flex-1">{renderEditableTextOrDisplay(block, idx)}</div>
                 </div>

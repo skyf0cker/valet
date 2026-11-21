@@ -346,6 +346,13 @@ export const MoonIcon: React.FC<IconProps> = ({ size = 14, className = "" }) => 
   </svg>
 );
 
+export const ContrastIcon: React.FC<IconProps> = ({ size = 14, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
+    <circle cx="12" cy="12" r="8" stroke="currentColor" strokeWidth="1.8" />
+    <path d="M12 4a8 8 0 010 16V4z" fill="currentColor" />
+  </svg>
+);
+
 export const PermissionGlyph: React.FC<{ id: PermissionId; size?: number; className?: string }> = ({
   id,
   size = 18,

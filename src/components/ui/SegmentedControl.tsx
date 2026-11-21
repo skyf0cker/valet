@@ -3,6 +3,7 @@ import React from "react";
 export interface SegmentOption<T extends string> {
   value: T;
   label: string;
+  icon?: React.ReactNode;
   widthClass?: string;
 }
 
@@ -48,11 +49,12 @@ export function SegmentedControl<T extends string>({
             role="tab"
             aria-selected={active}
             onClick={() => onChange(opt.value)}
-            className={`flex h-full cursor-pointer items-center justify-center transition-all duration-150 ${radiusClass} ${
+            className={`flex h-full cursor-pointer items-center justify-center gap-1.5 transition-all duration-150 ${radiusClass} ${
               fullWidth ? "flex-1" : opt.widthClass ?? "px-2.5"
             } ${size === "md" ? "text-[13px]" : "text-[12px]"} ${active ? activeStyle : idleStyle}`}
           >
-            {opt.label}
+            {opt.icon}
+            <span>{opt.label}</span>
           </button>
         );
       })}

@@ -28,7 +28,7 @@ import {
   createInitialSnapshot,
 } from "../services/mockData";
 import { valetService } from "../services/valetService";
-import { normalizeDarkTheme } from "../constants/themes";
+import { normalizeDarkTheme, normalizeLightTheme } from "../constants/themes";
 import {
   buildInboxQuoteAttachment,
   buildTimelineQuoteAttachment,
@@ -218,6 +218,7 @@ function loadInitialState(): ValetSnapshot {
       preferences: {
         ...base.preferences,
         ...(parsed.preferences ?? {}),
+        lightTheme: normalizeLightTheme(parsed.preferences?.lightTheme),
         darkTheme: normalizeDarkTheme(parsed.preferences?.darkTheme),
         autonomyLevel: normalizeClientAutonomy(parsed.preferences?.autonomyLevel),
         confirmChecklist: {
@@ -673,13 +674,16 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   }, [state]);
 
-  // Apply light/dark/auto theme and dark palette to document root
+  // Apply light/dark/auto theme and light/dark palettes to document root
   useEffect(() => {
     const applyTheme = () => {
       const mode = state.preferences.appearance;
       const isSystemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
       const resolved = mode === "auto" ? (isSystemDark ? "dark" : "light") : mode;
       document.documentElement.dataset.theme = resolved;
+      document.documentElement.dataset.lightPalette = normalizeLightTheme(
+        state.preferences.lightTheme
+      );
       document.documentElement.dataset.darkPalette = normalizeDarkTheme(
         state.preferences.darkTheme
       );
@@ -688,7 +692,11 @@ export const ValetProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
     mq.addEventListener("change", applyTheme);
     return () => mq.removeEventListener("change", applyTheme);
-  }, [state.preferences.appearance, state.preferences.darkTheme]);
+  }, [
+    state.preferences.appearance,
+    state.preferences.lightTheme,
+    state.preferences.darkTheme,
+  ]);
 
   // Hydrate canonical state and subscribe to MyGo push events when hosted in MyGo
   useEffect(() => {

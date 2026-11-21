@@ -24,6 +24,7 @@ export interface NotebookBlock {
   id: string;
   type: NotebookBlockType;
   content: string;
+  indent?: number;
   checked?: boolean;
   language?: string;
   sessionId?: string;
@@ -520,13 +521,20 @@ export interface HeartbeatRunLog {
 }
 
 export type AppearanceMode = "light" | "dark" | "auto";
+export type LightThemeId =
+  | "cursor-light"
+  | "vercel-light"
+  | "one-light"
+  | "tokyo-day"
+  | "catppuccin-latte"
+  | "solarized-light";
 export type DarkThemeId =
   | "cursor"
   | "vercel"
-  | "vesper"
   | "onedark"
   | "tokyo-night"
-  | "catppuccin";
+  | "catppuccin"
+  | "vesper";
 export type ToneStyle = "formal" | "concise" | "friendly";
 
 export interface SafetyConfirmationChecklist {
@@ -542,6 +550,7 @@ export interface ValetPreferences {
   launchAtLogin: boolean;
   showMenuBarIcon: boolean;
   appearance: AppearanceMode;
+  lightTheme?: LightThemeId;
   darkTheme?: DarkThemeId;
   language: string;
   globalHotkey: string[];

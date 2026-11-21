@@ -47,6 +47,13 @@ func TestSchemaAndGet(t *testing.T) {
 	if scalar != snap.Preferences.Appearance {
 		t.Fatalf("expected %q, got %#v", snap.Preferences.Appearance, scalar)
 	}
+	lightThemeVal, err := configctl.Get(snap.Preferences, "lightTheme")
+	if err != nil {
+		t.Fatalf("Get lightTheme failed: %v", err)
+	}
+	if lightThemeVal != "cursor-light" {
+		t.Fatalf("expected lightTheme=\"cursor-light\", got %#v", lightThemeVal)
+	}
 	darkThemeVal, err := configctl.Get(snap.Preferences, "darkTheme")
 	if err != nil {
 		t.Fatalf("Get darkTheme failed: %v", err)
@@ -66,6 +73,7 @@ func TestApplyUpdatesAndValidation(t *testing.T) {
 	// 1. Scalar, enum, int range, float & heartbeat initialization
 	changes, err := configctl.ApplyUpdates(&snap, map[string]string{
 		"appearance":            "dark",
+		"lightTheme":            "vercel-light",
 		"darkTheme":             "vesper",
 		"dailySpendLimit":       "45.5",
 		"maxStepsPerTask":       "40",
@@ -74,10 +82,10 @@ func TestApplyUpdatesAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyUpdates failed: %v", err)
 	}
-	if len(changes) != 5 {
-		t.Fatalf("expected 5 ChangeRecords, got %d", len(changes))
+	if len(changes) != 6 {
+		t.Fatalf("expected 6 ChangeRecords, got %d", len(changes))
 	}
-	if snap.Preferences.Appearance != "dark" || snap.Preferences.DarkTheme != "vesper" ||
+	if snap.Preferences.Appearance != "dark" || snap.Preferences.LightTheme != "vercel-light" || snap.Preferences.DarkTheme != "vesper" ||
 		snap.Preferences.DailySpendLimit != 45.5 ||
 		snap.Preferences.MaxStepsPerTask != 40 || snap.Preferences.Heartbeat.IntervalMin != 15 {
 		t.Fatalf("preferences not updated as expected: %+v", snap.Preferences)
@@ -191,6 +199,11 @@ func TestApplyUpdatesAndValidation(t *testing.T) {
 	}
 	if snap.Preferences.Appearance != beforeAppearance {
 		t.Fatal("expected failed ApplyUpdates batch with unknown key not to mutate Appearance")
+	}
+	if _, err := configctl.ApplyUpdates(&snap, map[string]string{
+		"lightTheme": "unknown-light",
+	}); err == nil {
+		t.Fatal("expected validation error for unsupported lightTheme")
 	}
 	if _, err := configctl.ApplyUpdates(&snap, map[string]string{
 		"darkTheme": "neon",

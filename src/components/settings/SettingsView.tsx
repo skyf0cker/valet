@@ -1,18 +1,34 @@
 import React, { useMemo, useRef, useState } from "react";
-import { DARK_THEME_OPTIONS, getDarkThemeMeta, normalizeDarkTheme } from "../../constants/themes";
+import {
+  DARK_THEME_OPTIONS,
+  LIGHT_THEME_OPTIONS,
+  getDarkThemeMeta,
+  getLightThemeMeta,
+  normalizeDarkTheme,
+  normalizeLightTheme,
+} from "../../constants/themes";
 import { valetService } from "../../services/valetService";
 import { useValet } from "../../store/ValetContext";
 import type {
   AppearanceMode,
   AutoReviewConfig,
   AutonomyLevel,
+  DarkThemeId,
+  LightThemeId,
   SettingsSectionId,
   ToneStyle,
 } from "../../types/valet";
 import { SidebarToggleButton } from "../Sidebar";
 import { Kbd } from "../ui/Badge";
 import { Checkbox } from "../ui/Checkbox";
-import { BowtieSvg, CheckIcon, SearchIcon } from "../ui/Icons";
+import {
+  BowtieSvg,
+  CheckIcon,
+  ContrastIcon,
+  MoonIcon,
+  SearchIcon,
+  SunIcon,
+} from "../ui/Icons";
 import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { Modal } from "../ui/Modal";
 import { SegmentedControl } from "../ui/SegmentedControl";
@@ -25,6 +41,7 @@ import {
   SettingRow,
   SettingsSectionCard,
 } from "./SettingsSectionCard";
+import { ThemePickerDropdown } from "./ThemePickerDropdown";
 
 interface SectionMeta {
   id: SettingsSectionId;
@@ -72,7 +89,7 @@ const SECTIONS: SectionMeta[] = [
     title: "通用",
     group: "Agent",
     subtitle: "启动、菜单栏驻留、浅色/深色多主题配色与运行中消息发送策略",
-    keywords: "通用 启动 外观 深色 浅色 自动 语言 消息 引导 排队 主题 配色 cursor vercel vesper onedark tokyo-night catppuccin ide theme",
+    keywords: "通用 启动 外观 深色 浅色 自动 语言 消息 引导 排队 主题 配色 cursor vercel one-light onedark tokyo-day tokyo-night catppuccin latte mocha solarized vesper 浅色主题 深色主题 theme",
   },
   {
     id: "models",
@@ -952,8 +969,8 @@ export const SettingsView: React.FC = () => {
         );
 
       case "general": {
+        const activeLightTheme = normalizeLightTheme(preferences.lightTheme);
         const activeDarkTheme = normalizeDarkTheme(preferences.darkTheme);
-        const activeDarkMeta = getDarkThemeMeta(activeDarkTheme);
         return (
           <div className="flex flex-col gap-5">
             <div className="flex flex-col gap-2">
@@ -968,166 +985,68 @@ export const SettingsView: React.FC = () => {
                     value={preferences.appearance}
                     onChange={(v) => updatePreferences({ appearance: v })}
                     options={[
-                      { value: "light", label: "浅色" },
-                      { value: "dark", label: "深色" },
-                      { value: "auto", label: "自动" },
+                      { value: "light", label: "浅色", icon: <SunIcon size={12.5} /> },
+                      { value: "dark", label: "深色", icon: <MoonIcon size={12.5} /> },
+                      { value: "auto", label: "自动", icon: <ContrastIcon size={12.5} /> },
                     ]}
                   />
                 </SettingRow>
 
-                <div className="border-t border-[var(--border-light)] px-4 py-3.5">
-                  <div className="flex flex-wrap items-baseline justify-between gap-2">
-                    <div className="flex flex-col gap-0.5">
-                      <span className="text-[13px] font-medium leading-[16px] text-[var(--ink-strong)]">
-                        深色主题风格
-                      </span>
-                      <span className="text-[11px] leading-[14px] text-[var(--ink-subtle)]">
-                        深色与自动夜间模式下生效，点击卡片可立即切换预览
-                      </span>
-                    </div>
-                    <span className="font-mono text-[10.5px] text-[var(--ink-muted)]">
-                      {activeDarkMeta.name}
-                    </span>
-                  </div>
+                <SettingRow
+                  label="浅色主题"
+                  description="在浅色与「自动 · 日间」状态下生效"
+                >
+                  <ThemePickerDropdown
+                    polarity="light"
+                    value={activeLightTheme}
+                    options={LIGHT_THEME_OPTIONS}
+                    appearance={preferences.appearance}
+                    activeLightTheme={activeLightTheme}
+                    activeDarkTheme={activeDarkTheme}
+                    onSelect={(rawId) => {
+                      const nextId = rawId as LightThemeId;
+                      const meta = getLightThemeMeta(nextId);
+                      if (preferences.appearance === "auto") {
+                        updatePreferences({ lightTheme: nextId });
+                        pushToast(`已设为日间浅色主题 · ${meta.name}`);
+                      } else if (preferences.appearance !== "light") {
+                        updatePreferences({ lightTheme: nextId, appearance: "light" });
+                        pushToast(`已切换浅色主题 · ${meta.name}`);
+                      } else {
+                        updatePreferences({ lightTheme: nextId });
+                        pushToast(`已切换浅色主题 · ${meta.name}`);
+                      }
+                    }}
+                  />
+                </SettingRow>
 
-                  <div className="mt-3 grid grid-cols-1 gap-2.5 sm:grid-cols-3">
-                    {DARK_THEME_OPTIONS.map((opt) => {
-                      const selected = activeDarkTheme === opt.id;
-                      const p = opt.preview;
-                      return (
-                        <button
-                          key={opt.id}
-                          type="button"
-                          onClick={() => {
-                            const isCurrentlyDark =
-                              document.documentElement.dataset.theme === "dark";
-                            if (!isCurrentlyDark) {
-                              updatePreferences({ darkTheme: opt.id, appearance: "dark" });
-                              pushToast(`已切换至深色 · ${opt.name}`);
-                            } else {
-                              updatePreferences({ darkTheme: opt.id });
-                              pushToast(`已切换深色主题 · ${opt.name}`);
-                            }
-                          }}
-                          className={`group flex cursor-pointer flex-col overflow-hidden rounded-[10px] p-2.5 text-left transition-all ${
-                            selected
-                              ? "border-[1.5px] border-[var(--ink-primary)] bg-[var(--bg-subtle)]/60"
-                              : "border border-[var(--border-control)] bg-[var(--bg-canvas)] hover:border-[var(--border-strong)]"
-                          }`}
-                        >
-                          {/* Miniature Valet UI swatch preview */}
-                          <div
-                            className="flex h-[62px] w-full overflow-hidden rounded-[7px] border"
-                            style={{
-                              backgroundColor: p.canvas,
-                              borderColor: p.border,
-                            }}
-                          >
-                            {/* Mini recessed sidebar */}
-                            <div
-                              className="flex w-[30%] shrink-0 flex-col gap-1 border-r p-1.5"
-                              style={{
-                                backgroundColor: p.sidebar,
-                                borderRightColor: p.border,
-                              }}
-                            >
-                              <div className="flex items-center gap-1 px-0.5">
-                                <span
-                                  className="h-1.5 w-1.5 rounded-full"
-                                  style={{ backgroundColor: p.accent }}
-                                />
-                                <span
-                                  className="h-1 w-5 rounded-full opacity-55"
-                                  style={{ backgroundColor: p.muted }}
-                                />
-                              </div>
-                              <div
-                                className="mt-0.5 h-2.5 w-full rounded-[3px] border"
-                                style={{
-                                  backgroundColor: p.navPill,
-                                  borderColor: p.border,
-                                }}
-                              />
-                              <div
-                                className="mx-0.5 h-1.5 w-3/4 rounded-full opacity-35"
-                                style={{ backgroundColor: p.muted }}
-                              />
-                              <div
-                                className="mx-0.5 h-1.5 w-2/3 rounded-full opacity-25"
-                                style={{ backgroundColor: p.muted }}
-                              />
-                            </div>
-
-                            {/* Mini lifted canvas */}
-                            <div className="flex min-w-0 flex-1 flex-col justify-between p-1.5">
-                              <div className="flex items-center justify-between gap-1.5 px-0.5">
-                                <div
-                                  className="h-2 w-10 rounded-full opacity-90"
-                                  style={{ backgroundColor: p.ink }}
-                                />
-                                <div
-                                  className="h-2.5 w-5 rounded-[3px]"
-                                  style={{ backgroundColor: p.ctaBg }}
-                                />
-                              </div>
-                              <div
-                                className="flex items-center justify-between rounded-[4px] border px-1.5 py-1"
-                                style={{
-                                  backgroundColor: p.surface,
-                                  borderColor: p.border,
-                                }}
-                              >
-                                <div className="flex flex-col gap-0.5">
-                                  <div
-                                    className="h-1 w-8 rounded-full opacity-80"
-                                    style={{ backgroundColor: p.ink }}
-                                  />
-                                  <div
-                                    className="h-1 w-5 rounded-full opacity-45"
-                                    style={{ backgroundColor: p.muted }}
-                                  />
-                                </div>
-                                <div
-                                  className="flex h-2.5 w-4 items-center justify-end rounded-full p-[1.5px]"
-                                  style={{ backgroundColor: p.switchTrack }}
-                                >
-                                  <span
-                                    className="h-[7px] w-[7px] rounded-full"
-                                    style={{ backgroundColor: p.ctaBg }}
-                                  />
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-
-                          {/* Label & check indicator */}
-                          <div className="mt-2.5 flex items-start justify-between gap-2 px-0.5">
-                            <div className="min-w-0 flex-1">
-                              <div className="truncate text-[12.5px] font-semibold leading-[16px] text-[var(--ink-strong)]">
-                                {opt.name}
-                              </div>
-                              <div className="mt-0.5 truncate font-mono text-[10px] leading-[13px] text-[var(--ink-subtle)]">
-                                {opt.enName}
-                              </div>
-                              <div className="mt-0.5 truncate text-[11px] leading-[14px] text-[var(--ink-muted)]">
-                                {opt.tagline}
-                              </div>
-                            </div>
-                            <span
-                              className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors ${
-                                selected
-                                  ? "border-[var(--ink-primary)] bg-[var(--ink-primary)] text-[var(--ink-on-primary)]"
-                                  : "border-[var(--border-control)] bg-transparent text-transparent"
-                              }`}
-                            >
-                              <CheckIcon size={9} strokeWidth={3.2} />
-                            </span>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
+                <SettingRow
+                  label="深色主题"
+                  description="在深色与「自动 · 夜间」状态下生效"
+                >
+                  <ThemePickerDropdown
+                    polarity="dark"
+                    value={activeDarkTheme}
+                    options={DARK_THEME_OPTIONS}
+                    appearance={preferences.appearance}
+                    activeLightTheme={activeLightTheme}
+                    activeDarkTheme={activeDarkTheme}
+                    onSelect={(rawId) => {
+                      const nextId = rawId as DarkThemeId;
+                      const meta = getDarkThemeMeta(nextId);
+                      if (preferences.appearance === "auto") {
+                        updatePreferences({ darkTheme: nextId });
+                        pushToast(`已设为夜间深色主题 · ${meta.name}`);
+                      } else if (preferences.appearance !== "dark") {
+                        updatePreferences({ darkTheme: nextId, appearance: "dark" });
+                        pushToast(`已切换深色主题 · ${meta.name}`);
+                      } else {
+                        updatePreferences({ darkTheme: nextId });
+                        pushToast(`已切换深色主题 · ${meta.name}`);
+                      }
+                    }}
+                  />
+                </SettingRow>
               </SettingsSectionCard>
             </div>
 

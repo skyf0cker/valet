@@ -109,8 +109,9 @@ func TestStorePersistsProjectsAndNotebookBlocks(t *testing.T) {
 			Tags:        []string{"磁盘", "自动化"},
 			WorkingDir:  "~/Projects/valet",
 			Blocks: []types.NotebookBlock{
-				{ID: "b1", Type: "h1", Content: "目标清单"},
-				{ID: "b2", Type: "todo", Content: "清理多余镜像", Checked: true},
+				{ID: "b1", Type: "h1", Content: "目标清单", Indent: 2},
+				{ID: "b2", Type: "todo", Content: "清理多余镜像", Checked: true, Indent: 1},
+				{ID: "b2b", Type: "bullet", Content: "深层嵌套列表", Indent: 99},
 				{ID: "b3", Type: "session_ref", SessionID: "chat-default", Content: "扫描结果"},
 			},
 			UpdatedAt: "刚刚",
@@ -130,7 +131,13 @@ func TestStorePersistsProjectsAndNotebookBlocks(t *testing.T) {
 	if custom.ID != "proj-custom-1" || custom.WorkingDir != "~/Projects/valet" || len(custom.Tags) != 2 {
 		t.Fatalf("unexpected custom project round-trip: %+v", custom)
 	}
-	if len(custom.Blocks) != 3 || custom.Blocks[1].Type != "todo" || !custom.Blocks[1].Checked || custom.Blocks[2].SessionID != "chat-default" {
+	if len(custom.Blocks) != 4 ||
+		custom.Blocks[0].Indent != 0 ||
+		custom.Blocks[1].Type != "todo" ||
+		!custom.Blocks[1].Checked ||
+		custom.Blocks[1].Indent != 1 ||
+		custom.Blocks[2].Indent != MaxNotebookBlockIndent ||
+		custom.Blocks[3].SessionID != "chat-default" {
 		t.Fatalf("unexpected persisted Notebook blocks: %+v", custom.Blocks)
 	}
 }

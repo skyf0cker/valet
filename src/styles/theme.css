@@ -9,49 +9,50 @@
   --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
+/* Default Light: Cursor Light (Anysphere Light) */
 :root {
   color-scheme: light;
 
   /* Surfaces */
-  --bg-canvas: #FFFFFF;
-  --bg-sidebar: #F6F6F6;
-  --bg-sub-sidebar: #FFFFFF;
+  --bg-canvas: #FCFCFC;
+  --bg-sidebar: #F3F3F3;
+  --bg-sub-sidebar: #F8F8F8;
   --bg-surface: #FFFFFF;
-  --bg-subtle: #F4F4F4;
-  --bg-muted: #F2F2F2;
-  --bg-hover: #EAEAEA;
-  --bg-card-hover: #F7F7F7;
+  --bg-subtle: #F2F2F2;
+  --bg-muted: #EBEBEB;
+  --bg-hover: #E5E5E5;
+  --bg-card-hover: #F5F5F5;
   --bg-elevated: #FFFFFF;
   --bg-segment-active: #FFFFFF;
-  --bg-code: #F6F6F6;
-  --bg-track: #EDEDED;
+  --bg-code: #F3F3F3;
+  --bg-track: #E6E6E6;
 
   /* Brand & Plugin Icon Badges */
-  --brand-icon-bg: #0A0A0A;
+  --brand-icon-bg: #141414;
   --brand-icon-border: transparent;
   --brand-icon-fg: #FFFFFF;
 
   /* Ink */
-  --ink-primary: #0A0A0A;
-  --ink-strong: #000000;
-  --ink-body: #1A1A1A;
-  --ink-secondary: #3A3A3A;
-  --ink-nav: #0E1512;
-  --ink-muted: #6B6B6B;
-  --ink-subtle: #8A8A8A;
-  --ink-faint: #9A9A9A;
+  --ink-primary: #141414;
+  --ink-strong: #0F0F0F;
+  --ink-body: #242424;
+  --ink-secondary: #484848;
+  --ink-nav: #141414;
+  --ink-muted: #707070;
+  --ink-subtle: #8C8C8C;
+  --ink-faint: #A3A3A3;
   --ink-on-primary: #FFFFFF;
-  --ink-on-primary-muted: rgba(255, 255, 255, 0.6);
+  --ink-on-primary-muted: rgba(255, 255, 255, 0.65);
 
   /* Borders */
-  --border-faint: #F4F4F4;
-  --border-subtle: #F2F2F2;
-  --border-light: #EFEFEF;
-  --border-base: #EAEAEA;
-  --border-card: #EBEBEB;
-  --border-control: #E2E2E2;
-  --border-strong: #D6D6D6;
-  --border-dash: #CFCFCF;
+  --border-faint: #F2F2F2;
+  --border-subtle: #EDEDED;
+  --border-light: #EAEAEA;
+  --border-base: #E5E5E5;
+  --border-card: #E6E6E6;
+  --border-control: #DFDFDF;
+  --border-strong: #CCCCCC;
+  --border-dash: #C7C7C7;
 
   /* Status accents */
   --amber-text: #9A5F0A;
@@ -67,42 +68,42 @@
   --danger-border: #FECACA;
 
   /* Switch & bar tokens */
-  --switch-on-bg: #0A0A0A;
-  --switch-off-bg: #DADADA;
+  --switch-on-bg: #2A8F7D;
+  --switch-off-bg: #D6D6D6;
   --switch-thumb-on: #FFFFFF;
   --switch-thumb-off: #FFFFFF;
-  --spark-bar-peak: #0A0A0A;
-  --spark-bar-muted: #CFCFCF;
-  --spark-bar-active: #6B6B6B;
+  --spark-bar-peak: #2A8F7D;
+  --spark-bar-muted: #D4D4D4;
+  --spark-bar-active: #687370;
 
   /* Navigation, Avatar, Duty, Badge & Repair semantic tokens */
-  --nav-active-bg: #0A0A0A;
+  --nav-active-bg: #141414;
   --nav-active-border: transparent;
   --nav-active-fg: #FFFFFF;
   --nav-active-badge-bg: rgba(255, 255, 255, 0.16);
   --nav-active-amber-bg: rgba(255, 255, 255, 0.16);
   --nav-active-amber-border: transparent;
   --nav-active-amber-fg: #FFFFFF;
-  --avatar-bg: #0A0A0A;
+  --avatar-bg: #141414;
   --avatar-border: transparent;
   --avatar-fg: #FFFFFF;
-  --duty-dot: #0A0A0A;
-  --duty-halo: rgba(10, 10, 10, 0.10);
-  --duty-ring: rgba(10, 10, 10, 0.40);
-  --core-badge-bg: #0A0A0A;
+  --duty-dot: #2A8F7D;
+  --duty-halo: rgba(42, 143, 125, 0.14);
+  --duty-ring: rgba(42, 143, 125, 0.42);
+  --core-badge-bg: #141414;
   --core-badge-border: transparent;
   --core-badge-fg: #FFFFFF;
   --repair-btn-bg: #FFFFFF;
-  --repair-btn-border: #0A0A0A;
-  --repair-btn-fg: #000000;
+  --repair-btn-border: #141414;
+  --repair-btn-fg: #0F0F0F;
 
-  /* Developer Banner (Light = inverted ink, Dark = elevated card) */
-  --banner-bg: #0A0A0A;
+  /* Developer Banner (Light = inverted ink) */
+  --banner-bg: #141414;
   --banner-border: transparent;
   --banner-fg: #FFFFFF;
   --banner-muted: rgba(255, 255, 255, 0.72);
   --banner-btn-bg: #FFFFFF;
-  --banner-btn-fg: #0A0A0A;
+  --banner-btn-fg: #141414;
 
   /* Motion System v0.1 */
   --ease-valet: cubic-bezier(0.2, 0.8, 0.2, 1);
@@ -117,6 +118,374 @@
   --shadow-composer: 0 16px 40px -20px rgba(0, 0, 0, 0.22);
   --shadow-popover: 0 18px 48px -16px rgba(0, 0, 0, 0.24);
   --shadow-segment: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+/* Vercel Light (Geist Light) */
+[data-theme="light"][data-light-palette="vercel-light"] {
+  --bg-canvas: #FFFFFF;
+  --bg-sidebar: #FAFAFA;
+  --bg-sub-sidebar: #FFFFFF;
+  --bg-surface: #FFFFFF;
+  --bg-subtle: #F5F5F5;
+  --bg-muted: #EFEFEF;
+  --bg-hover: #EAEAEA;
+  --bg-card-hover: #F7F7F7;
+  --bg-elevated: #FFFFFF;
+  --bg-segment-active: #FFFFFF;
+  --bg-code: #F6F6F6;
+  --bg-track: #EAEAEA;
+
+  --brand-icon-bg: #000000;
+  --brand-icon-border: transparent;
+  --brand-icon-fg: #FFFFFF;
+
+  --ink-primary: #000000;
+  --ink-strong: #000000;
+  --ink-body: #171717;
+  --ink-secondary: #444444;
+  --ink-nav: #000000;
+  --ink-muted: #666666;
+  --ink-subtle: #888888;
+  --ink-faint: #999999;
+  --ink-on-primary: #FFFFFF;
+  --ink-on-primary-muted: rgba(255, 255, 255, 0.65);
+
+  --border-faint: #F4F4F4;
+  --border-subtle: #EFEFEF;
+  --border-light: #EAEAEA;
+  --border-base: #E6E6E6;
+  --border-card: #E5E5E5;
+  --border-control: #DCDCDC;
+  --border-strong: #C8C8C8;
+  --border-dash: #CCCCCC;
+
+  --switch-on-bg: #0070F3;
+  --switch-off-bg: #D8D8D8;
+  --spark-bar-peak: #0070F3;
+  --spark-bar-muted: #D4D4D4;
+  --spark-bar-active: #666666;
+
+  --nav-active-bg: #000000;
+  --nav-active-fg: #FFFFFF;
+  --avatar-bg: #000000;
+  --avatar-fg: #FFFFFF;
+  --duty-dot: #0070F3;
+  --duty-halo: rgba(0, 112, 243, 0.14);
+  --duty-ring: rgba(0, 112, 243, 0.42);
+  --core-badge-bg: #000000;
+  --core-badge-fg: #FFFFFF;
+  --repair-btn-bg: #FFFFFF;
+  --repair-btn-border: #000000;
+  --repair-btn-fg: #000000;
+
+  --banner-bg: #000000;
+  --banner-fg: #FFFFFF;
+  --banner-btn-bg: #FFFFFF;
+  --banner-btn-fg: #000000;
+}
+
+/* One Light (Atom Light) */
+[data-theme="light"][data-light-palette="one-light"] {
+  --bg-canvas: #FAFAFA;
+  --bg-sidebar: #EFEFF1;
+  --bg-sub-sidebar: #F4F4F6;
+  --bg-surface: #FFFFFF;
+  --bg-subtle: #ECECEF;
+  --bg-muted: #E5E5E8;
+  --bg-hover: #DFDFE4;
+  --bg-card-hover: #F5F5F7;
+  --bg-elevated: #FFFFFF;
+  --bg-segment-active: #FFFFFF;
+  --bg-code: #F0F0F3;
+  --bg-track: #E2E2E6;
+
+  --brand-icon-bg: #2B2E36;
+  --brand-icon-border: transparent;
+  --brand-icon-fg: #FFFFFF;
+
+  --ink-primary: #2B2E36;
+  --ink-strong: #20232A;
+  --ink-body: #383A42;
+  --ink-secondary: #52555E;
+  --ink-nav: #2B2E36;
+  --ink-muted: #696C77;
+  --ink-subtle: #848793;
+  --ink-faint: #9E9FA8;
+  --ink-on-primary: #FFFFFF;
+  --ink-on-primary-muted: rgba(255, 255, 255, 0.65);
+
+  --border-faint: #EFEFF2;
+  --border-subtle: #E8E8EC;
+  --border-light: #E2E2E6;
+  --border-base: #DCDCE0;
+  --border-card: #E0E0E5;
+  --border-control: #D2D2D8;
+  --border-strong: #BFBFC7;
+  --border-dash: #C5C5CE;
+
+  --amber-text: #986801;
+  --amber-icon: #B57B00;
+  --amber-warn: #B57B00;
+  --amber-bg: #FBF7EC;
+  --amber-border: #EDE1C4;
+  --amber-pill: #E4C98D;
+  --amber-divider: #EDE1C4;
+
+  --danger: #D84336;
+  --danger-bg: #FEF2F1;
+  --danger-border: #FACBC7;
+
+  --switch-on-bg: #4078F2;
+  --switch-off-bg: #CFD0D6;
+  --spark-bar-peak: #4078F2;
+  --spark-bar-muted: #D2D3D9;
+  --spark-bar-active: #696C77;
+
+  --nav-active-bg: #2B2E36;
+  --nav-active-fg: #FFFFFF;
+  --avatar-bg: #2B2E36;
+  --avatar-fg: #FFFFFF;
+  --duty-dot: #4078F2;
+  --duty-halo: rgba(64, 120, 242, 0.14);
+  --duty-ring: rgba(64, 120, 242, 0.42);
+  --core-badge-bg: #2B2E36;
+  --core-badge-fg: #FFFFFF;
+  --repair-btn-bg: #FFFFFF;
+  --repair-btn-border: #2B2E36;
+  --repair-btn-fg: #2B2E36;
+
+  --banner-bg: #2B2E36;
+  --banner-fg: #FFFFFF;
+  --banner-btn-bg: #FFFFFF;
+  --banner-btn-fg: #2B2E36;
+}
+
+/* Tokyo Day (Tokyo Night Day) */
+[data-theme="light"][data-light-palette="tokyo-day"] {
+  --bg-canvas: #E6E7ED;
+  --bg-sidebar: #D8DAE2;
+  --bg-sub-sidebar: #DFE1E8;
+  --bg-surface: #EFF0F5;
+  --bg-subtle: #D5D7E0;
+  --bg-muted: #CDD0DA;
+  --bg-hover: #C4C7D4;
+  --bg-card-hover: #E9EBF1;
+  --bg-elevated: #F4F5F9;
+  --bg-segment-active: #F4F5F9;
+  --bg-code: #DCDEE6;
+  --bg-track: #C8CBD6;
+
+  --brand-icon-bg: #24283B;
+  --brand-icon-border: transparent;
+  --brand-icon-fg: #F4F5F9;
+
+  --ink-primary: #24283B;
+  --ink-strong: #1A1D2B;
+  --ink-body: #343B58;
+  --ink-secondary: #4B5270;
+  --ink-nav: #24283B;
+  --ink-muted: #58607D;
+  --ink-subtle: #6E7692;
+  --ink-faint: #848BA6;
+  --ink-on-primary: #FFFFFF;
+  --ink-on-primary-muted: rgba(255, 255, 255, 0.7);
+
+  --border-faint: #DCDEE6;
+  --border-subtle: #D3D6E0;
+  --border-light: #CCD0DC;
+  --border-base: #C4C8D6;
+  --border-card: #C6CAD8;
+  --border-control: #B8BDCD;
+  --border-strong: #9DA4B8;
+  --border-dash: #A6ACC0;
+
+  --amber-text: #8C6C3E;
+  --amber-icon: #9E7B44;
+  --amber-warn: #9E7B44;
+  --amber-bg: #F2ECE1;
+  --amber-border: #DFD2BD;
+  --amber-pill: #D3BC98;
+  --amber-divider: #DFD2BD;
+
+  --danger: #C64343;
+  --danger-bg: #F6E6E8;
+  --danger-border: #E5B9BD;
+
+  --switch-on-bg: #2E7DE9;
+  --switch-off-bg: #B8BDCE;
+  --spark-bar-peak: #2E7DE9;
+  --spark-bar-muted: #C0C4D4;
+  --spark-bar-active: #58607D;
+
+  --nav-active-bg: #24283B;
+  --nav-active-fg: #F4F5F9;
+  --avatar-bg: #24283B;
+  --avatar-fg: #F4F5F9;
+  --duty-dot: #2E7DE9;
+  --duty-halo: rgba(46, 125, 233, 0.16);
+  --duty-ring: rgba(46, 125, 233, 0.44);
+  --core-badge-bg: #24283B;
+  --core-badge-fg: #F4F5F9;
+  --repair-btn-bg: #F4F5F9;
+  --repair-btn-border: #24283B;
+  --repair-btn-fg: #24283B;
+
+  --banner-bg: #24283B;
+  --banner-fg: #F4F5F9;
+  --banner-btn-bg: #F4F5F9;
+  --banner-btn-fg: #24283B;
+}
+
+/* Catppuccin Latte (Latte Pastel) */
+[data-theme="light"][data-light-palette="catppuccin-latte"] {
+  --bg-canvas: #EFF1F5;
+  --bg-sidebar: #E6E9EF;
+  --bg-sub-sidebar: #ECEFF4;
+  --bg-surface: #F7F8FB;
+  --bg-subtle: #E2E5EC;
+  --bg-muted: #DCE0E8;
+  --bg-hover: #D3D7E1;
+  --bg-card-hover: #F1F3F8;
+  --bg-elevated: #FAFBFD;
+  --bg-segment-active: #FFFFFF;
+  --bg-code: #E6E9EF;
+  --bg-track: #D4D8E2;
+
+  --brand-icon-bg: #3B3E54;
+  --brand-icon-border: transparent;
+  --brand-icon-fg: #FAFBFD;
+
+  --ink-primary: #3B3E54;
+  --ink-strong: #2C2F42;
+  --ink-body: #4C4F69;
+  --ink-secondary: #5C5F77;
+  --ink-nav: #3B3E54;
+  --ink-muted: #6C6F85;
+  --ink-subtle: #7C7F93;
+  --ink-faint: #8C8FA1;
+  --ink-on-primary: #FFFFFF;
+  --ink-on-primary-muted: rgba(255, 255, 255, 0.7);
+
+  --border-faint: #E5E8EF;
+  --border-subtle: #DFE2EA;
+  --border-light: #D8DCE5;
+  --border-base: #CFD3DD;
+  --border-card: #D3D7E2;
+  --border-control: #C2C7D4;
+  --border-strong: #A6ACBE;
+  --border-dash: #B0B5C7;
+
+  --amber-text: #B56E0C;
+  --amber-icon: #DF8E1D;
+  --amber-warn: #DF8E1D;
+  --amber-bg: #F9F0E2;
+  --amber-border: #EAD5B6;
+  --amber-pill: #E4C18A;
+  --amber-divider: #EAD5B6;
+
+  --danger: #D20F39;
+  --danger-bg: #FAE6EB;
+  --danger-border: #EEBAC6;
+
+  --switch-on-bg: #8839EF;
+  --switch-off-bg: #C6CAD6;
+  --spark-bar-peak: #8839EF;
+  --spark-bar-muted: #CCD0DA;
+  --spark-bar-active: #6C6F85;
+
+  --nav-active-bg: #3B3E54;
+  --nav-active-fg: #FAFBFD;
+  --avatar-bg: #3B3E54;
+  --avatar-fg: #FAFBFD;
+  --duty-dot: #8839EF;
+  --duty-halo: rgba(136, 57, 239, 0.14);
+  --duty-ring: rgba(136, 57, 239, 0.42);
+  --core-badge-bg: #3B3E54;
+  --core-badge-fg: #FAFBFD;
+  --repair-btn-bg: #FAFBFD;
+  --repair-btn-border: #3B3E54;
+  --repair-btn-fg: #3B3E54;
+
+  --banner-bg: #3B3E54;
+  --banner-fg: #FAFBFD;
+  --banner-btn-bg: #FAFBFD;
+  --banner-btn-fg: #3B3E54;
+}
+
+/* Solarized Light (Warm Parchment) */
+[data-theme="light"][data-light-palette="solarized-light"] {
+  --bg-canvas: #FDF6E3;
+  --bg-sidebar: #EEE8D5;
+  --bg-sub-sidebar: #F5EFDC;
+  --bg-surface: #FCF7E8;
+  --bg-subtle: #EAE3CE;
+  --bg-muted: #E3DCC6;
+  --bg-hover: #DBD3BC;
+  --bg-card-hover: #F7F0DC;
+  --bg-elevated: #FFFDF4;
+  --bg-segment-active: #FFFDF4;
+  --bg-code: #EFE9D6;
+  --bg-track: #DFD8C2;
+
+  --brand-icon-bg: #073642;
+  --brand-icon-border: transparent;
+  --brand-icon-fg: #FDF6E3;
+
+  --ink-primary: #073642;
+  --ink-strong: #002B36;
+  --ink-body: #3E545B;
+  --ink-secondary: #586E75;
+  --ink-nav: #073642;
+  --ink-muted: #657B83;
+  --ink-subtle: #839496;
+  --ink-faint: #93A1A1;
+  --ink-on-primary: #FDF6E3;
+  --ink-on-primary-muted: rgba(253, 246, 227, 0.72);
+
+  --border-faint: #EFE8D4;
+  --border-subtle: #E8E0CB;
+  --border-light: #E2D9C2;
+  --border-base: #DAD1B9;
+  --border-card: #DDD5BE;
+  --border-control: #CCC3AA;
+  --border-strong: #B5AC93;
+  --border-dash: #BFB69C;
+
+  --amber-text: #946F00;
+  --amber-icon: #B58900;
+  --amber-warn: #B58900;
+  --amber-bg: #F6ECCE;
+  --amber-border: #E5D4A0;
+  --amber-pill: #D9BD6E;
+  --amber-divider: #E5D4A0;
+
+  --danger: #DC322F;
+  --danger-bg: #FBE9E4;
+  --danger-border: #F0BCAF;
+
+  --switch-on-bg: #268BD2;
+  --switch-off-bg: #CCC3AA;
+  --spark-bar-peak: #268BD2;
+  --spark-bar-muted: #D7CFBA;
+  --spark-bar-active: #657B83;
+
+  --nav-active-bg: #073642;
+  --nav-active-fg: #FDF6E3;
+  --avatar-bg: #073642;
+  --avatar-fg: #FDF6E3;
+  --duty-dot: #268BD2;
+  --duty-halo: rgba(38, 139, 210, 0.16);
+  --duty-ring: rgba(38, 139, 210, 0.44);
+  --core-badge-bg: #073642;
+  --core-badge-fg: #FDF6E3;
+  --repair-btn-bg: #FFFDF4;
+  --repair-btn-border: #073642;
+  --repair-btn-fg: #073642;
+
+  --banner-bg: #073642;
+  --banner-fg: #FDF6E3;
+  --banner-btn-bg: #FDF6E3;
+  --banner-btn-fg: #073642;
 }
 
 /* Default Dark: Cursor Dark (Anysphere Neutral) */

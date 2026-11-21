@@ -4799,6 +4799,7 @@ func (s *Service) UpdatePreferences(prefs types.ValetPreferences) (types.ValetSn
 		if st.Preferences.BusyMessagePolicy != "steer" && st.Preferences.BusyMessagePolicy != "queue" {
 			st.Preferences.BusyMessagePolicy = "queue"
 		}
+		st.Preferences.LightTheme = types.NormalizeLightTheme(st.Preferences.LightTheme)
 		st.Preferences.DarkTheme = types.NormalizeDarkTheme(st.Preferences.DarkTheme)
 	})
 	if s.opts.OnSyncTray != nil {
@@ -6140,6 +6141,9 @@ func (s *Service) UpdateProject(params types.UpdateProjectParams) (types.ValetSn
 			if params.Blocks != nil {
 				blocks := make([]types.NotebookBlock, len(*params.Blocks))
 				copy(blocks, *params.Blocks)
+				for j := range blocks {
+					blocks[j].Indent = store.ClampNotebookBlockIndent(blocks[j].Type, blocks[j].Indent)
+				}
 				st.Projects[i].Blocks = blocks
 			}
 			if params.Archived != nil && !st.Projects[i].IsDefault {

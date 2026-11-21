@@ -162,7 +162,7 @@ export const NotebookMentionPopover: React.FC<{
   return (
     <div
       onMouseDown={(e) => e.preventDefault()}
-      className="animate-valet-modal-in z-40 mt-1.5 flex w-[396px] max-w-full flex-col overflow-hidden rounded-[12px] border border-[var(--border-control)] bg-[var(--bg-elevated)] shadow-[var(--shadow-popover)]"
+      className="animate-valet-modal-in absolute top-full left-0 z-40 mt-1 flex w-[396px] max-w-full flex-col overflow-hidden rounded-[12px] border border-[var(--border-control)] bg-[var(--bg-elevated)] shadow-[var(--shadow-popover)]"
     >
       {items.length === 0 ? (
         <div className="px-4 py-6 text-center text-[12px] text-[var(--ink-muted)]">
@@ -478,7 +478,7 @@ export const NotebookSlashPopover: React.FC<{
   return (
     <div
       onMouseDown={(e) => e.preventDefault()}
-      className="animate-valet-modal-in z-40 mt-1.5 flex w-[340px] max-w-full flex-col overflow-hidden rounded-[12px] border border-[var(--border-control)] bg-[var(--bg-elevated)] shadow-[var(--shadow-popover)]"
+      className="animate-valet-modal-in absolute top-full left-0 z-40 mt-1 flex w-[340px] max-w-full flex-col overflow-hidden rounded-[12px] border border-[var(--border-control)] bg-[var(--bg-elevated)] shadow-[var(--shadow-popover)]"
     >
       <div className="px-3.5 pt-2.5 pb-1 font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--ink-subtle)]">
         插入块 · BLOCKS

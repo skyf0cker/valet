@@ -1,6 +1,16 @@
 import { useEffect } from "react";
-import { getDarkThemeMeta } from "../constants/themes";
+import { getDarkThemeMeta, getLightThemeMeta } from "../constants/themes";
 import { useValet } from "../store/ValetContext";
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!target || typeof HTMLElement === "undefined" || !(target instanceof HTMLElement)) {
+    return false;
+  }
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+    return true;
+  }
+  return target.isContentEditable;
+}
 
 export function useGlobalShortcuts() {
   const {
@@ -16,7 +26,7 @@ export function useGlobalShortcuts() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (!state.onboardingCompleted) return;
+      if (!state.onboardingCompleted || e.defaultPrevented) return;
 
       const meta = e.metaKey || e.ctrlKey;
 
@@ -26,25 +36,31 @@ export function useGlobalShortcuts() {
         return;
       }
 
-      if (meta && (e.key.toLowerCase() === "i" || e.key === "4")) {
+      if (meta && !e.altKey && !e.shiftKey && e.key === "4") {
         e.preventDefault();
         setActiveView("inbox");
         return;
       }
 
-      if (meta && e.key === "1") {
+      if (meta && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "i" && !isEditableTarget(e.target)) {
+        e.preventDefault();
+        setActiveView("inbox");
+        return;
+      }
+
+      if (meta && !e.altKey && !e.shiftKey && e.key === "1") {
         e.preventDefault();
         setActiveView("timeline");
         return;
       }
 
-      if (meta && e.key === "2") {
+      if (meta && !e.altKey && !e.shiftKey && e.key === "2") {
         e.preventDefault();
         setActiveView("projects");
         return;
       }
 
-      if (meta && e.key === "3") {
+      if (meta && !e.altKey && !e.shiftKey && e.key === "3") {
         e.preventDefault();
         setActiveView("plugins");
         return;
@@ -71,7 +87,7 @@ export function useGlobalShortcuts() {
         pushToast(
           next === "dark"
             ? `已切换深色模式 · ${getDarkThemeMeta(state.preferences.darkTheme).name}`
-            : "已切换浅色模式"
+            : `已切换浅色模式 · ${getLightThemeMeta(state.preferences.lightTheme).name}`
         );
         return;
       }
@@ -96,6 +112,7 @@ export function useGlobalShortcuts() {
     setActiveView,
     setCommandPaletteOpen,
     state.onboardingCompleted,
+    state.preferences.lightTheme,
     state.preferences.darkTheme,
     togglePauseValet,
     toggleSidebarCollapsed,

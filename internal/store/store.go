@@ -348,6 +348,7 @@ func normalizeLoadedSnapshot(s *types.ValetSnapshot) {
 	if s.Preferences.BusyMessagePolicy != "steer" && s.Preferences.BusyMessagePolicy != "queue" {
 		s.Preferences.BusyMessagePolicy = "queue"
 	}
+	s.Preferences.LightTheme = types.NormalizeLightTheme(s.Preferences.LightTheme)
 	s.Preferences.DarkTheme = types.NormalizeDarkTheme(s.Preferences.DarkTheme)
 	if !s.Preferences.Heartbeat.Initialized {
 		def := DefaultHeartbeatConfig()
@@ -456,6 +457,26 @@ func cloneSnapshot(src types.ValetSnapshot) types.ValetSnapshot {
 	return out
 }
 
+// MaxNotebookBlockIndent defines the maximum nesting depth for indentable Notebook blocks.
+const MaxNotebookBlockIndent = 6
+
+// ClampNotebookBlockIndent restricts block indentation to [0, MaxNotebookBlockIndent] and
+// clears indentation on non-indentable block types (headings, dividers, session cards, code).
+func ClampNotebookBlockIndent(blockType string, indent int) int {
+	switch blockType {
+	case "bullet", "numbered", "todo", "paragraph", "quote", "callout":
+		if indent < 0 {
+			return 0
+		}
+		if indent > MaxNotebookBlockIndent {
+			return MaxNotebookBlockIndent
+		}
+		return indent
+	default:
+		return 0
+	}
+}
+
 func normalizeProjectsSnapshot(s *types.ValetSnapshot) {
 	var defaultProj *types.Project
 	others := make([]types.Project, 0, len(s.Projects))
@@ -469,6 +490,13 @@ func normalizeProjectsSnapshot(s *types.ValetSnapshot) {
 		}
 		if len(p.Blocks) == 0 {
 			p.Blocks = []types.NotebookBlock{{ID: "blk-" + p.ID + "-1", Type: "paragraph", Content: ""}}
+		} else {
+			normBlocks := make([]types.NotebookBlock, len(p.Blocks))
+			copy(normBlocks, p.Blocks)
+			for j := range normBlocks {
+				normBlocks[j].Indent = ClampNotebookBlockIndent(normBlocks[j].Type, normBlocks[j].Indent)
+			}
+			p.Blocks = normBlocks
 		}
 		if p.ID == types.DefaultProjectID {
 			p.IsDefault = true

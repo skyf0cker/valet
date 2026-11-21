@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useValet } from "../store/ValetContext";
-import { getDarkThemeMeta } from "../constants/themes";
+import { getDarkThemeMeta, getLightThemeMeta } from "../constants/themes";
 import { DEFAULT_PROJECT_ID, type AppView } from "../types/valet";
 import { countUnreadThreads } from "../utils/chatUnread";
 import { CreateProjectModal } from "./projects/CreateProjectModal";
@@ -192,7 +192,7 @@ export const Sidebar: React.FC = () => {
     pushToast(
       next === "dark"
         ? `已切换深色模式 · ${getDarkThemeMeta(state.preferences.darkTheme).name}`
-        : "已切换浅色模式"
+        : `已切换浅色模式 · ${getLightThemeMeta(state.preferences.lightTheme).name}`
     );
   };
 

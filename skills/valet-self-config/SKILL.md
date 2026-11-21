@@ -54,7 +54,8 @@ valet skill list
 | `launchAtLogin` | `true` \| `false` | 开机自启 |
 | `showMenuBarIcon` | `true` \| `false` | 菜单栏图标驻留 |
 | `appearance` | `light` \| `dark` \| `auto` | 外观主题（浅色/深色/跟随系统） |
-| `darkTheme` | `cursor` \| `vercel` \| `vesper` \| `onedark` \| `tokyo-night` \| `catppuccin` | 深色主题配色（Cursor Dark / Vercel / Vesper / One Dark Pro / Tokyo Night / Catppuccin Mocha） |
+| `lightTheme` | `cursor-light` \| `vercel-light` \| `one-light` \| `tokyo-day` \| `catppuccin-latte` \| `solarized-light` | 浅色主题配色（Cursor Light / Vercel Light / One Light / Tokyo Day / Catppuccin Latte / Solarized Light） |
+| `darkTheme` | `cursor` \| `vercel` \| `onedark` \| `tokyo-night` \| `catppuccin` \| `vesper` | 深色主题配色（Cursor Dark / Vercel Dark / One Dark Pro / Tokyo Night / Catppuccin Mocha / Vesper） |
 | `language` | `string` | 界面语言（如 `简体中文`、`English`） |
 | `busyMessagePolicy` | `queue` \| `steer` | 运行中发消息策略（排队 / 立即插话） |
 
